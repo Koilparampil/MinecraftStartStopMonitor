@@ -6,6 +6,7 @@ Real sockets on free ports, a line-based fake of sleeping.handle_connection
 and a fake controller.
 """
 
+import errno
 import json
 import socket
 import threading
@@ -15,9 +16,13 @@ import pytest
 
 from src.auto_start import (
     AccessPolicy,
+    _ListenCycle,
     AutoStartManager,
+    ConnectionSlots,
     ListenerOptions,
+    accept_error_action,
     bind_address,
+    client_key,
     normalize_client_ip,
 )
 from src.events import Event, EventBus
@@ -217,7 +222,7 @@ class TestListen:
     def test_does_not_listen_unless_stopped(self, make_manager, port, state):
         manager, _ = make_manager(controller=FakeController(port, state=state))
         assert manager.listen() is False
-        time.sleep(0.1)
+        assert not manager.is_armed  # no cycle was created at all
         assert not manager.is_listening
         assert can_bind(port)
 
@@ -237,7 +242,7 @@ class TestListen:
             started = time.monotonic()
             assert manager.listen()
             assert time.monotonic() - started < 0.2
-            time.sleep(0.2)
+            wait_until(lambda: manager._cycle.bind_failures >= 1)
             assert not manager.is_listening
         finally:
             blocker.close()
@@ -252,14 +257,15 @@ class TestListen:
         try:
             manager, _ = make_manager(options=options)
             manager.listen()
-            time.sleep(0.1)
+            wait_until(
+                lambda: manager._cycle.bind_failures >= 1
+            )  # now waiting to retry
             started = time.monotonic()
             assert manager.stop_listening() is True
             assert time.monotonic() - started < 1.0
         finally:
             blocker.close()
-        time.sleep(0.1)
-        assert can_bind(port)
+        assert can_bind(port)  # stop_listening() returned: nothing holds the port
 
     def test_a_disarm_racing_with_listen_wins(self, make_manager, port):
         """STARTING committed (and handled) between listen()'s state check and
@@ -279,7 +285,7 @@ class TestListen:
         manager, _ = make_manager(controller=RacingController(port))
         holder["manager"] = manager
         assert manager.listen() is False
-        time.sleep(0.1)
+        assert not manager.is_armed
         assert not manager.is_listening
         assert can_bind(port)
 
@@ -296,7 +302,7 @@ class TestWake:
         wait_until(lambda: manager.is_listening)
         for _ in range(3):
             assert talk(port, "STATUS").startswith("MOTD ")
-        time.sleep(0.15)
+        wait_until(lambda: manager.active_connections == 0)  # handlers finished
         assert controller.start_calls == 0
         assert manager.is_listening
 
@@ -312,7 +318,8 @@ class TestWake:
         assert controller.start_calls == 1
         assert controller.port_free_at_start == [True]
         assert not manager.is_listening
-        time.sleep(0.15)
+        manager._last_cycle.thread.join(3)  # the cycle is over: no second start
+        assert not manager._last_cycle.thread.is_alive()
         assert controller.start_calls == 1
 
     def test_concurrent_logins_start_the_server_exactly_once(self, make_manager, port):
@@ -331,7 +338,8 @@ class TestWake:
             sock.close()
         assert all(r.startswith(b"KICK ") for r in replies)
         assert controller.started.wait(3)
-        time.sleep(0.2)
+        wait_until(lambda: manager.active_connections == 0)
+        manager._last_cycle.thread.join(3)
         assert controller.start_calls == 1
 
     def test_denied_login_does_not_wake(self, make_manager, port):
@@ -342,7 +350,7 @@ class TestWake:
             talk(port, "LOGIN Griefer")
             == "DENY You are not white-listed on this server!"
         )
-        time.sleep(0.15)
+        wait_until(lambda: manager.active_connections == 0)
         assert controller.start_calls == 0
         assert manager.is_listening
 
@@ -394,7 +402,7 @@ class TestWake:
         assert can_bind(port)
         bus.publish(Event.SERVER_STOPPED, {})
         assert manager.listen() is False
-        time.sleep(0.1)
+        assert not manager.is_armed
         assert can_bind(port)
 
     def test_sleeping_config_comes_from_settings_and_properties(
@@ -536,3 +544,165 @@ class TestAccessPolicy:
         mock_settings.respectWhitelist = False
         _write_json(server_dir / "banned-players.json", [{"name": "Griefer"}])
         assert AccessPolicy().check("Griefer", "1.2.3.4") == (True, None)
+
+
+# ----------------------------------------------------------------------
+# Admission control: idle sockets must not lock legitimate players out
+# ----------------------------------------------------------------------
+
+
+def idle_socket(port, source="127.0.0.1"):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((source, 0))
+    except OSError:
+        sock.close()
+        pytest.skip(f"cannot use {source} as a source address here")
+    sock.settimeout(3)
+    sock.connect(("127.0.0.1", port))
+    return sock
+
+
+def talk_from(port, line, source):
+    sock = idle_socket(port, source)
+    with sock:
+        sock.sendall(line.encode() + b"\n")
+        return sock.recv(256).decode().strip()
+
+
+SLOTS = ListenerOptions(
+    accept_timeout=0.05,
+    connection_timeout=2.0,
+    first_byte_timeout=5.0,  # longer than the tests: idle sockets stay held
+    release_timeout=3.0,
+)
+
+
+class TestAdmission:
+    def test_idle_sockets_from_one_host_do_not_block_a_join(self, make_manager, port):
+        manager, controller = make_manager(options=SLOTS)
+        manager.listen()
+        wait_until(lambda: manager.is_listening)
+        idle = [idle_socket(port) for _ in range(20)]  # old global cap was 16
+        try:
+            wait_until(lambda: manager.active_connections == 4)  # per-client cap
+            assert talk_from(port, "LOGIN Steve", "127.0.0.2").startswith("KICK ")
+            assert controller.started.wait(3)
+        finally:
+            for sock in idle:
+                sock.close()
+
+    def test_idle_sockets_from_many_hosts_do_not_block_a_join(self, make_manager, port):
+        manager, controller = make_manager(options=SLOTS)
+        manager.listen()
+        wait_until(lambda: manager.is_listening)
+        idle = [idle_socket(port, f"127.0.0.{10 + i}") for i in range(20)]
+        try:
+            wait_until(lambda: manager.active_connections == 20)
+            assert talk(port, "LOGIN Steve").startswith("KICK ")
+            assert controller.started.wait(3)
+        finally:
+            for sock in idle:
+                sock.close()
+
+    def test_silent_sockets_are_dropped_after_the_first_byte_timeout(
+        self, make_manager, port
+    ):
+        options = ListenerOptions(accept_timeout=0.05, first_byte_timeout=0.2)
+        manager, controller = make_manager(options=options)
+        manager.listen()
+        wait_until(lambda: manager.is_listening)
+        idle = [idle_socket(port) for _ in range(4)]  # fills this host's slots
+        try:
+            wait_until(lambda: manager.active_connections == 4)
+            for sock in idle:
+                assert sock.recv(16) == b""  # closed by the listener
+            wait_until(lambda: manager.active_connections == 0)
+            assert talk(port, "LOGIN Steve").startswith("KICK ")
+            assert controller.started.wait(3)
+        finally:
+            for sock in idle:
+                sock.close()
+
+    def test_connection_slots(self):
+        slots = ConnectionSlots(total=3, per_client=2)
+        assert slots.acquire("a") and slots.acquire("a")
+        assert not slots.acquire("a")  # per-client cap
+        assert slots.acquire("b")
+        assert not slots.acquire("c")  # global cap
+        slots.release("a")
+        assert slots.acquire("c")
+        assert slots.in_use == 3
+
+    @pytest.mark.parametrize(
+        ("ip", "key"),
+        [
+            ("10.0.0.7", "10.0.0.7"),
+            ("2001:db8:1:2:3:4:5:6", "2001:db8:1:2::/64"),
+            ("2001:db8:1:2::ff", "2001:db8:1:2::/64"),
+            ("garbage", "garbage"),
+        ],
+    )
+    def test_client_key(self, ip, key):
+        assert client_key(ip) == key
+
+
+# ----------------------------------------------------------------------
+# accept() errors keep the port bound
+# ----------------------------------------------------------------------
+
+
+class TestAcceptErrors:
+    @pytest.mark.parametrize(
+        ("error", "action"),
+        [
+            (ConnectionAbortedError(errno.ECONNABORTED, "aborted"), "retry"),
+            (ConnectionResetError(errno.ECONNRESET, "reset"), "retry"),
+            (OSError(errno.EPROTO, "protocol"), "retry"),
+            (OSError(errno.EMFILE, "too many open files"), "backoff"),
+            (OSError(errno.ENFILE, "file table overflow"), "backoff"),
+            (OSError(errno.EBADF, "bad file descriptor"), "rebind"),
+            (OSError(errno.EINVAL, "invalid"), "rebind"),
+        ],
+    )
+    def test_classification(self, error, action):
+        assert accept_error_action(error) == action
+
+    @staticmethod
+    def serve_with(manager, errors):
+        """Run one cycle's accept loop over a fake listening socket that raises
+        *errors* in turn, then cancels the cycle. Returns the errors left."""
+        cycle = _ListenCycle(manager, 99)
+        pending = list(errors)
+
+        class FakeListener:
+            def settimeout(self, _timeout):
+                pass
+
+            def accept(self):
+                if pending:
+                    raise pending.pop(0)
+                cycle.cancel()
+                raise TimeoutError
+
+        cycle._serve(FakeListener())
+        return pending
+
+    def test_transient_and_resource_errors_keep_accepting(self, make_manager):
+        manager, _ = make_manager()
+        left = self.serve_with(
+            manager,
+            [
+                ConnectionAbortedError(errno.ECONNABORTED, "aborted"),
+                OSError(errno.EMFILE, "too many open files"),
+                ConnectionResetError(errno.ECONNRESET, "reset"),
+            ],
+        )
+        assert left == []  # survived all three, then the cancel ended it
+
+    def test_a_broken_listening_socket_is_rebound(self, make_manager):
+        manager, _ = make_manager()
+        left = self.serve_with(
+            manager, [OSError(errno.EBADF, "bad file descriptor"), OSError(1, "unused")]
+        )
+        assert len(left) == 1  # returned after the first error: _run re-binds

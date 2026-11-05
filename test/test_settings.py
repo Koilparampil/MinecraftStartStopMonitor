@@ -89,7 +89,7 @@ class TestLoading:
         assert s.startCommand == ["java", "-jar", "server.jar"]
         assert (s.serverPort, s.webServerPort, s.useWebServer) == (25570, 8080, False)
         assert (s.sleepingMotd, s.listenerBindHost, s.autoStopDelay) == ("zzz", "", 300)
-        assert s.dataDir == "state"
+        assert s.dataDir == str(tmp_path / "state")  # relative to the settings file
         assert not hasattr(s, "x")
 
     def test_quoted_values_are_coerced(self, tmp_path):
@@ -127,6 +127,40 @@ class TestLoading:
         again = Settings()
         again.readSettings(path)
         assert again.sessionSecretKey == s.sessionSecretKey
+
+    def test_relative_paths_follow_the_settings_file_not_the_cwd(
+        self, tmp_path, monkeypatch
+    ):
+        conf = tmp_path / "conf"
+        conf.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        path = write_yaml(
+            conf / "settings.yaml",
+            {"minecraft": {"serverDir": "../server"}, "monitor": {"dataDir": "state"}},
+        )
+        s = Settings()
+        s.readSettings(path)
+        assert s.serverDir == str(tmp_path / "server")
+        assert s.dataDir == str(conf / "state")
+        s.readSettings(write_yaml(conf / "other.yaml", {"web": {"password": "x"}}))
+        assert s.dataDir == str(conf / "state")  # absolute now: kept
+
+    def test_default_data_dir_sits_next_to_the_settings_file(self, tmp_path):
+        s = Settings()
+        s.readSettings(
+            write_yaml(tmp_path / "settings.yaml", {"web": {"password": "x"}})
+        )
+        assert s.dataDir == str(tmp_path / "data")
+
+    def test_home_relative_paths_are_expanded(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        s = Settings()
+        s.readSettings(
+            write_yaml(tmp_path / "s.yaml", {"monitor": {"dataDir": "~/mm"}})
+        )
+        assert s.dataDir == str(tmp_path / "mm")
 
     def test_data_path_creates_the_directory(self, tmp_path):
         s = Settings()

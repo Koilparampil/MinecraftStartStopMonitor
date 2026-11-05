@@ -154,6 +154,19 @@ def env(mock_settings, tmp_path, monkeypatch):
     psutil.wait_procs(owned, timeout=5)
 
 
+def write_launcher(env, after="", redirect=""):
+    """A Forge-style ./run.sh: sh runs the server as a child, then `after`."""
+    script = os.path.join(env.server_dir, "run.sh")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(
+            f'#!/bin/sh\n"{sys.executable}" "{env.script}" "$@"{redirect}\n'
+            f'echo "exited: $?"\n{after}'
+        )
+    os.chmod(script, 0o755)
+    env.settings.startCommand = "./run.sh nogui"
+    return script
+
+
 def wait_ready(env):
     wait_until(lambda: env.marker("ready"), message="fake server never became ready")
 
@@ -326,6 +339,38 @@ class TestGracefulStop:
         assert not any(name.startswith("saved-") for name in os.listdir(env.markers))
         assert pm.tracked_identity is None
 
+    @POSIX_ONLY
+    def test_sigterm_wait_is_at_least_the_stop_timeout(self, env, monkeypatch):
+        monkeypatch.setenv("FAKE_IGNORE_STOP", "1")
+        monkeypatch.setenv("FAKE_STOP_DELAY", "0.6")  # saving after SIGTERM
+        env.settings.stopTimeout = 1
+        pm = env.manager()
+        pm.TERMINATE_TIMEOUT = 0.2  # a fixed short wait would kill mid-save
+        identity = env.launch(pm)
+        wait_ready(env)
+
+        assert pm.terminate_process(identity) is True
+
+        assert env.marker("saved-sigterm")
+
+    @POSIX_ONLY
+    def test_unattended_stop_never_forces_without_a_graceful_path(self, env):
+        process = env.spawn()  # adopted: no console pipe
+        wait_ready(env)
+        env.settings.stopTimeout = 0.5
+        pm = env.manager(graceful_stopper=lambda: False)  # RCON unavailable
+        pm.windows = True  # Windows decisions (its terminate is a hard kill)
+        pm.TERMINATE_TIMEOUT = 0.5
+        found = pm.find_process_identity()
+        pm.set_known_identity(found)
+
+        assert pm.terminate_process(found, force=False) is False  # auto-stop
+        assert process.poll() is None
+        assert pm.tracked_identity == found
+
+        assert pm.terminate_process(found, force=True) is True  # admin stop
+        process.wait(5)
+
     def test_children_of_the_server_are_stopped_too(self, env, monkeypatch):
         monkeypatch.setenv("FAKE_CHILD", "1")
         env.settings.stopTimeout = 1
@@ -350,14 +395,7 @@ class TestWrapperTree:
 
     @pytest.fixture
     def run_sh(self, env):
-        script = os.path.join(env.server_dir, "run.sh")
-        with open(script, "w", encoding="utf-8") as f:
-            f.write(
-                f'#!/bin/sh\n"{sys.executable}" "{env.script}" "$@"\necho "exited: $?"\n'
-            )
-        os.chmod(script, 0o755)
-        env.settings.startCommand = "./run.sh nogui"
-        return script
+        return write_launcher(env)
 
     def launch_tree(self, env, pm):
         wrapper = env.launch(pm)
@@ -408,6 +446,54 @@ class TestWrapperTree:
         assert env.marker("saved-rcon")
         assert gone(wrapper)
 
+    def stop_server_by_itself(self, env, child):
+        """The server exits on its own (crash, in-game /stop)."""
+        child_identity = ProcessIdentity(child.pid, child.create_time())
+        env.stop_file.write_text("stop", encoding="utf-8")
+        wait_until(lambda: gone(child_identity), timeout=15)
+
+    def test_launcher_waiting_for_input_does_not_keep_the_server_running(self, env):
+        write_launcher(env, after='echo "Press enter"\nread answer\n')  # run.bat: pause
+        pm = env.manager()
+        wrapper, child = self.launch_tree(env, pm)
+        assert pm.observe().tracked_running is True
+
+        self.stop_server_by_itself(env, child)
+
+        # The first scan without the server closes our stdin pipe: `read`
+        # returns and the launcher exits, which is detected as usual.
+        wait_until(lambda: not pm.observe().tracked_running, timeout=10)
+        wait_until(lambda: gone(wrapper), timeout=10)
+
+    def test_launcher_that_outlives_the_server_counts_as_stopped(self, env):
+        write_launcher(env, after="sleep 60\n")  # ignores its input
+        pm = env.manager()
+        wrapper, child = self.launch_tree(env, pm)
+        assert pm.observe().tracked_running is True
+
+        self.stop_server_by_itself(env, child)
+        first, second = pm.observe(), pm.observe()
+
+        assert first.tracked_running is True  # one scan could be a hiccup
+        assert second.tracked_running is False
+        assert second.found is None
+        assert not gone(wrapper)  # it lingers, but it is not the server
+
+    def test_rcon_follow_up_when_the_launcher_swallows_stdin(self, env):
+        write_launcher(env, redirect=" < /dev/null")  # stdin never reaches it
+        env.settings.stopTimeout = 30
+        calls = []
+        pm = env.manager(graceful_stopper=touch_stop_file(env, calls))
+        pm.STDIN_STOP_GRACE = 0.5
+        wrapper, _child = self.launch_tree(env, pm)
+
+        started = time.monotonic()
+        assert pm.terminate_process(wrapper) is True
+
+        assert time.monotonic() - started < 10  # not the 30 s stopTimeout
+        assert calls == [True]
+        assert env.marker("saved-rcon")
+
 
 class TestProcessIdentity:
     @pytest.mark.skipif(sys.platform != "linux", reason="Linux zombie semantics")
@@ -429,10 +515,11 @@ class TestProcessIdentity:
         wait_ready(env)
         env.stop_file.write_text("stop", encoding="utf-8")  # it stops by itself
 
-        wait_until(lambda: not pm.identity_is_running(identity))
+        wait_until(lambda: not pm.identity_is_running(identity), timeout=20)
 
+        # Reported gone only once reaped (it may exit between the checks).
         with pytest.raises(psutil.NoSuchProcess):
-            psutil.Process(identity.pid).status()  # reaped, not a zombie
+            psutil.Process(identity.pid).status()
 
     def test_a_reused_pid_counts_as_gone_and_is_never_signalled(self, env):
         process = env.spawn()

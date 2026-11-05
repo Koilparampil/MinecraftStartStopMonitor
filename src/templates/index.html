@@ -30,7 +30,7 @@
       </div>
       <p class="status-detail" id="statusDetail">
         {%- if status == 'LOADING' %}Process is up — loading mods…
-        {%- elif status == 'STARTING' %}Launching the server…
+        {%- elif status == 'STARTING' %}{% if snapshot.restartPending %}Restarting — starting again…{% else %}Launching the server…{% endif %}
         {%- elif status == 'STOPPING' %}Saving worlds and shutting down…
         {%- elif status == 'ONLINE' %}Accepting players
         {%- else %}{% if config.autoStart %}Sleeping — a join attempt wakes it{% else %}Stopped{% endif %}{% endif -%}
@@ -53,11 +53,12 @@
   <section class="panel toolbar" aria-label="Server controls">
     <div class="btn-row">
       {% if config.controlServer %}
-      <button type="button" class="btn btn--primary" id="startBtn" {% if state != 'STOPPED' %}disabled{% endif %}>
+      <button type="button" class="btn btn--primary" id="startBtn" {% if state != 'STOPPED' or snapshot.restartPending %}disabled{% endif %}>
         <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-play"></use></svg><span>Start</span>
       </button>
-      <button type="button" class="btn btn--danger" id="stopBtn" {% if state != 'RUNNING' %}disabled{% endif %}>
-        <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-stop"></use></svg><span>Stop</span>
+      {% set cancel_restart = state == 'STOPPING' and snapshot.restartPending %}
+      <button type="button" class="btn btn--danger" id="stopBtn" {% if state != 'RUNNING' and not cancel_restart %}disabled{% endif %}>
+        <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-stop"></use></svg><span id="stopLabel">{{ 'Cancel restart' if cancel_restart else 'Stop' }}</span>
       </button>
       <button type="button" class="btn btn--warn" id="restartBtn" {% if state != 'RUNNING' %}disabled{% endif %}>
         <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-restart"></use></svg><span>Restart</span>

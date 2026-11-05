@@ -7,8 +7,10 @@ import pytest
 from src.auth import (
     LoginAttemptTracker,
     User,
+    credential_epoch,
     is_safe_redirect,
     safe_next_url,
+    split_user_id,
     verify_credentials,
 )
 
@@ -36,6 +38,34 @@ class TestUser:
         assert user.is_authenticated is True
         assert user.is_active is True
         assert user.is_anonymous is False
+
+
+class TestCredentialEpoch:
+    def test_user_id_carries_the_epoch(self):
+        user = User("admin", "abc123")
+        assert user.username == "admin"
+        assert user.epoch == "abc123"
+        assert user.get_id() == "admin|abc123"
+        assert split_user_id(user.get_id()) == ("admin", "abc123")
+
+    def test_username_with_separator_round_trips(self):
+        user = User("we|ird", "ff00")
+        assert split_user_id(user.get_id()) == ("we|ird", "ff00")
+
+    def test_legacy_id_has_no_epoch(self):
+        assert split_user_id("admin") == ("admin", "")
+
+    def test_epoch_changes_with_any_credential_or_the_secret(self):
+        base = credential_epoch("admin", "pw", "secret")
+        assert base == credential_epoch("admin", "pw", "secret")
+        assert len(base) == 32
+        assert base != credential_epoch("admin", "pw2", "secret")
+        assert base != credential_epoch("admin2", "pw", "secret")
+        assert base != credential_epoch("admin", "pw", "other-secret")
+        assert base == credential_epoch("admin", "pw", b"secret")
+
+    def test_epoch_does_not_reveal_the_password(self):
+        assert "pw-secret" not in credential_epoch("admin", "pw-secret", "k")
 
 
 class TestVerifyCredentials:

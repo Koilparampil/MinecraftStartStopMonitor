@@ -39,10 +39,13 @@ ANONYMOUS_PLAYER = "anonymous player"
 # 1.13+: "There are 2 of a max of 20 players online: A, B"
 # 1.7-1.12: "There are 2/20 players online:" + names (RCON joins with \n or nothing)
 # Bukkit/Essentials: "There are 2 out of maximum 20 players online."
+# EssentialsX with vanished players: "There are 1/1 out of maximum 20 ..."
+# (visible/hidden: both are online).
+_MAXIMUM = r"out\s+of\s+(?:a\s+)?max(?:imum)?(?:\s+of)?"
 _LIST_HEADER = re.compile(
     r"There\s+(?:are|is)\s+(?P<online>\d+)\s*"
-    r"(?:/|of\s+a\s+max(?:imum)?(?:\s+of)?|out\s+of\s+(?:a\s+)?max(?:imum)?(?:\s+of)?)\s*"
-    r"(?P<max>\d+)\s+players?\s+online\s*[:.]?",
+    rf"(?:/\s*(?P<hidden>\d+)\s*{_MAXIMUM}|/|of\s+a\s+max(?:imum)?(?:\s+of)?|{_MAXIMUM})"
+    r"\s*(?P<max>\d+)\s+players?\s+online\s*[:.]?",
     re.IGNORECASE,
 )
 _UUID_ENTRY = re.compile(
@@ -82,7 +85,8 @@ def parse_list_response(text: str) -> Roster | None:
     if match is None:
         return None
     players = _parse_names(plain[match.end() :])
-    online = max(int(match["online"]), len(players))
+    counted = int(match["online"]) + int(match["hidden"] or 0)
+    online = max(counted, len(players))
     return Roster(online=online, players=tuple(players), max_players=int(match["max"]))
 
 
@@ -123,7 +127,8 @@ def roster_from_status(status: ServerStatus) -> Roster:
             continue
         players.append(OnlinePlayer(name=name, uuid=player_uuid))
     return Roster(
-        online=status.online,
+        # Never below the players we can name, as on the RCON path.
+        online=max(status.online, len(players)),
         players=tuple(players),
         max_players=status.max_players,
         source="ping",

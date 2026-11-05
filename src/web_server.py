@@ -22,6 +22,7 @@ order (see docs/ARCHITECTURE.md, "WebServer").
 """
 
 import contextlib
+import hmac
 import json
 import logging
 import os
@@ -59,7 +60,14 @@ from flask_login import (
 from flask_wtf.csrf import CSRFError, CSRFProtect
 from werkzeug.serving import make_server
 
-from src.auth import LoginAttemptTracker, User, safe_next_url, verify_credentials
+from src.auth import (
+    LoginAttemptTracker,
+    User,
+    credential_epoch,
+    safe_next_url,
+    split_user_id,
+    verify_credentials,
+)
 from src.events import Event
 from src.lifecycle.messages import ActionResult, LifecycleState
 from src.minecraft import server_files
@@ -94,6 +102,15 @@ COMMITTED_EVENTS = (
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _FORMATTING_CODE_RE = re.compile("§.?")
+
+
+@dataclass(frozen=True)
+class _StreamGrant:
+    """Who opened a live stream and until when it may run."""
+
+    owner: str | None  # the session id (logout ends its streams)
+    epoch: str  # credential epoch at open time
+    expires_at: float  # time.monotonic() deadline (the session's lifetime)
 
 
 @dataclass(frozen=True)
@@ -143,10 +160,16 @@ _STATUS_LABELS = {
 
 
 def status_label(snapshot: dict) -> str:
-    """OFFLINE / STARTING / LOADING / ONLINE / STOPPING for a snapshot."""
+    """OFFLINE / STARTING / LOADING / ONLINE / STOPPING for a snapshot.
+
+    STOPPED with a pending restart is the instant between a restart's stop
+    and its start: it reads as STARTING, never as OFFLINE.
+    """
     state = snapshot.get("state") or LifecycleState.STOPPED
     if state == LifecycleState.RUNNING:
         return "ONLINE" if snapshot.get("ready") else "LOADING"
+    if state == LifecycleState.STOPPED and snapshot.get("restartPending"):
+        return "STARTING"
     return _STATUS_LABELS.get(state, "OFFLINE")
 
 
@@ -208,7 +231,7 @@ class _StreamHub:
     def __init__(self, max_clients: int, queue_size: int):
         self._max_clients = max_clients
         self._queue_size = queue_size
-        self._clients: list[queue.Queue] = []
+        self._clients: dict[queue.Queue, str | None] = {}  # queue -> owner sid
         self._lock = threading.Lock()
         self._closed = threading.Event()
 
@@ -220,17 +243,25 @@ class _StreamHub:
         with self._lock:
             return len(self._clients)
 
-    def add(self) -> queue.Queue | None:
+    def add(self, owner: str | None = None) -> queue.Queue | None:
         with self._lock:
             if self._closed.is_set() or len(self._clients) >= self._max_clients:
                 return None
             client = queue.Queue(maxsize=self._queue_size)
-            self._clients.append(client)
+            self._clients[client] = owner
             return client
 
     def remove(self, client: queue.Queue) -> None:
-        with self._lock, contextlib.suppress(ValueError):
-            self._clients.remove(client)
+        with self._lock:
+            self._clients.pop(client, None)
+
+    def close_owner(self, owner: str) -> int:
+        """End the streams opened by one session (logout). Returns how many."""
+        with self._lock:
+            mine = [client for client, sid in self._clients.items() if sid == owner]
+            for client in mine:
+                _put_latest(client, None)
+        return len(mine)
 
     def broadcast(self, message: str) -> None:
         with self._lock:
@@ -338,11 +369,28 @@ class WebServer:
         manager.unauthorized_handler(self._unauthorized)
         return manager
 
-    @staticmethod
-    def _load_user(user_id):
-        if user_id == str(settings.webUsername):
-            return User(user_id)
-        return None
+    def _credential_epoch(self) -> str:
+        return credential_epoch(
+            str(settings.webUsername), str(settings.webPassword), self.app.secret_key
+        )
+
+    def _load_user(self, user_id):
+        """Sessions and remember cookies carry the credential epoch: after a
+        password (or username) change they no longer load a user."""
+        username, epoch = split_user_id(user_id)
+        if username != str(settings.webUsername) or not epoch:
+            return None
+        if not hmac.compare_digest(epoch, self._credential_epoch()):
+            return None
+        return User(username, epoch)
+
+    def _ensure_session_id(self):
+        """Give every logged-in session an id (remember-cookie logins too), so
+        logout can end exactly that session's live streams."""
+        if request.endpoint in (None, "static", "healthz"):
+            return
+        if "sid" not in session and current_user.is_authenticated:
+            session["sid"] = secrets.token_urlsafe(16)
 
     def _static_url(self, filename: str) -> str:
         """url_for('static') with a cache-busting version (file mtime)."""
@@ -427,6 +475,7 @@ class WebServer:
             return jsonify(ok=True)
 
     def _register_error_handlers(self):
+        self.app.before_request(self._ensure_session_id)
         self.app.register_error_handler(CSRFError, self._handle_csrf_error)
         self.app.register_error_handler(429, self._handle_rate_limited)
         self.app.after_request(self._add_security_headers)
@@ -584,7 +633,9 @@ class WebServer:
             username, password, settings.webUsername, settings.webPassword
         ):
             session.permanent = True
-            login_user(User(str(settings.webUsername)), remember=remember)
+            user = User(str(settings.webUsername), self._credential_epoch())
+            login_user(user, remember=remember)
+            session["sid"] = secrets.token_urlsafe(16)
             self.login_tracker.record_successful_login(ip)
             logger.info("Web login from %s", ip)
             return redirect(next_url)
@@ -619,7 +670,10 @@ class WebServer:
 
     def _handle_logout(self):
         logger.info("Web logout from %s", request.remote_addr)
+        sid = session.pop("sid", None)
         logout_user()
+        if sid:
+            self._streams.close_owner(sid)
         flash("You have been signed out.", "info")
         return redirect(url_for("login"))
 
@@ -666,12 +720,20 @@ class WebServer:
             current_user.username,
             request.remote_addr,
         )
-        accepted = bool(self._call_controller(spec.method, default=False))
-        message = spec.started
-        if not accepted:
-            state = str(self._refresh_snapshot().get("state", "")).lower()
-            message = f"{spec.failed}: the server is {state or 'busy'}."
+        result = self._call_controller(spec.method)
+        if isinstance(result, ActionResult):  # carries the real reason
+            accepted, message = result.success, result.message
+        else:  # plain bool from older controllers
+            accepted, message = bool(result), ""
+        if not message:
+            message = spec.started if accepted else self._rejection_guess(spec, result)
         return self._json_state(success=accepted, message=message)
+
+    def _rejection_guess(self, spec, result) -> str:
+        if result is None:
+            return "Internal error; see the monitor log."
+        state = str(self._refresh_snapshot().get("state", "")).lower()
+        return f"{spec.failed}: the server is {state or 'busy'}."
 
     def _handle_player_action(self, kind: str):
         spec = PLAYER_ACTIONS[kind]
@@ -801,22 +863,35 @@ class WebServer:
         return f"{prefix}data: {json.dumps(payload)}\n\n"
 
     def _handle_stream(self):
+        grant = _StreamGrant(
+            owner=session.get("sid"),
+            epoch=getattr(current_user, "epoch", ""),
+            expires_at=time.monotonic() + float(settings.sessionTimeout),
+        )
         with self._lock:
             # The initial snapshot is read and the queue registered under the
             # broadcast lock, so no committed update can slip in between.
             snapshot = self._cache_snapshot(self._read_snapshot())
-            client = self._streams.add()
+            client = self._streams.add(grant.owner)
             initial = self._sse_message(self._payload(snapshot), retry=SSE_RETRY_MS)
         if client is None:
             return jsonify(success=False, message="Live updates unavailable."), 503
         response = Response(
-            self._stream_events(client, initial), mimetype="text/event-stream"
+            self._stream_events(client, initial, grant), mimetype="text/event-stream"
         )
         response.headers["Cache-Control"] = "no-cache"
         response.headers["X-Accel-Buffering"] = "no"
         return response
 
-    def _stream_events(self, client: queue.Queue, initial: str):
+    def _grant_valid(self, grant: "_StreamGrant") -> bool:
+        """A stream lives no longer than the session that opened it: it ends
+        when that session would expire or the credentials change (logout
+        ends it at once through close_owner)."""
+        if time.monotonic() >= grant.expires_at:
+            return False
+        return hmac.compare_digest(grant.epoch, self._credential_epoch())
+
+    def _stream_events(self, client: queue.Queue, initial: str, grant=None):
         try:
             yield initial
             while True:
@@ -825,10 +900,11 @@ class WebServer:
                 except queue.Empty:
                     if self._streams.closed:
                         return
-                    yield ": keepalive\n\n"
-                    continue
+                    message = ": keepalive\n\n"
                 if message is None:
                     return
+                if grant is not None and not self._grant_valid(grant):
+                    return  # the browser reconnects and re-authenticates
                 yield message
         finally:
             self._streams.remove(client)
@@ -917,8 +993,8 @@ def _content_security_policy() -> str:
         [
             "default-src 'self'",
             f"img-src {images}",
-            "style-src 'self' https://fonts.googleapis.com",
-            "font-src 'self' https://fonts.gstatic.com",
+            "style-src 'self'",
+            "font-src 'self'",
             "script-src 'self'",
             "connect-src 'self'",
             "object-src 'none'",

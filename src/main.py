@@ -76,6 +76,11 @@ class RedactingFormatter(logging.Formatter):
         return text
 
 
+def log_file_path(settings_path):
+    """monitor.log lives next to the settings file, wherever we are started."""
+    return os.path.join(os.path.dirname(os.path.abspath(settings_path)), LOG_FILE)
+
+
 def configure_logging(log_file=LOG_FILE):
     """Log to stdout and a rotating ``monitor.log`` (level from $LOG_LEVEL)."""
     level = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), None)
@@ -83,6 +88,7 @@ def configure_logging(log_file=LOG_FILE):
         level = logging.INFO
     handlers = [logging.StreamHandler(sys.stdout)]
     try:
+        os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
         handlers.append(
             logging.handlers.RotatingFileHandler(
                 log_file,
@@ -211,11 +217,12 @@ class MonitorApp:
         self.process_manager = create_process_manager(
             graceful_stopper=self.client.request_stop
         )
+        player_manager = PlayerManager(bus=self.bus)
         self.controller = MinecraftController(
             client=self.client,
             process_manager=self.process_manager,
-            player_manager=PlayerManager(bus=self.bus),
-            banlist_manager=BanlistManager(bus=self.bus),
+            player_manager=player_manager,
+            banlist_manager=BanlistManager(bus=self.bus, known_players=player_manager),
             bus=self.bus,
         )
         if settings.autoStart:
@@ -278,9 +285,9 @@ def main(argv=None):
     signals = ShutdownSignals()
     signals.install()
     print(BANNER, flush=True)
-    configure_logging()
-
     settings_path = determine_settings_path(args)
+    configure_logging(log_file_path(settings_path))
+
     if not os.path.exists(settings_path) and not run_first_time_setup(settings_path):
         return 1
     if not load_settings(settings_path, args):

@@ -2,6 +2,8 @@
 
 from dataclasses import replace
 
+import pytest
+
 from src.lifecycle.auto_stop import (
     AutoStopConfig,
     AutoStopDecision,
@@ -30,17 +32,9 @@ def armed_state(now=131.0, generation=1):
     return state
 
 
-def expire(state, *, now=191.0, generation=1, inflight=False, due=195.0, seq=5):
-    return on_expiry(
-        state,
-        config=CONFIG,
-        now=now,
-        generation=generation,
-        poll_inflight=inflight,
-        poll_due_at=due,
-        poll_seq=seq,
-        poll_interval=2,
-    )
+def expire(state, *, generation=1, seq=5, config=CONFIG):
+    """The deadline expires while poll ``seq`` is the newest one issued."""
+    return on_expiry(state, config=config, generation=generation, poll_seq=seq)
 
 
 def sample(state, *, now, count, seq, generation=1):
@@ -55,7 +49,7 @@ def sample(state, *, now, count, seq, generation=1):
     )
 
 
-class TestAutoStopPolicy:
+class TestArming:
     def test_startup_guard_cancels_without_arming(self):
         state, decision = sample(AutoStopState(), now=110.0, count=0, seq=1)
 
@@ -109,65 +103,66 @@ class TestAutoStopPolicy:
         assert state.last_valid_sample_at == 131.0
         assert state.last_valid_roster_empty is True
 
-    def test_fresh_empty_sample_stops_on_expiry(self):
-        state, _ = sample(armed_state(), now=190.0, count=0, seq=2)
-        state, decision = expire(state)
 
-        assert decision == AutoStopDecision.STOP
-        assert state.deadline is None
+class TestExpiry:
+    def test_expiry_never_stops_on_what_is_already_known(self):
+        # Even a sample taken a moment ago cannot confirm: a player may have
+        # joined since. Only a poll issued after the expiry can.
+        fresh, _ = sample(armed_state(), now=190.9, count=0, seq=5)
 
-    def test_inflight_poll_revalidates_instead_of_stopping(self):
-        state, decision = expire(armed_state(), inflight=True, due=None)
+        state, decision = expire(fresh, seq=5)
 
         assert decision == AutoStopDecision.REVALIDATE
         assert state.revalidation == 1
         assert state.revalidation_seq == 6
         assert state.deadline is None
 
-    def test_due_poll_revalidates(self):
-        _state, decision = expire(armed_state(), due=191.0)
-
-        assert decision == AutoStopDecision.REVALIDATE
-
-    def test_stale_sample_revalidates(self):
-        # The armed sample was taken at 131; 60 s later it is stale.
-        _state, decision = expire(armed_state())
-
-        assert decision == AutoStopDecision.REVALIDATE
-
-    def test_generation_change_cancels(self):
-        _state, decision = expire(armed_state(generation=1), generation=2)
-
-        assert decision == AutoStopDecision.CANCEL
-
-    def test_expiry_during_revalidation_waits(self):
-        state, _ = expire(armed_state(), inflight=True, due=None)
-        state = replace(state, deadline=200.0, generation=1)  # defensive branch
-
-        _state, decision = expire(state, now=201.0)
-
-        assert decision == AutoStopDecision.NONE
-
-    def test_old_inflight_sample_requests_another(self):
-        state, decision = expire(armed_state(), inflight=True, due=None)
-        assert decision == AutoStopDecision.REVALIDATE
+    def test_sample_from_a_poll_issued_before_expiry_cannot_confirm(self):
+        state, _ = expire(armed_state(), seq=5)
 
         state, decision = sample(state, now=192.0, count=0, seq=5)
 
         assert decision == AutoStopDecision.REVALIDATE
         assert state.revalidation == 1
 
-    def test_current_empty_sample_confirms(self):
-        state, _ = expire(armed_state(), inflight=True, due=None)
+    def test_empty_sample_issued_after_expiry_confirms(self):
+        state, _ = expire(armed_state(), seq=5)
+
         state, decision = sample(state, now=192.0, count=0, seq=6)
 
         assert decision == AutoStopDecision.STOP
         assert state.deadline is None
 
-    def test_current_non_empty_sample_cancels_revalidation(self):
-        state, _ = expire(armed_state(), inflight=True, due=None)
+    def test_player_seen_after_expiry_cancels(self):
+        state, _ = expire(armed_state(), seq=5)
+
         state, decision = sample(state, now=192.0, count=1, seq=6)
 
         assert decision == AutoStopDecision.CANCEL
         assert state.deadline is None
         assert state.revalidation is None
+
+    def test_unavailable_sample_after_expiry_cancels(self):
+        state, _ = expire(armed_state(), seq=5)
+
+        state, decision = on_unavailable(state)
+
+        assert decision == AutoStopDecision.CANCEL
+        assert state == AutoStopState()
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"generation": 2}, {"config": AutoStopConfig(enabled=False, delay=60)}],
+    )
+    def test_generation_change_or_disabled_cancels(self, kwargs):
+        _state, decision = expire(armed_state(generation=1), **kwargs)
+
+        assert decision == AutoStopDecision.CANCEL
+
+    def test_expiry_during_revalidation_waits(self):
+        state, _ = expire(armed_state(), seq=5)
+        state = replace(state, deadline=200.0, generation=1)  # defensive branch
+
+        _state, decision = expire(state)
+
+        assert decision == AutoStopDecision.NONE

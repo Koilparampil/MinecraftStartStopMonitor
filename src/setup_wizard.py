@@ -473,6 +473,8 @@ def _ask_start_command(io, server_dir):
 
 
 def _offer_rcon(io, server_dir):
+    """Ask about RCON. Returns "enable", "quiet" (only broadcast-rcon-to-ops)
+    or None; nothing is written yet."""
     status = rcon_status(server_dir)
     if status.enabled:
         io.out(f"  RCON is already enabled in server.properties (port {status.port}).")
@@ -481,39 +483,48 @@ def _offer_rcon(io, server_dir):
             "echoed to operators in chat?",
             default=True,
         ):
-            disable_rcon_broadcast(server_dir)
-        return
+            return "quiet"
+        return None
     io.out(
         "  RCON lets the monitor list players, kick/ban and run console commands. "
         "Without it only the status ping is used."
     )
-    if not io.confirm("  Enable RCON in server.properties now?", default=True):
-        io.out(
-            "  Skipped. You can set enable-rcon/rcon.password in server.properties later."
-        )
-        return
-    setup = configure_rcon(server_dir)
+    if io.confirm("  Enable RCON in server.properties?", default=True):
+        return "enable"
     io.out(
-        f"  RCON enabled on port {setup.port} with a random password (kept in server.properties)."
+        "  Skipped. You can set enable-rcon/rcon.password in server.properties later."
     )
-    io.out("  If the server is running right now, restart it for RCON to start.")
+    return None
 
 
 def _ask_eula(io, server_dir):
+    """True when the user accepts the EULA now; nothing is written yet."""
     if server_files.read_eula(server_dir) is True:
-        return
+        return False
     io.out("  The Minecraft server only starts after you accept the Minecraft EULA:")
     io.out(f"    {EULA_URL}")
-    answer = io.ask(
-        "  Do you accept the Minecraft EULA? Type 'yes' to accept: "
-    ).lower()
-    if answer == "yes":
+    answer = io.ask("  Do you accept the Minecraft EULA? Type 'yes' to accept: ")
+    if answer.lower() == "yes":
+        return True
+    io.out("  Not accepted. The server will not start until eula.txt says eula=true.")
+    return False
+
+
+def _apply_server_edits(io, server_dir, rcon_action, accept):
+    """Write server.properties / eula.txt once every question is answered."""
+    if rcon_action == "quiet":
+        disable_rcon_broadcast(server_dir)
+        io.out("  Set broadcast-rcon-to-ops=false in server.properties.")
+    elif rcon_action == "enable":
+        setup = configure_rcon(server_dir)
+        io.out(
+            f"  RCON enabled on port {setup.port} with a random password "
+            "(kept in server.properties)."
+        )
+        io.out("  If the server is running right now, restart it for RCON to start.")
+    if accept:
         accept_eula(server_dir)
         io.out("  EULA accepted (eula=true written to eula.txt).")
-    else:
-        io.out(
-            "  Not accepted. The server will not start until eula.txt says eula=true."
-        )
 
 
 def _ask_web_password(io):
@@ -534,8 +545,10 @@ def interactive_setup(
 ):
     """First-run wizard: prompt for required settings and save settings.yaml.
 
-    Raises EOFError when there is no terminal to read answers from (the
-    caller prints help and exits). Returns the saved nested config.
+    Nothing is written (server.properties, eula.txt, settings.yaml) until the
+    last question is answered, so a cancelled setup changes nothing. Raises
+    EOFError when there is no terminal to read answers from (the caller
+    prints help and exits). Returns the saved nested config.
     """
     io = _Prompter(ask, ask_secret, out)
     io.out("")
@@ -543,10 +556,13 @@ def interactive_setup(
     io.out("")
     server_dir = _ask_server_dir(io, detected_dir)
     start_command = _ask_start_command(io, server_dir)
-    _offer_rcon(io, server_dir)
-    _ask_eula(io, server_dir)
+    rcon_action = _offer_rcon(io, server_dir)
+    accept = _ask_eula(io, server_dir)
     web_password = _ask_web_password(io)
 
+    # Every answer is in: only now touch the server's files, then save.
+    io.out("")
+    _apply_server_edits(io, server_dir, rcon_action, accept)
     config = default_config(server_dir, start_command, web_password)
     write_settings_file(settings_path, config)
     io.out("")

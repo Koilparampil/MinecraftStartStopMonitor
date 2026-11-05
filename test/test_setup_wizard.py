@@ -438,6 +438,17 @@ class TestInteractiveSetup:
         run_wizard(tmp_path / "settings.yaml", str(forge_server), script)
         assert "start.sh looks like it restarts the server in a loop" in script.text
 
+    def test_cancel_at_the_last_prompt_changes_no_server_file(
+        self, tmp_path, forge_server
+    ):
+        settings_path = tmp_path / "settings.yaml"
+        script = Script(["", "", "", "yes"], secrets=[])  # EOF at the password
+        with pytest.raises(EOFError):
+            run_wizard(settings_path, str(forge_server), script)
+        assert not (forge_server / "server.properties").exists()  # RCON not applied
+        assert not (forge_server / "eula.txt").exists()  # EULA not applied
+        assert not settings_path.exists()
+
     def test_eof_aborts_without_writing(self, tmp_path, forge_server):
         settings_path = tmp_path / "settings.yaml"
         with pytest.raises(EOFError):

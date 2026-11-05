@@ -19,7 +19,7 @@ from src.minecraft.rcon import (
     encode_packet,
     read_packet,
 )
-from test.support import free_tcp_port
+from test.support import free_tcp_port, wait_until
 
 PASSWORD = "secret"
 
@@ -57,6 +57,7 @@ class FakeRcon:
         self.connections = 0
         self.received = []  # (connection number, request id, type, body)
         self.violations = []
+        self.closed = 0  # server-side connections closed so far
         self._threads = []
         self._conns = []
         thread = threading.Thread(target=self._accept, daemon=True)
@@ -90,12 +91,19 @@ class FakeRcon:
                 request_id, packet_type = struct.unpack_from("<ii", data, 4)
                 body = data[12:-2].decode("utf-8")
                 self.received.append((number, request_id, packet_type, body))
-                if self.handler(ctx, request_id, packet_type, body) is False:
+                outcome = self.handler(ctx, request_id, packet_type, body)
+                if outcome == "reset":  # close with a TCP reset instead of a FIN
+                    conn.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                    )
+                    return
+                if outcome is False:
                     return
         except OSError:
             return
         finally:
             conn.close()
+            self.closed += 1
 
     def types(self):
         return [packet_type for _, _, packet_type, _ in self.received]
@@ -284,6 +292,14 @@ def test_read_timeout_is_unavailable(make_server, make_client):
     assert not client.connected
 
 
+def commands_seen(server, body):
+    return [
+        number
+        for number, _, kind, text in server.received
+        if kind == 2 and text == body
+    ]
+
+
 def test_reconnects_after_the_server_dropped_the_connection(make_server, make_client):
     def reply_then_close(ctx, request_id):
         ctx.reply(request_id, "bye")
@@ -292,9 +308,53 @@ def test_reconnects_after_the_server_dropped_the_connection(make_server, make_cl
     server = make_server(vanilla({"once": reply_then_close}))
     client = make_client(server)
     assert client.command("once") == "bye"
-    time.sleep(0.05)  # the server side is closed now
+    wait_until(lambda: server.closed == 1)
     assert client.command("again") == "echo:again"  # transparently reconnected
+    # The closed connection was detected before sending: "again" ran once.
+    assert commands_seen(server, "again") == [2]
     assert server.connections == 2
+
+
+def test_reset_idle_connection_is_replaced_before_sending(make_server, make_client):
+    def reply_then_reset(ctx, request_id):
+        ctx.reply(request_id, "bye")
+        return "reset"
+
+    server = make_server(vanilla({"once": reply_then_reset}))
+    client = make_client(server)
+    assert client.command("once") == "bye"
+    wait_until(lambda: server.closed == 1)
+    assert client.command("again") == "echo:again"
+    assert commands_seen(server, "again") == [2]
+
+
+def test_command_is_never_sent_twice(make_server, make_client):
+    """The server ran the command but the reply was lost: report, don't retry
+    (a retried kick would run twice and a say would be duplicated)."""
+    server = make_server(vanilla({"kick Alex": lambda ctx, request_id: False}))
+    client = make_client(server)
+    client.command("warmup")
+    with pytest.raises(RconUnavailable):
+        client.command("kick Alex")
+    assert commands_seen(server, "kick Alex") == [1]
+    assert server.connections == 1
+
+
+def test_send_refused_by_a_dead_connection_is_retried(
+    make_server, make_client, monkeypatch
+):
+    def reply_then_reset(ctx, request_id):
+        ctx.reply(request_id, "bye")
+        return "reset"
+
+    server = make_server(vanilla({"once": reply_then_reset}))
+    client = make_client(server)
+    assert client.command("once") == "bye"
+    wait_until(lambda: server.closed == 1)
+    wait_until(client._peer_closed)  # the reset has arrived
+    monkeypatch.setattr(client, "_peer_closed", lambda: False)  # miss it on purpose
+    assert client.command("again") == "echo:again"  # the send failed: safe to retry
+    assert commands_seen(server, "again") == [2]
 
 
 def test_unauthenticated_command_reply(make_server, make_client):

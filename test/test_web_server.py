@@ -8,6 +8,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from flask_login import login_user
+
+from src.auth import User
 from src.events import Event, EventBus
 from src.lifecycle.messages import ActionResult
 from src.minecraft import server_files
@@ -50,6 +53,15 @@ def make_server(snapshot=None):
     server = WebServer(controller, bus=bus)
     server.app.config["WTF_CSRF_ENABLED"] = False
     return server, controller, bus
+
+
+def open_stream(server):
+    """_handle_stream() as the logged-in admin (the route is login_required)."""
+    from src.settings import settings
+
+    with server.app.test_request_context():
+        login_user(User(str(settings.webUsername), server._credential_epoch()))
+        return server._handle_stream()
 
 
 def decode(message):
@@ -194,9 +206,8 @@ class TestServerSentEvents:
         server, controller, _ = make_server(snapshot)
         controller.get_snapshot.reset_mock()
 
-        with server.app.test_request_context():
-            response = server._handle_stream()
-            first = next(response.response)
+        response = open_stream(server)
+        first = next(response.response)
         response.response.close()
 
         assert first.startswith("retry: ")
@@ -207,8 +218,7 @@ class TestServerSentEvents:
 
     def test_initial_snapshot_precedes_queued_updates(self, mock_settings):
         server, controller, bus = make_server(make_snapshot(revision=1))
-        with server.app.test_request_context():
-            response = server._handle_stream()
+        response = open_stream(server)
 
         bus.publish(Event.BAN_ADDED, {"name": "x"})  # same revision -> queued
         controller.get_snapshot.return_value = make_snapshot(
@@ -255,8 +265,7 @@ class TestServerSentEvents:
     def test_keepalive_comment_when_idle(self, mock_settings):
         server, _, _ = make_server()
         server.sse_keepalive_interval = 0.01
-        with server.app.test_request_context():
-            response = server._handle_stream()
+        response = open_stream(server)
         next(response.response)
         assert next(response.response) == ": keepalive\n\n"
         response.response.close()
@@ -264,24 +273,21 @@ class TestServerSentEvents:
 
     def test_close_ends_open_streams_and_refuses_new_ones(self, mock_settings):
         server, _, _ = make_server()
-        with server.app.test_request_context():
-            response = server._handle_stream()
+        response = open_stream(server)
         next(response.response)
 
         server.close()
 
         with pytest.raises(StopIteration):
             next(response.response)
-        with server.app.test_request_context():
-            _, status = server._handle_stream()
+        _, status = open_stream(server)
         assert status == 503
 
     def test_client_limit(self, mock_settings, monkeypatch):
         server, _, _ = make_server()
         monkeypatch.setattr(server._streams, "_max_clients", 1)
-        with server.app.test_request_context():
-            first = server._handle_stream()
-            _, status = server._handle_stream()
+        first = open_stream(server)
+        _, status = open_stream(server)
         assert status == 503
         first.response.close()
 
@@ -292,7 +298,62 @@ class TestServerSentEvents:
         assert [client.get_nowait(), client.get_nowait()] == ["r2", "r3"]
 
 
+class TestStreamLifetime:
+    def test_stream_ends_when_the_session_would_expire(self, mock_settings):
+        mock_settings.sessionTimeout = 0.05
+        server, _, _ = make_server()
+        server.sse_keepalive_interval = 0.01
+        response = open_stream(server)
+        next(response.response)
+        rest = list(response.response)  # terminates on its own
+        assert all(chunk == ": keepalive\n\n" for chunk in rest)
+        assert len(server._streams) == 0
+
+    def test_stream_ends_when_credentials_change(self, mock_settings):
+        server, _, _ = make_server()
+        server.sse_keepalive_interval = 0.01
+        response = open_stream(server)
+        next(response.response)
+        assert next(response.response) == ": keepalive\n\n"
+        mock_settings.webPassword = "rotated-password"
+        assert list(response.response) == []
+
+    def test_no_snapshot_is_sent_after_the_grant_lapses(self, mock_settings):
+        server, controller, bus = make_server()
+        response = open_stream(server)
+        next(response.response)
+        mock_settings.webPassword = "rotated-password"
+        controller.get_snapshot.return_value = make_snapshot(
+            revision=9, state="RUNNING"
+        )
+        bus.publish(Event.SERVER_STARTED, {})
+        assert list(response.response) == []
+
+    def test_close_owner_ends_only_that_sessions_streams(self, mock_settings):
+        server, _, _ = make_server()
+        mine = server._streams.add("sid-a")
+        other = server._streams.add("sid-b")
+        assert server._streams.close_owner("sid-a") == 1
+        assert mine.get_nowait() is None
+        assert other.empty()
+
+    def test_load_user_requires_the_current_credential_epoch(self, mock_settings):
+        server, _, _ = make_server()
+        epoch = server._credential_epoch()
+        assert server._load_user(f"test_admin|{epoch}").username == "test_admin"
+        assert server._load_user("test_admin") is None  # pre-epoch session
+        assert server._load_user("test_admin|" + "0" * 32) is None
+        assert server._load_user(f"intruder|{epoch}") is None
+        mock_settings.webPassword = "changed"
+        assert server._load_user(f"test_admin|{epoch}") is None
+
+
 class TestHelpers:
+    def test_restart_frame_reads_as_starting(self):
+        assert status_label({"state": "STOPPED", "restartPending": True}) == "STARTING"
+        assert status_label({"state": "STOPPING", "restartPending": True}) == "STOPPING"
+        assert status_label({"state": "STOPPED", "restartPending": False}) == "OFFLINE"
+
     @pytest.mark.parametrize(
         "state,ready,label",
         [

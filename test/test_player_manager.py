@@ -2,6 +2,7 @@
 persistence (save on change, throttled timestamp-only saves)."""
 
 import json
+import os
 
 import pytest
 
@@ -132,6 +133,32 @@ class TestRoster:
         manager.update_from_roster(roster(online=0))
         assert manager.get_player_count() == 0
 
+    def test_partial_roster_trims_the_least_recently_seen_excess(self, env):
+        """Ping-only, more than 12 online: a leaver is dropped once the count
+        says fewer players are online than are tracked."""
+        manager = env.manager()
+        names = [OnlinePlayer(f"P{i:02d}") for i in range(15)]
+        manager.update_from_roster(roster(*names))  # all 15 seen at t=1000
+        for step, window in enumerate((names[1:13], names[3:15]), start=1):
+            env.wall.now = 1_000.0 + step * 5  # P00 is never sampled again
+            manager.update_from_roster(roster(*window, online=15))
+        assert manager.get_player_count() == 15  # count unchanged: nobody trimmed
+        env.wall.now = 1_020.0
+        manager.update_from_roster(roster(*names[2:14], online=14))  # P00 left
+        online = {p["name"] for p in manager.get_online_players()}
+        assert online == {f"P{i:02d}" for i in range(1, 15)}
+        left = [e for e in env.bus.events if e[0] == Event.PLAYER_LEFT]
+        assert left == [(Event.PLAYER_LEFT, {"name": "P00", "uuid": None})]
+
+    def test_find_player_returns_a_copy(self, env):
+        manager = env.manager()
+        manager.update_from_roster(roster(STEVE))
+        record = manager.find_player("STEVE")
+        assert (record["name"], record["uuid"]) == ("Steve", STEVE.uuid)
+        record["name"] = "changed"
+        assert manager.find_player("steve")["name"] == "Steve"
+        assert manager.find_player("nobody") is None
+
     def test_mark_all_offline_keeps_records_and_is_idempotent(self, env):
         manager = env.manager()
         manager.update_from_roster(roster(STEVE, ALEX))
@@ -208,11 +235,23 @@ class TestPersistence:
         manager.update_from_roster(roster(STEVE, ALEX))
         assert set(env.saved()["players"]) == {"steve", "alex"}
 
-    def test_corrupt_file_starts_empty(self, env):
+    @pytest.mark.parametrize("content", ["{not json", "[1, 2]"])
+    def test_corrupt_file_is_kept_aside_not_overwritten(self, env, content):
         env.path.parent.mkdir(parents=True, exist_ok=True)
-        env.path.write_text("{not json", encoding="utf-8")
+        env.path.write_text(content, encoding="utf-8")
         manager = env.manager()
         assert manager.get_all_players() == []
+        kept = list(env.path.parent.glob("players.json.corrupt-*"))
+        assert [p.read_text(encoding="utf-8") for p in kept] == [content]
+        manager.update_from_roster(roster(STEVE))
+        assert env.saved()["players"]["steve"]["name"] == "Steve"
+
+    def test_saves_are_fsynced_before_replacing(self, env, monkeypatch):
+        synced = []
+        real_fsync = os.fsync
+        monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd) or real_fsync(fd))
+        env.manager().update_from_roster(roster(STEVE))
+        assert synced
 
     def test_malformed_records_are_skipped(self, env):
         env.path.parent.mkdir(parents=True, exist_ok=True)

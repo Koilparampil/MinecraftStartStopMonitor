@@ -86,7 +86,7 @@ DEFAULTS = {
     # --- auto-stop ----------------------------------------------------
     "autoStopDelay": 600,  # seconds with zero players before stopping
     # --- monitor state ------------------------------------------------
-    "dataDir": "data",  # players.json, server.pid, server-console.log (relative to cwd)
+    "dataDir": "data",  # players.json, server.pid, server-console.log (relative to the settings file)
     # --- security -----------------------------------------------------
     **DEFAULT_SECURITY_SETTINGS,
 }
@@ -268,6 +268,22 @@ class Settings:
             logger.exception("Error from readSettings")
 
         self._ensure_session_secret_key(file_path)
+        self.resolve_paths(os.path.dirname(os.path.abspath(file_path)))
+
+    def resolve_paths(self, base_dir):
+        """Relative ``serverDir`` / ``dataDir`` from the settings file are
+        relative to the folder holding that file (not to the working
+        directory), so the monitor finds the same data wherever it is
+        started from. Absolute paths and ``~`` are kept as given (expanded).
+        """
+        for key in ("serverDir", "dataDir"):
+            value = self.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            path = os.path.expanduser(value.strip())
+            if not os.path.isabs(path):
+                path = os.path.normpath(os.path.join(base_dir, path))
+            self[key] = path
 
     def coerce_types(self):
         """Turn YAML strings like ``"25565"`` / ``"false"`` into int/bool.
@@ -323,6 +339,7 @@ class Settings:
             self.serverDir = os.path.abspath(os.path.expanduser(self.serverDir.strip()))
         props = self.read_server_properties()
         explicit_password = _blank_to_none(self.rconPassword)
+        explicit_port = _blank_to_none(self.serverPort)
 
         self.serverPort = _resolved_port(
             self.serverPort, props.get("server-port"), DEFAULT_GAME_PORT
@@ -336,12 +353,24 @@ class Settings:
         if self.listenerBindHost is None:
             self.listenerBindHost = props.get("server-ip", "") or ""
 
-        self._warn_about_properties(props, explicit_password)
+        self._warn_about_properties(props, explicit_password, explicit_port)
         return props
 
-    def _warn_about_properties(self, props, explicit_password):
+    def _warn_about_properties(self, props, explicit_password, explicit_port):
         if not props:
             return
+        file_port = _int_or(props.get("server-port"), None)
+        if (
+            explicit_port is not None
+            and file_port is not None
+            and file_port != self.serverPort
+        ):
+            logger.warning(
+                f"minecraft.port is {self.serverPort} but server.properties has "
+                f"server-port={file_port}: the monitor sleeps on and pings port "
+                f"{self.serverPort} while the server listens on {file_port}. "
+                "Make them match (or remove minecraft.port)."
+            )
         if explicit_password is not None and not _truthy(props.get("enable-rcon")):
             logger.warning(
                 "minecraft.rconPassword is set but server.properties does not have "

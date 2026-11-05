@@ -88,10 +88,21 @@ wake it up.
 
 ## Configuration
 
-`settings.yaml` lives next to the program (or point to another file with
-`--settings PATH` / `$MINECRAFT_MONITOR_SETTINGS`). See
+The settings file is the first of: `--settings PATH`,
+`$MINECRAFT_MONITOR_SETTINGS`, or `settings.yaml` next to the program
+(`src/settings.yaml` when running from source). See
 [`src/settings.yaml.example`](src/settings.yaml.example) for every option with
 comments. Values left `null` are read from the server's own `server.properties`.
+
+The monitor keeps its own files **next to `settings.yaml`**, wherever it is
+started from:
+- `monitor.log`, rotated at 5 MB with 3 backups;
+- `session_secret.key`;
+- the `data/` folder (`monitor.dataDir`), holding `players.json`, `server.pid`
+  and the server's launch output `server-console.log`.
+
+Relative paths in the file (`dataDir`, `serverDir`) are resolved against the
+settings file's folder.
 
 | Setting (YAML) | CLI flag | Description |
 |---|---|---|
@@ -173,8 +184,9 @@ journalctl -u minecraft-monitor -f
 ```
 
 - `User` must be the account that owns the Minecraft server files.
-- `WorkingDirectory` is where `monitor.log` and `data/` (players, PID file,
-  launch output) are written.
+- The monitor writes `monitor.log` and `data/` next to its `settings.yaml`.
+  `WorkingDirectory` only matters for a relative `--server-dir` on the command
+  line.
 - The unit uses `KillMode=process`: stopping or restarting the monitor leaves a
   running Minecraft server alone, and the next monitor adopts it. Stop the
   server from the dashboard first if you want it down.

@@ -2,7 +2,6 @@
 end-to-end run against the dummy Minecraft server."""
 
 import threading
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -15,10 +14,12 @@ from src.lifecycle.messages import (
     ProcessObservation,
     ProcessSnapshot,
     Roster,
+    RosterSample,
     StartCommand,
-    StopCommand,
+    StopResult,
 )
 from src.minecraft.client import RconError
+from src.lifecycle.supervisor import PROCESS_PRESENT_MESSAGE
 from src.minecraft_control import MinecraftController
 from test.support import wait_until
 from test.support.fakes import (
@@ -28,6 +29,7 @@ from test.support.fakes import (
     FakePlayerManager,
     FakeProcessManager,
     FakeWallClock,
+    HandledSpy,
     OffsetClock,
     fake_uuid,
     make_roster,
@@ -72,6 +74,7 @@ class Harness:
             wall_clock=self.wall,
         )
         self.controller.BAN_VERIFY_DELAY = 0
+        self.spy = HandledSpy(self.controller._supervisor)
         supervisor = self.controller._supervisor
         supervisor.server_starting_cooldown = 0
         supervisor.server_stopping_cooldown = 0
@@ -107,6 +110,12 @@ class Harness:
     def events_of(self, event_type):
         return [data for kind, data in self.events if kind == event_type]
 
+    def settle(self, kind, more=2):
+        """Wait until the lifecycle thread has consumed `more` further messages
+        of `kind` (fresh polls / scans), instead of sleeping."""
+        target = self.spy.count(kind) + more
+        wait_until(lambda: self.spy.count(kind) >= target)
+
     def online_names(self):
         return {p["name"] for p in self.snapshot()["players"] if p["currently_online"]}
 
@@ -124,7 +133,7 @@ def harness(mock_settings):
 class TestControllerLifecycle:
     def test_constructor_does_not_start_workers(self, harness):
         assert not any(t.name in CONTROLLER_THREAD_NAMES for t in threading.enumerate())
-        assert harness.controller.start_server() is False
+        assert harness.controller.start_server().success is False
 
     def test_stale_pid_startup_reconciles_and_does_not_block_start(self, harness):
         harness.players.seed("Steve", online=True)
@@ -140,14 +149,14 @@ class TestControllerLifecycle:
         assert [p["name"] for p in snapshot["players"]] == ["Steve"]
         assert snapshot["players"][0]["currently_online"] is False
 
-        assert harness.controller.start_server() is True
+        assert harness.controller.start_server().success is True
         wait_until(lambda: harness.controller.state == RUNNING)
 
     def test_start_command_commits_starting_then_running(self, harness):
         harness.pm.launch_identity = ProcessIdentity(2001, 20.0)
         harness.start()
 
-        assert harness.controller.start_server() is True
+        assert harness.controller.start_server().success is True
         wait_until(lambda: harness.controller.state == RUNNING)
 
         states = [data["state"] for data in harness.events_of(Event.LIFECYCLE_CHANGED)]
@@ -166,7 +175,7 @@ class TestControllerLifecycle:
         )
         harness.start()
 
-        assert harness.controller.start_server() is True
+        assert harness.controller.start_server().success is True
         wait_until(lambda: harness.controller.state == RUNNING)
 
         assert tracked_at_notification == [identity]
@@ -177,7 +186,7 @@ class TestControllerLifecycle:
         harness.pm.launch_identity = None
         harness.start()
 
-        assert harness.controller.start_server() is True
+        assert harness.controller.start_server().success is True
         wait_until(
             lambda: harness.controller.state == STOPPED and harness.pm.launch_calls
         )
@@ -193,7 +202,7 @@ class TestControllerLifecycle:
     def test_ready_once_the_server_answers(self, harness):
         harness.client.available = False
         harness.start_with_process()
-        time.sleep(0.05)
+        harness.settle(RosterSample, more=1)  # a failed poll was consumed
         assert harness.snapshot()["ready"] is False  # process up, still loading
 
         harness.client.available = True
@@ -209,7 +218,7 @@ class TestControllerLifecycle:
             lambda _data: online_at_stop.append(harness.players.get_player_count()),
         )
 
-        assert harness.controller.stop_server() is True
+        assert harness.controller.stop_server().success is True
         wait_until(lambda: harness.controller.state == STOPPED)
 
         snapshot = harness.snapshot()
@@ -230,21 +239,21 @@ class TestControllerLifecycle:
 
         harness.client.roster = make_roster("Alex")
         harness.pm.terminate_result = False
-        assert harness.controller.stop_server() is True
+        assert harness.controller.stop_server().success is True
         wait_until(lambda: harness.controller.state == RUNNING)
         wait_until(lambda: "Alex" in harness.online_names())
 
         harness.pm.terminate_result = True
-        assert harness.controller.stop_server() is True
+        assert harness.controller.stop_server().success is True
         wait_until(lambda: harness.controller.state == STOPPED)
 
     def test_pending_stop_stays_stopping_until_the_process_exits(self, harness):
         identity = harness.start_with_process()
         harness.pm.terminate_result = None
 
-        assert harness.controller.stop_server() is True
-        wait_until(lambda: harness.controller.state == STOPPING)
-        time.sleep(0.1)
+        assert harness.controller.stop_server().success is True
+        wait_until(lambda: harness.spy.count(StopResult) == 1)
+        harness.settle(ProcessObservation, more=1)  # a scan after the result
         assert harness.controller.state == STOPPING
 
         harness.pm.exit(identity)
@@ -256,10 +265,13 @@ class TestControllerLifecycle:
         gate = harness.client.hold(make_roster("Ghost"))
         wait_until(harness.client.entered.is_set)
 
-        assert harness.controller.stop_server() is True
+        assert harness.controller.stop_server().success is True
         wait_until(lambda: harness.controller.state == STOPPED)
+        handled = harness.spy.count(RosterSample)
         gate.set()
-        time.sleep(0.1)
+        wait_until(
+            lambda: harness.spy.count(RosterSample) > handled
+        )  # late answer consumed
 
         snapshot = harness.snapshot()
         assert snapshot["state"] == STOPPED
@@ -273,16 +285,18 @@ class TestControllerLifecycle:
         gate = harness.client.hold(make_roster("Ghost"))
         wait_until(harness.client.entered.is_set)
 
-        assert harness.controller.stop_server() is True
+        assert harness.controller.stop_server().success is True
         wait_until(lambda: harness.controller.state == STOPPED)
         harness.pm.launch_identity = ProcessIdentity(2002, 20.0)
         harness.client.roster = make_roster()
-        assert harness.controller.start_server() is True
+        assert harness.controller.start_server().success is True
         wait_until(lambda: harness.controller.state == RUNNING)
 
+        handled = harness.spy.count(RosterSample)
         gate.set()
-        wait_until(lambda: harness.snapshot()["playerData"] == "ok")
-        time.sleep(0.1)
+        # The late Ghost answer comes first, then this generation's polls.
+        wait_until(lambda: harness.spy.count(RosterSample) >= handled + 2)
+        assert harness.snapshot()["playerData"] == "ok"
         assert harness.snapshot()["playerCount"] == 0
         assert harness.players.get_player_count() == 0
 
@@ -296,11 +310,12 @@ class TestControllerLifecycle:
         harness.pm.observe_gate = gate
         assert harness.pm.observe_entered.wait(1)
 
-        assert harness.controller.stop_server() is True
+        assert harness.controller.stop_server().success is True
         wait_until(lambda: harness.controller.state == STOPPED)
         started_before = len(harness.events_of(Event.SERVER_STARTED))
+        scans = harness.spy.count(ProcessObservation)
         gate.set()
-        time.sleep(0.15)
+        wait_until(lambda: harness.spy.count(ProcessObservation) > scans)  # consumed
 
         assert harness.controller.state == STOPPED
         assert len(harness.events_of(Event.SERVER_STARTED)) == started_before
@@ -322,7 +337,7 @@ class TestControllerLifecycle:
         assert harness.pm.observe_entered.wait(1)
         assert harness.controller.state == STOPPED
 
-        assert harness.controller.start_server() is False
+        assert harness.controller.start_server().success is False
         assert harness.pm.launch_calls == []
 
         gate.set()
@@ -350,7 +365,7 @@ class TestControllerLifecycle:
 
         harness.pm.exit(identity)
         wait_until(lambda: harness.controller.state == STOPPED)
-        time.sleep(0.1)
+        harness.settle(ProcessObservation)  # more scans of the same exit
 
         assert len(harness.events_of(Event.SERVER_STOPPED)) == 1
 
@@ -372,7 +387,7 @@ class TestControllerLifecycle:
         first = harness.start_with_process(ProcessIdentity(1001, 10.0))
         harness.pm.terminate_block = threading.Event()
         harness.pm.terminate_mutates = False
-        assert harness.controller.stop_server() is True
+        assert harness.controller.stop_server().success is True
         wait_until(lambda: harness.controller.state == STOPPING)
         assert harness.pm.terminate_entered.wait(1)
 
@@ -381,7 +396,7 @@ class TestControllerLifecycle:
         wait_until(lambda: harness.controller.state == STOPPED)
 
         harness.pm.launch_identity = ProcessIdentity(2002, 20.0)
-        assert harness.controller.start_server() is True
+        assert harness.controller.start_server().success is True
         assert harness.controller.state == STARTING
         assert harness.pm.launch_calls == []
 
@@ -398,7 +413,7 @@ class TestControllerLifecycle:
         harness.pm.launch_identity = second
         harness.events.clear()
 
-        assert harness.controller.restart_server() is True
+        assert harness.controller.restart_server().success is True
 
         wait_until(lambda: harness.pm.tracked_identity == second)
         wait_until(lambda: harness.controller.state == RUNNING)
@@ -420,7 +435,7 @@ class TestControllerLifecycle:
         harness.pm.launch_identity = ProcessIdentity(2002, 20.0)
         harness.start()
 
-        assert harness.controller.restart_server() is True
+        assert harness.controller.restart_server().success is True
         wait_until(lambda: harness.controller.state == RUNNING)
 
     def test_repeated_start_and_close_leave_no_threads_or_subscriptions(self, harness):
@@ -455,7 +470,8 @@ class TestControllerAutoStop:
         gate = harness.client.hold()
         wait_until(harness.client.entered.is_set)
         harness.clock.advance(harness.settings.autoStopDelay + 1)
-        time.sleep(0.1)
+        # The expiry was handled: it always asks for one more sample.
+        wait_until(lambda: harness.supervisor.auto_stop_deadline is None)
         assert harness.controller.state == RUNNING
 
         # The blocked poll answers empty; a fresh sample shows a player.
@@ -472,7 +488,8 @@ class TestControllerAutoStop:
         gate = harness.client.hold()
         wait_until(harness.client.entered.is_set)
         harness.clock.advance(harness.settings.autoStopDelay + 1)
-        time.sleep(0.1)
+        # The expiry was handled: it always asks for one more sample.
+        wait_until(lambda: harness.supervisor.auto_stop_deadline is None)
         assert harness.controller.state == RUNNING
 
         gate.set()
@@ -486,7 +503,7 @@ class TestControllerAutoStop:
         wait_until(lambda: harness.snapshot()["playerCount"] == 3)
 
         harness.clock.advance(31 + harness.settings.autoStopDelay * 3)
-        time.sleep(0.1)
+        harness.settle(RosterSample)
 
         assert harness.controller.state == RUNNING
         assert harness.snapshot()["autoStopAt"] is None
@@ -506,7 +523,7 @@ class TestControllerAutoStop:
         assert left == []
 
         harness.clock.advance(120)
-        time.sleep(0.1)
+        harness.settle(RosterSample)
         assert harness.controller.state == RUNNING
 
         harness.client.available = True
@@ -520,17 +537,17 @@ class TestControllerAutoStop:
         harness.start_with_process(ProcessIdentity(1001, 10.0))
         wait_until(lambda: harness.snapshot()["playerData"] == "ok")
         harness.clock.advance(30)
-        time.sleep(0.05)
+        wait_until(lambda: harness.supervisor.auto_stop_deadline is not None)
 
-        assert harness.controller.stop_server() is True
+        assert harness.controller.stop_server().success is True
         wait_until(lambda: harness.controller.state == STOPPED)
         harness.pm.launch_identity = ProcessIdentity(2002, 20.0)
-        assert harness.controller.start_server() is True
+        assert harness.controller.start_server().success is True
         wait_until(lambda: harness.controller.state == RUNNING)
 
         # The first generation's deadline would have passed by now.
         harness.clock.advance(31)
-        time.sleep(0.1)
+        harness.settle(RosterSample)
         assert harness.controller.state == RUNNING
 
         harness.clock.advance(harness.settings.autoStopDelay + 5)
@@ -544,22 +561,52 @@ class TestControllerAutoStop:
 
 @pytest.fixture
 def moderation(mock_settings):
+    """enter(state) -> a Harness whose running controller is held in `state`
+    (offline ban edits run on the lifecycle thread, so the runtime runs)."""
+    mock_settings.pollingRate = 0.01
     h = Harness(mock_settings)
-    supervisor = h.supervisor
+    gates = []
+
+    def hold(attribute):
+        gate = threading.Event()
+        gates.append(gate)
+        setattr(h.pm, attribute, gate)
 
     def enter(state):
         if state in (RUNNING, STOPPING):
-            h.pm.found = ProcessIdentity(1001, 10.0)
-            h.pm.alive.add(1001)
-            supervisor.handle(ProcessObservation(supervisor.generation, h.pm.observe()))
-        if state == STOPPING:
-            supervisor.handle(StopCommand())
+            h.start_with_process()
+        else:
+            h.start()
+            wait_until(lambda: h.events_of(Event.SERVER_STOPPED))  # reconciled
         if state == STARTING:
-            supervisor.handle(StartCommand())
+            hold("launch_block")
+            h.pm.launch_identity = ProcessIdentity(2002, 20.0)
+            assert h.controller.start_server().success
+            wait_until(h.pm.launch_entered.is_set)
+        if state == STOPPING:
+            hold("terminate_block")
+            assert h.controller.stop_server().success
+            wait_until(h.pm.terminate_entered.is_set)
         assert h.controller.state == state
         return h
 
-    return enter
+    yield enter
+    for gate in gates:
+        gate.set()
+    h.close()
+
+
+def hold_detection(h):
+    """Park the detection worker (it would adopt any process it finds);
+    returns the gate that releases it."""
+    gate = threading.Event()
+    h.pm.gated_snapshot = ProcessSnapshot(
+        tracked=None, tracked_running=False, found=None
+    )
+    h.pm.observe_entered.clear()
+    h.pm.observe_gate = gate
+    assert h.pm.observe_entered.wait(2)
+    return gate
 
 
 def assert_failure(result, *fragments):
@@ -679,12 +726,66 @@ class TestModerationRules:
     def test_no_offline_edit_while_an_unadopted_server_runs(self, moderation):
         h = moderation(STOPPED)
         h.players.seed("Griefer", uuid=fake_uuid("Griefer"))
-        h.pm.found = ProcessIdentity(4242, 42.0)
+        gate = hold_detection(h)
+        try:
+            h.pm.found = ProcessIdentity(4242, 42.0)
 
-        assert_failure(h.controller.ban_player("Griefer"), "process is running")
-        assert_failure(h.controller.unban_player("Griefer"), "process is running")
+            assert h.controller.ban_player("Griefer") == ActionResult(
+                False, PROCESS_PRESENT_MESSAGE
+            )
+            assert h.controller.unban_player("Griefer") == ActionResult(
+                False, PROCESS_PRESENT_MESSAGE
+            )
+        finally:
+            gate.set()
         assert h.bans.offline_add_calls == []
         assert h.bans.offline_remove_calls == []
+
+    def test_an_offline_edit_and_a_start_never_interleave(self, moderation):
+        h = moderation(STOPPED)
+        h.players.seed("Griefer", uuid=fake_uuid("Griefer"))
+        h.pm.launch_identity = ProcessIdentity(2002, 20.0)
+        order = []
+        entered, release = threading.Event(), threading.Event()
+        add_ban = h.bans.add_ban_offline
+        launch = h.pm.launch_process
+
+        def slow_add(*args):
+            entered.set()
+            release.wait(5)
+            result = add_ban(*args)
+            order.append("ban written")
+            return result
+
+        def recorded_launch():
+            order.append("launch")
+            return launch()
+
+        h.bans.add_ban_offline = slow_add
+        h.pm.launch_process = recorded_launch
+        results = []
+        banner = threading.Thread(
+            target=lambda: results.append(h.controller.ban_player("Griefer"))
+        )
+        banner.start()
+        assert entered.wait(2)  # the edit runs on the lifecycle thread
+
+        # A wake arrives meanwhile: its start waits behind the edit.
+        start = StartCommand()
+        starter = threading.Thread(
+            target=h.controller._runtime.submit_command, args=(start,)
+        )
+        starter.start()
+        queue = h.controller._runtime._observations
+        wait_until(lambda: _queued(queue, start))
+        release.set()
+        banner.join(5)
+        starter.join(5)
+
+        wait_until(lambda: h.controller.state == RUNNING)
+        assert results[0].success is True
+        assert start.result is True
+        assert order == ["ban written", "launch"]
 
     @pytest.mark.parametrize("state", [STARTING, STOPPING])
     def test_bans_cannot_change_while_starting_or_stopping(self, moderation, state):
@@ -865,7 +966,7 @@ class TestEndToEndWithDummyServer:
             lambda: (Event.SERVER_STOPPED, STOPPED) in stack.events
         )  # reconciled
 
-        assert controller.start_server() is True
+        assert controller.start_server().success is True
         first = self.wait_ready(stack)
         wait_until(lambda: controller.get_snapshot()["playerCount"] == 1)
         snapshot = controller.get_snapshot()
@@ -882,7 +983,7 @@ class TestEndToEndWithDummyServer:
         assert controller.run_console_command("list").success is True
 
         stack.events.clear()
-        assert controller.restart_server() is True
+        assert controller.restart_server().success is True
         wait_until(
             lambda: controller.state == RUNNING and stack.events[-1][1] == RUNNING,
             timeout=30,
@@ -924,3 +1025,8 @@ def _kill_launched(process_manager, pids):
                 member.kill()
         except psutil.Error:
             continue
+
+
+def _queued(observations, item) -> bool:
+    with observations.mutex:
+        return item in observations.queue

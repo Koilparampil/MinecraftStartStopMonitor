@@ -32,12 +32,40 @@ logger = logging.getLogger(__name__)
 _PRUNE_THRESHOLD = 1024
 
 
-class User(UserMixin):
-    """The single dashboard administrator, as seen by Flask-Login."""
+# Separates the username from the credential epoch in the Flask-Login id.
+# The epoch is hex, so the last separator is always the right one.
+_EPOCH_SEPARATOR = "|"
 
-    def __init__(self, username):
-        self.id = username
+
+class User(UserMixin):
+    """The single dashboard administrator, as seen by Flask-Login.
+
+    The id stored in the session and the remember-me cookie is
+    ``<username>|<credential epoch>``: changing the password changes the
+    epoch, which revokes every existing session and remember cookie.
+    """
+
+    def __init__(self, username, epoch=""):
         self.username = username
+        self.epoch = epoch
+        self.id = f"{username}{_EPOCH_SEPARATOR}{epoch}" if epoch else username
+
+
+def credential_epoch(username, password, secret_key) -> str:
+    """HMAC (keyed with the session secret) of a hash of the credentials."""
+    material = hashlib.sha256(
+        f"{username}\0{password}".encode("utf-8", "surrogatepass")
+    ).digest()
+    key = (
+        secret_key.encode("utf-8") if isinstance(secret_key, str) else bytes(secret_key)
+    )
+    return hmac.new(key, material, hashlib.sha256).hexdigest()[:32]
+
+
+def split_user_id(user_id) -> tuple[str, str]:
+    """(username, epoch) from a Flask-Login id; epoch is "" when absent."""
+    username, separator, epoch = str(user_id).rpartition(_EPOCH_SEPARATOR)
+    return (username, epoch) if separator else (str(user_id), "")
 
 
 def verify_credentials(

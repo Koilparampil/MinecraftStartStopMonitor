@@ -869,3 +869,132 @@ class TestRealServer:
         with session.get(base + "/stream", stream=True, timeout=10):
             # A held-open SSE connection must not block other requests.
             assert session.get(base + "/banned", timeout=5).status_code == 200
+
+
+# ----------------------------------------------------------------------
+# Session-bound streams and credential revocation
+# ----------------------------------------------------------------------
+
+
+class TestSessionSecurity:
+    def test_logout_ends_that_sessions_stream(self, auth_client):
+        response = auth_client.get("/stream", buffered=False)
+        chunks = iter(response.response)
+        assert sse_payload(next(chunks))["data"]["revision"] == 1
+        assert auth_client.post("/logout").status_code == 302
+        with pytest.raises(StopIteration):
+            next(chunks)
+        response.close()
+
+    def test_logout_leaves_other_sessions_streams_alone(self, web, auth_client):
+        other = web.app.test_client()
+        login(other)
+        mine = auth_client.get("/stream", buffered=False)
+        theirs = other.get("/stream", buffered=False)
+        next(iter(mine.response))
+        their_chunks = iter(theirs.response)
+        next(their_chunks)
+        auth_client.post("/logout")
+        web.controller.get_snapshot.return_value = make_snapshot(revision=2)
+        web.bus.publish(Event.SERVER_STATUS, {})
+        assert sse_payload(next(their_chunks))["data"]["revision"] == 2
+        mine.close()
+        theirs.close()
+
+    def test_stream_ends_when_the_session_would_expire(
+        self, auth_client, web, mock_settings
+    ):
+        web.sse_keepalive_interval = 0.02
+        mock_settings.sessionTimeout = 0.2
+        response = auth_client.get("/stream", buffered=False)
+        started = time.monotonic()
+        rest = list(response.response)  # ends by itself
+        assert time.monotonic() - started < 3
+        assert all(not chunk.startswith(b"data: ") for chunk in rest[1:])
+        response.close()
+
+    def test_password_change_revokes_sessions_and_remember_cookies(
+        self, client, mock_settings
+    ):
+        assert login(client, remember="on").status_code == 302
+        client.delete_cookie(f"mcmonitor_session_{mock_settings.webServerPort}")
+        assert client.get("/").status_code == 200  # restored from the remember cookie
+        mock_settings.webPassword = "a-brand-new-password"
+        assert client.get("/").status_code == 302
+        assert client.get("/banned").status_code == 401
+
+    def test_pre_epoch_session_ids_are_rejected(self, client):
+        with client.session_transaction() as session:
+            session["_user_id"] = "test_admin"
+            session["_fresh"] = True
+        assert client.get("/").status_code == 302
+
+
+class TestNoExternalRequests:
+    def test_pages_reference_no_third_party_hosts(self, client, auth_client):
+        for html in (
+            client.get("/login").get_data(as_text=True),
+            auth_client.get("/").get_data(as_text=True),
+        ):
+            assert "googleapis" not in html
+            assert "gstatic" not in html
+
+    def test_csp_is_self_only_for_styles_and_fonts(self, auth_client):
+        csp = auth_client.get("/").headers["Content-Security-Policy"]
+        assert "style-src 'self';" in csp
+        assert "font-src 'self';" in csp
+        assert "googleapis" not in csp
+
+    def test_bundled_font_and_its_license_are_served(self, client):
+        font = client.get("/static/fonts/PressStart2P-Regular.ttf")
+        license_text = client.get("/static/fonts/OFL.txt")
+        assert font.status_code == 200 and len(font.data) > 10000
+        assert b"SIL OPEN FONT LICENSE" in license_text.data.upper()
+        font.close()
+        license_text.close()
+
+
+class TestRestartFrames:
+    def test_stopped_with_pending_restart_renders_as_starting(self, auth_client, web):
+        web.controller.get_snapshot.return_value = make_snapshot(
+            state="STOPPED", restartPending=True
+        )
+        html = auth_client.get("/").get_data(as_text=True)
+        assert '<span id="statusText">STARTING</span>' in html
+        assert "Restarting" in html
+        start = re.search(r'<button[^>]*id="startBtn"[^>]*>', html).group(0)
+        assert "disabled" in start
+
+    def test_stopping_with_pending_restart_offers_cancel(self, auth_client, web):
+        web.controller.get_snapshot.return_value = make_snapshot(
+            state="STOPPING", restartPending=True
+        )
+        html = auth_client.get("/").get_data(as_text=True)
+        stop = re.search(r'<button[^>]*id="stopBtn"[^>]*>', html).group(0)
+        assert "disabled" not in stop
+        assert '<span id="stopLabel">Cancel restart</span>' in html
+
+    def test_plain_stopping_keeps_stop_disabled(self, auth_client, web):
+        web.controller.get_snapshot.return_value = make_snapshot(state="STOPPING")
+        html = auth_client.get("/").get_data(as_text=True)
+        assert "disabled" in re.search(r'<button[^>]*id="stopBtn"[^>]*>', html).group(0)
+
+
+class TestControllerMessages:
+    @pytest.mark.parametrize("success", [True, False])
+    def test_action_result_message_is_shown_verbatim(self, auth_client, web, success):
+        web.controller.stop_server.return_value = ActionResult(
+            success, "Restart cancelled; the server stays offline."
+        )
+        body = auth_client.post("/action", data={"action": "stopServer"}).get_json()
+        assert body["success"] is success
+        assert body["message"] == "Restart cancelled; the server stays offline."
+
+    def test_action_result_without_message_gets_a_default(self, auth_client, web):
+        web.controller.start_server.return_value = ActionResult(True, "")
+        assert (
+            auth_client.post("/action", data={"action": "startServer"}).get_json()[
+                "message"
+            ]
+            == "Starting the server…"
+        )

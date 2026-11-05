@@ -74,20 +74,39 @@ def read_varint(data, pos):
             return value, pos
 
 
+def recv_exact(sock, size):
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("closed before a whole packet arrived")
+        data += chunk
+    return data
+
+
+def recv_packet(sock):
+    """One length-prefixed frame, like a real client reads it."""
+    length = shift = 0
+    while True:
+        byte = recv_exact(sock, 1)[0]
+        length |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return recv_exact(sock, length)
+
+
 def join_attempt(port, name, protocol=PROTOCOL_1_20_1):
-    """Handshake (next_state=2) + Login Start; returns the disconnect JSON."""
+    """Handshake (next_state=2) + Login Start; returns the disconnect JSON.
+    Closes right after the disconnect packet, as the game client does."""
     with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
         handshake = varint(protocol) + mc_string("localhost") + struct.pack(">H", port)
         sock.sendall(frame(0x00, handshake + varint(2)))
         sock.sendall(frame(0x00, mc_string(name) + b"\x00"))  # no UUID (1.19.3-1.20.1)
-        data = b""
-        while chunk := sock.recv(4096):
-            data += chunk
-    _length, pos = read_varint(data, 0)
-    packet_id, pos = read_varint(data, pos)
+        packet = recv_packet(sock)
+    packet_id, pos = read_varint(packet, 0)
     assert packet_id == 0x00, f"expected Login Disconnect, got {packet_id:#x}"
-    text_length, pos = read_varint(data, pos)
-    return json.loads(data[pos : pos + text_length].decode("utf-8"))
+    text_length, pos = read_varint(packet, pos)
+    return json.loads(packet[pos : pos + text_length].decode("utf-8"))
 
 
 def message_text(component):

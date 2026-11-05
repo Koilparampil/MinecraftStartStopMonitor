@@ -36,8 +36,10 @@ pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
 class Monitor:
     """One `python -m src.main` child; always killed by the fixture."""
 
-    def __init__(self, workdir, settings_path, extra_args=("--no-web",)):
+    def __init__(self, workdir, settings_path, extra_args=("--no-web",), cwd=None):
         self.workdir = workdir
+        self.cwd = cwd or workdir
+        self.settings_dir = Path(settings_path).parent
         self.args = [sys.executable, "-m", "src.main", "--settings", str(settings_path)]
         self.args += list(extra_args)
         self.process = None
@@ -49,7 +51,7 @@ class Monitor:
         with open(self.stdout_path, "wb") as stdout:
             self.process = subprocess.Popen(
                 self.args,
-                cwd=self.workdir,
+                cwd=self.cwd,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout,
@@ -59,7 +61,7 @@ class Monitor:
 
     @property
     def log(self):
-        path = self.workdir / "monitor.log"
+        path = self.settings_dir / "monitor.log"  # next to the settings file
         return path.read_text(encoding="utf-8") if path.exists() else ""
 
     @property
@@ -99,7 +101,7 @@ def workspace(tmp_path):
             "processName": DUMMY_PROCESS_NAME,
         },
         "web": {"enabled": False, "password": WEB_PASSWORD},
-        "monitor": {"dataDir": str(tmp_path / "data")},
+        "monitor": {"dataDir": "data"},  # relative: next to settings.yaml
     }
     settings_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
     monitors = []
@@ -114,8 +116,8 @@ def workspace(tmp_path):
         servers = spawned_servers
 
         @staticmethod
-        def monitor(settings=settings_path, extra_args=("--no-web",)):
-            monitor = Monitor(tmp_path, settings, extra_args)
+        def monitor(settings=settings_path, extra_args=("--no-web",), cwd=None):
+            monitor = Monitor(tmp_path, settings, extra_args, cwd)
             monitors.append(monitor)
             return monitor
 
@@ -128,7 +130,9 @@ def workspace(tmp_path):
 
 
 def test_starts_sleeps_and_exits_cleanly_on_sigterm(workspace):
-    monitor = workspace.monitor().start()
+    elsewhere = workspace.root / "elsewhere"  # started from another folder
+    elsewhere.mkdir()
+    monitor = workspace.monitor(cwd=elsewhere).start()
     monitor.wait_for_log(f"Sleeping on 127.0.0.1:{workspace.game}")
     monitor.wait_for_log("press Ctrl+C to stop the monitor")  # blocked, waiting
     assert JavaServer("127.0.0.1", workspace.game, timeout=3).status(
@@ -146,6 +150,9 @@ def test_starts_sleeps_and_exits_cleanly_on_sigterm(workspace):
     assert "|  \\/  |" in monitor.stdout  # banner
     assert "Minecraft Monitor is running" in monitor.stdout  # logs go to stdout too
     assert can_bind(workspace.game)
+    # monitor.log and data/ follow the settings file, not the working directory.
+    assert (workspace.root / "data").is_dir()
+    assert list(elsewhere.iterdir()) == []
 
 
 def test_first_run_without_a_terminal_prints_help_and_exits_1(workspace):

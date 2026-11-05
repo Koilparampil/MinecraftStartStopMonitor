@@ -5,10 +5,12 @@ import json
 import queue
 import random
 import socket
+import sys
 import threading
 import time
 import uuid
 
+import psutil
 import pytest
 from mcstatus import JavaServer, LegacyServer
 
@@ -31,6 +33,7 @@ from src.minecraft.sleeping import (
     handle_connection,
     status_json,
 )
+from test.support import wait_until
 
 PLAYER_UUID = uuid.UUID("8667ba71-b85a-4004-af54-457a9734eed7")
 CONFIG = SleepingServerConfig(
@@ -435,3 +438,54 @@ def test_bad_timeout_values_fall_back_to_the_default(timeout):
             right, "1.2.3.4", CONFIG, lambda name, ip: (True, None), timeout=timeout
         )
     assert outcome.kind == ConnectionKind.INVALID
+
+
+def test_bungeecord_forwarded_handshake_wakes(sleeper):
+    """IP forwarding appends ip, UUID and a properties JSON to the address."""
+    properties = json.dumps(
+        [{"name": "textures", "value": "e" * 700, "signature": "s" * 1400}]
+    )
+    address = "\0".join(["mc.example.com", "203.0.113.7", PLAYER_UUID.hex, properties])
+    assert len(address) > 2000
+    server = sleeper()
+    with connect(server.port) as sock:
+        sock.sendall(handshake(763, 2, address) + login_start(763, "Proxied"))
+        assert read_disconnect(sock)["text"] == CONFIG.kick_message
+    outcome = server.outcome()
+    assert (outcome.kind, outcome.player_name, outcome.wake) == (
+        ConnectionKind.LOGIN,
+        "Proxied",
+        True,
+    )
+
+
+def _tcp_states(port_a, port_b):
+    return {
+        (c.laddr.port, c.raddr.port): c.status
+        for c in psutil.net_connections("tcp")
+        if c.raddr and {c.laddr.port, c.raddr.port} == {port_a, port_b}
+    }
+
+
+def test_the_client_closes_first_and_holds_time_wait(sleeper, monkeypatch):
+    monkeypatch.setattr(sleeping, "DRAIN_SECONDS", 5.0)
+    server = sleeper()
+    with connect(server.port) as sock:
+        client_port = sock.getsockname()[1]
+        sock.sendall(handshake(763) + login_start(763, "Alex"))
+        read_disconnect(sock)
+        sock.settimeout(0.2)
+        with pytest.raises(TimeoutError):
+            sock.recv(1)  # no FIN yet: the server waits for the client to close
+    outcome, elapsed = server.outcome_and_time()
+    assert outcome.wake is True
+    assert elapsed < 2.5  # released as soon as the client closed, not after 5 s
+    if sys.platform.startswith("linux"):
+        client_side, server_side = (
+            (client_port, server.port),
+            (server.port, client_port),
+        )
+        wait_until(
+            lambda: _tcp_states(*client_side).get(client_side) == psutil.CONN_TIME_WAIT
+        )
+        assert _tcp_states(*client_side).get(server_side) != psutil.CONN_TIME_WAIT

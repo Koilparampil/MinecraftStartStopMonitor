@@ -23,8 +23,18 @@
 #   the monitor saves the world and stops it gracefully.
 #
 #   Caveat: a server left running when you `systemctl stop` the monitor is no
-#   longer managed (no auto-stop) until the monitor starts again. On machine
-#   shutdown systemd still sends it SIGTERM, which makes the server save and exit.
+#   longer managed (no auto-stop) until the monitor starts again.
+#
+# Machine shutdown / reboot:
+#   With KillMode=process the Minecraft server is not stopped together with
+#   this unit; it is caught by systemd's final sweep of leftover processes:
+#   SIGTERM (the server's JVM shutdown hook saves the world and exits), then
+#   SIGKILL once DefaultTimeoutStopSec has passed (90 s by default). A big
+#   modded world can take longer than that to save. Either stop the server
+#   from the dashboard before shutting down, or raise the timeout, e.g. in
+#   /etc/systemd/system.conf:
+#       DefaultTimeoutStopSec=300s
+#   (then `sudo systemctl daemon-reexec`).
 
 [Unit]
 Description=Minecraft Monitor (auto start/stop + web dashboard)

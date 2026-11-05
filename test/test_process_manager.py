@@ -378,3 +378,52 @@ class TestLaunchFailures:
         assert "launch failed" in log
         assert manager.tracked_identity is None
         assert not os.path.exists(mock_settings.data_path("server.pid"))
+
+
+class TestLauncherOutlivingTheServer:
+    """observe(): a launcher left behind by its server (run.bat's `pause`)."""
+
+    def scan(self, manager, monkeypatch, tree_has_server):
+        manager.set_known_identity(ProcessIdentity(4242, 10.0))
+        answers = iter(tree_has_server)
+        monkeypatch.setattr(
+            "src.process_manager._tree_has_server", lambda _pid, _target: next(answers)
+        )
+        monkeypatch.setattr(manager, "identity_is_running", lambda _identity: True)
+        monkeypatch.setattr(manager, "find_process_identity", lambda: None)
+        return [manager.observe().tracked_running for _ in tree_has_server]
+
+    def test_two_scans_without_the_server_end_it(self, manager, monkeypatch):
+        assert self.scan(manager, monkeypatch, [True, False, False]) == [
+            True,
+            True,
+            False,
+        ]
+
+    def test_a_returning_server_resets_the_count(self, manager, monkeypatch):
+        answers = [True, False, True, False, True]
+
+        assert self.scan(manager, monkeypatch, answers) == [True] * 5
+
+    def test_a_launcher_that_never_had_a_server_is_left_alone(
+        self, manager, monkeypatch
+    ):
+        # Still launching: the JVM has not appeared yet.
+        assert self.scan(manager, monkeypatch, [False, False, False]) == [True] * 3
+
+    def test_an_unreadable_tree_changes_nothing(self, manager, monkeypatch):
+        assert self.scan(manager, monkeypatch, [True, None, None]) == [True] * 3
+
+    def test_a_new_identity_starts_over(self, manager, monkeypatch):
+        assert self.scan(manager, monkeypatch, [True, False]) == [True, True]
+        manager.set_known_identity(ProcessIdentity(5252, 20.0))
+
+        assert self.scan_again(manager, monkeypatch, [False, False]) == [True, True]
+
+    @staticmethod
+    def scan_again(manager, monkeypatch, tree_has_server):
+        answers = iter(tree_has_server)
+        monkeypatch.setattr(
+            "src.process_manager._tree_has_server", lambda _pid, _target: next(answers)
+        )
+        return [manager.observe().tracked_running for _ in tree_has_server]

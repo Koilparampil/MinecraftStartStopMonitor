@@ -28,15 +28,22 @@ check and the commit that follows it.
 Every commit changes its data first and bumps the snapshot revision last,
 right before its notification is published, so a snapshot that carries a new
 revision is always complete.
+
+Every command gets an outcome (``command.outcome``, an ``ActionResult``) that
+says why it was refused, or what is happening, before its waiter is released.
 """
 
 import logging
+import math
 import threading
 import time
+from dataclasses import dataclass
 
 from src.events import Event, EventBus
 from src.lifecycle import auto_stop
 from src.lifecycle.messages import (
+    ActionResult,
+    Command,
     LaunchRequest,
     LaunchResult,
     LifecycleState,
@@ -76,6 +83,65 @@ SNAPSHOT_KEYS = (
     "restartPending",
 )
 
+# Messages carried by command outcomes (shown to the admin as-is).
+STARTING_MESSAGE = "Starting the server."
+STOPPING_MESSAGE = "Stopping the server."
+RESTARTING_MESSAGE = "Restarting the server."
+RESTART_CANCELLED_MESSAGE = "Restart cancelled: the server will stay stopped."
+NOT_RUNNING_MESSAGE = "The server is not running."
+RESTART_IN_PROGRESS_MESSAGE = "A restart is already in progress."
+PROCESS_PRESENT_MESSAGE = (
+    "A Minecraft server process is already running in the server directory; "
+    "the monitor will adopt it within a few seconds."
+)
+DISCOVERY_FAILED_MESSAGE = (
+    "Could not check for a running server process (see the monitor log)."
+)
+_START_REFUSED = {
+    LifecycleState.STARTING: "The server is already starting.",
+    LifecycleState.RUNNING: "The server is already running.",
+    LifecycleState.STOPPING: "The server is stopping; start it again once it has stopped.",
+}
+_STOP_REFUSED = {
+    LifecycleState.STOPPED: NOT_RUNNING_MESSAGE,
+    LifecycleState.STARTING: "The server is still launching; stop it once it is running.",
+    LifecycleState.STOPPING: "The server is already stopping.",
+}
+_RESTART_REFUSED = {
+    LifecycleState.STARTING: "The server is still launching; restart it once it is running.",
+    LifecycleState.STOPPING: _START_REFUSED[LifecycleState.STOPPING],
+}
+
+
+@dataclass(frozen=True)
+class AutoStopRequest(StopRequest):
+    """A stop decided by the auto-stop policy. Nobody is waiting for it, so the
+    process backend must never force-kill a server it cannot stop gracefully."""
+
+
+class OfflineEditCommand(Command):
+    """Run ``edit()`` (an offline banned-players.json change) on the lifecycle
+    thread, only while the server is STOPPED and no server process exists.
+
+    Commands are handled one at a time, so a start (an auto-start wake) can
+    never launch the server between that check and the write.
+    """
+
+    def __init__(self, edit):
+        super().__init__()
+        self.edit = edit
+
+
+def settle(command, success: bool, message: str = "", outcome=None) -> None:
+    """Record a command's outcome and release whoever waits for it."""
+    command.result = success
+    command.outcome = outcome if outcome is not None else ActionResult(success, message)
+    command.done.set()
+
+
+def _whole_seconds(seconds: float) -> int:
+    return max(1, math.ceil(seconds))
+
 
 class Supervisor:
     def __init__(
@@ -94,8 +160,8 @@ class Supervisor:
         self._clock = clock or time.monotonic  # deadlines, cooldowns
         self._wall_clock = wall_clock or time.time  # snapshot timestamps
 
-        self.server_starting_cooldown = 5
-        self.server_stopping_cooldown = 5
+        self.server_starting_cooldown = 5  # start -> start
+        self.server_stopping_cooldown = 5  # stop -> start (debounces wakes)
         # None reads settings.pollingRate at call time; tests may pin a value.
         self.poll_interval: float | None = None
         self.last_server_started_time = float("-inf")
@@ -178,6 +244,7 @@ class Supervisor:
             (StartCommand, self._handle_start_command),
             (StopCommand, self._handle_stop_command),
             (RestartCommand, self._handle_restart_command),
+            (OfflineEditCommand, self._handle_offline_edit),
             (LaunchResult, self._handle_launch_result),
             (StopResult, self._handle_stop_result),
             (ProcessObservation, self._handle_process_observation),
@@ -187,6 +254,8 @@ class Supervisor:
             if isinstance(item, message_type):
                 return handler(item)
         logger.warning(f"Ignoring unknown lifecycle observation: {item!r}")
+        if isinstance(item, Command):
+            settle(item, False, "Unknown lifecycle command.")
         return []
 
     def next_timeout(self) -> float | None:
@@ -234,55 +303,53 @@ class Supervisor:
     # ------------------------------------------------------------------
 
     def _handle_start_command(self, command) -> list:
-        request = self._begin_start() if self._start_allowed() else None
-        command.result = request is not None
+        reason = self._start_rejection()
+        if reason is not None:
+            logger.warning(f"Start refused: {reason}")
+            settle(command, False, reason)
+            return []
+        request = self._begin_start()
         # The command is accepted before the listener is asked to release the
         # port, so the auto-start thread never waits on this command.
-        command.done.set()
-        if request is None:
-            return []
+        settle(command, True, STARTING_MESSAGE)
         logger.info("Starting the Minecraft server")
         self._publish_lifecycle(LifecycleState.STARTING, request.generation)
         return [request]
 
     def _handle_stop_command(self, command: StopCommand) -> list:
         if self._cancel_pending_restart():
-            command.result = True
-            command.done.set()
+            settle(command, True, RESTART_CANCELLED_MESSAGE)
             return []
         return self._request_stop(command, restart=False)
 
     def _handle_restart_command(self, command: RestartCommand) -> list:
-        state = self.state
-        if state == LifecycleState.STOPPED:
+        if self.state == LifecycleState.STOPPED:
             return self._handle_start_command(command)
-        if state == LifecycleState.RUNNING:
-            return self._request_stop(command, restart=True)
-        logger.warning(f"Cannot restart the Minecraft server while it is {state}.")
-        command.result = False
-        command.done.set()
-        return []
-
-    def _start_allowed(self) -> bool:
-        reason = self._start_rejection()
-        if reason is None and self._server_process_present():
-            reason = (
-                "A Minecraft server process is already running in the server directory."
-            )
-        if reason is not None:
-            logger.warning(reason)
-            return False
-        return True
+        return self._request_stop(command, restart=True)
 
     def _start_rejection(self) -> str | None:
+        reason = self._start_state_rejection()
+        if reason is None:
+            reason = self._server_process_reason()
+        return reason
+
+    def _start_state_rejection(self) -> str | None:
         now = self._clock()
         with self._state_lock:
-            if self._state != LifecycleState.STOPPED:
-                return "The Minecraft server is already running or starting."
-            if now - self.last_server_started_time < self.server_starting_cooldown:
-                return "Tried to start the server too quickly multiple times."
-            if now - self.last_server_stopped_time < self.server_stopping_cooldown:
-                return "Tried to start the server too quickly after stopping it."
+            state = self._state
+            restarting = self._restart_pending
+            started_ago = now - self.last_server_started_time
+            stopped_ago = now - self.last_server_stopped_time
+        if state != LifecycleState.STOPPED:
+            if restarting:
+                return RESTART_IN_PROGRESS_MESSAGE
+            return _START_REFUSED.get(state, _START_REFUSED[LifecycleState.RUNNING])
+        if started_ago < self.server_starting_cooldown:
+            wait = _whole_seconds(self.server_starting_cooldown - started_ago)
+            return f"The server was started moments ago; try again in {wait} s."
+        if stopped_ago < self.server_stopping_cooldown:
+            wait = _whole_seconds(self.server_stopping_cooldown - stopped_ago)
+            return f"The server stopped moments ago; try again in {wait} s."
         return None
 
     def _begin_start(self) -> LaunchRequest:
@@ -299,29 +366,31 @@ class Supervisor:
 
     def _request_stop(self, command, restart: bool) -> list:
         with self._state_lock:
-            reason = self._stop_rejection_locked()
+            reason = self._stop_rejection_locked(restart)
             request = None if reason else self._begin_stop_locked(restart=restart)
-        if reason:
-            logger.warning(reason)
-        command.result = request is not None
-        if request is not None:
-            verb = "Restarting" if restart else "Stopping"
-            logger.info(f"{verb} the Minecraft server")
-            self._publish_lifecycle(LifecycleState.STOPPING, request.generation)
-        command.done.set()
-        return [request] if request is not None else []
+        if request is None:
+            logger.warning(f"{'Restart' if restart else 'Stop'} refused: {reason}")
+            settle(command, False, reason)
+            return []
+        message = RESTARTING_MESSAGE if restart else STOPPING_MESSAGE
+        logger.info(message.replace("the server", "the Minecraft server"))
+        self._publish_lifecycle(LifecycleState.STOPPING, request.generation)
+        settle(command, True, message)
+        return [request]
 
-    def _stop_rejection_locked(self) -> str | None:
-        if self._state != LifecycleState.RUNNING or self._identity is None:
-            return "An attempt to stop the Minecraft server was made, but it was not running."
-        if (
-            self._clock() - self.last_server_stopped_time
-            < self.server_stopping_cooldown
-        ):
-            return "Tried to stop the server too quickly after the previous stop."
-        return None
+    def _stop_rejection_locked(self, restart: bool) -> str | None:
+        # No stop -> stop cooldown: a stop needs RUNNING, which already
+        # proves the previous stop is over.
+        if self._state == LifecycleState.RUNNING and self._identity is not None:
+            return None
+        if self._state == LifecycleState.STOPPING and self._restart_pending:
+            return RESTART_IN_PROGRESS_MESSAGE
+        refusals = _RESTART_REFUSED if restart else _STOP_REFUSED
+        return refusals.get(self._state, NOT_RUNNING_MESSAGE)
 
-    def _begin_stop_locked(self, restart: bool = False) -> StopRequest | None:
+    def _begin_stop_locked(
+        self, restart: bool = False, auto: bool = False
+    ) -> StopRequest | None:
         identity = self._identity
         if identity is None:
             return None
@@ -330,11 +399,12 @@ class Supervisor:
         self._auto_stop = auto_stop.cancelled(self._auto_stop)
         self._poll_due_at = None
         self._poll_inflight = False
-        return StopRequest(self._generation, identity)
+        request_type = AutoStopRequest if auto else StopRequest
+        return request_type(self._generation, identity)
 
-    def _begin_stop(self) -> list:
+    def _begin_auto_stop(self) -> list:
         with self._state_lock:
-            request = self._begin_stop_locked()
+            request = self._begin_stop_locked(auto=True)
         if request is None:
             return []
         self._publish_lifecycle(LifecycleState.STOPPING, request.generation)
@@ -350,6 +420,30 @@ class Supervisor:
         logger.info("Stop requested during a restart: the server will stay stopped")
         self._publish_lifecycle(LifecycleState.STOPPING, generation)
         return True
+
+    def _handle_offline_edit(self, command: OfflineEditCommand) -> list:
+        state = self.state
+        if state == LifecycleState.STOPPED:
+            reason = self._server_process_reason()
+        else:
+            reason = (
+                f"The server is {state.lower()}; bans can be changed while it is "
+                "running (over RCON) or stopped."
+            )
+        if reason is not None:
+            settle(command, False, reason)
+            return []
+        # Lifecycle thread, outside the state lock: no start can interleave.
+        outcome = self._call(command.edit)
+        if not isinstance(outcome, ActionResult):
+            outcome = ActionResult(
+                bool(outcome),
+                ""
+                if outcome
+                else "The ban list could not be changed; see the monitor log.",
+            )
+        settle(command, outcome.success, outcome.message, outcome)
+        return []
 
     # ------------------------------------------------------------------
     # Observations
@@ -392,7 +486,9 @@ class Supervisor:
             self._poll_due_at = self._clock()
             self._poll_inflight = False
             generation = self._generation
-        logger.warning("Stop failed while the process is still alive; resuming polling")
+        logger.warning(
+            "The server is still running after the stop attempt; resuming polling"
+        )
         self._publish_lifecycle(LifecycleState.RUNNING, generation)
 
     def _handle_process_observation(self, observation: ProcessObservation) -> list:
@@ -533,8 +629,10 @@ class Supervisor:
         self._log_auto_stop_change(armed_before, armed_after, online)
         self._publish_status(generation)
         if decision == auto_stop.AutoStopDecision.STOP:
-            logger.info("Auto-stop: the server stayed empty; stopping it")
-            return self._begin_stop()
+            logger.info(
+                "Auto-stop: a fresh sample confirmed the server is empty; stopping it"
+            )
+            return self._begin_auto_stop()
         return []
 
     # ------------------------------------------------------------------
@@ -700,24 +798,31 @@ class Supervisor:
     # Discovery and auto-stop helpers
     # ------------------------------------------------------------------
 
-    def _server_process_present(self) -> bool:
-        """True when a tracked or discoverable server process is alive."""
-        pm = self.process_manager
+    def _server_process_reason(self) -> str | None:
+        """Why launching (or editing server files) now is unsafe, if it is."""
         try:
-            tracked = pm.tracked_identity
-            if tracked is not None and pm.identity_is_running(tracked):
-                return True
-            # No live tracked identity is not proof that no server exists: the
-            # first detection scan may not have adopted it yet.
-            if pm.find_process_identity() is not None:
-                return True
-            if tracked is not None:
-                pm.clear_identity(tracked)
-            return False
+            present = self._find_server_process()
         except Exception:
-            # Never risk two servers on one world: refuse to start.
+            # Never risk two servers on one world.
             logger.exception("Process discovery failed")
+            return DISCOVERY_FAILED_MESSAGE
+        return PROCESS_PRESENT_MESSAGE if present else None
+
+    def _server_process_present(self) -> bool:
+        return self._server_process_reason() is not None
+
+    def _find_server_process(self) -> bool:
+        pm = self.process_manager
+        tracked = pm.tracked_identity
+        if tracked is not None and pm.identity_is_running(tracked):
             return True
+        # No live tracked identity is not proof that no server exists: the
+        # first detection scan may not have adopted it yet.
+        if pm.find_process_identity() is not None:
+            return True
+        if tracked is not None:
+            pm.clear_identity(tracked)
+        return False
 
     def _poll_interval(self) -> float:
         if self.poll_interval is not None:
@@ -740,8 +845,6 @@ class Supervisor:
             logger.info(f"Auto-stop cancelled: {online} player(s) online")
 
     def _expire_auto_stop(self, generation: int) -> list:
-        stop_now = False
-        revalidate = False
         with self._state_lock:
             if self._state != LifecycleState.RUNNING or self._generation != generation:
                 self._auto_stop = auto_stop.cancelled(self._auto_stop)
@@ -749,22 +852,12 @@ class Supervisor:
             self._auto_stop, decision = auto_stop.on_expiry(
                 self._auto_stop,
                 config=self._auto_stop_config(),
-                now=self._clock(),
                 generation=generation,
-                poll_inflight=self._poll_inflight,
-                poll_due_at=self._poll_due_at,
                 poll_seq=self._poll_seq,
-                poll_interval=self._poll_interval(),
             )
-            if decision == auto_stop.AutoStopDecision.REVALIDATE:
-                revalidate = True
-                if not self._poll_inflight:
-                    self._poll_due_at = self._clock()
-            elif decision == auto_stop.AutoStopDecision.STOP:
-                stop_now = True
-        if stop_now:
-            logger.info("Auto-stop delay elapsed with a fresh empty sample")
-            return self._begin_stop()
+            revalidate = decision == auto_stop.AutoStopDecision.REVALIDATE
+            if revalidate and not self._poll_inflight:
+                self._poll_due_at = self._clock()
         if revalidate:
             logger.info("Auto-stop delay elapsed; confirming with a fresh sample")
         return []

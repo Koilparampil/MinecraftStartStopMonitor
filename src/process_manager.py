@@ -26,9 +26,16 @@ reports into lifecycle state.
   command line contains ``settings.processName``. Launch wrappers are normal
   (Forge's ``run.sh`` is ``sh`` running ``java`` as a child), so a process
   counts together with its descendants.
+- A launcher that outlives its server (Forge's ``run.bat`` ends with
+  ``pause``, scripts may ``read``) does not keep the server "running": once
+  the tree has had a server process, two scans without one count as an exit
+  (the first also closes our stdin pipe so such a launcher can return).
 - Stop: ``stop`` on our stdin pipe (or the RCON ``graceful_stopper`` for an
-  adopted server), wait ``stopTimeout`` for the whole tree, then terminate
-  (SIGTERM runs the JVM shutdown hook, which saves the worlds), then kill.
+  adopted server; also RCON when stdin did not work within 15 s), wait
+  ``stopTimeout`` for the whole tree, then terminate (SIGTERM runs the JVM
+  shutdown hook, which saves the worlds) and wait ``max(30, stopTimeout)``,
+  then kill. An unattended stop (auto-stop) never force-kills a server that
+  cannot be asked to stop (Windows without stdin pipe or RCON).
 """
 
 import contextlib
@@ -301,6 +308,16 @@ def _with_descendants(processes) -> set:
     return tree
 
 
+def _tree_has_server(pid: int, target: str) -> bool | None:
+    """Whether the process or a live descendant matches processName (None: unknown)."""
+    try:
+        root = psutil.Process(pid)
+        tree = [root, *root.children(recursive=True)]
+    except (psutil.Error, OSError):
+        return None
+    return any(match_rank(_info_of(p), target) and _is_alive(p) for p in tree)
+
+
 def _oldest_first(processes) -> list:
     def created(process):
         try:
@@ -362,9 +379,11 @@ class OSProcessManager:
     """
 
     windows = IS_WINDOWS
-    TERMINATE_TIMEOUT = 30.0  # after SIGTERM (TerminateProcess on Windows)
+    TERMINATE_TIMEOUT = 30.0  # at least, after SIGTERM: max(this, stopTimeout)
     KILL_TIMEOUT = 10.0  # after SIGKILL
     WAIT_INTERVAL = 0.2
+    STDIN_STOP_GRACE = 15.0  # then also send `stop` over RCON
+    SERVER_GONE_SCANS = 2  # scans without the server before its launcher is ignored
 
     def __init__(
         self,
@@ -376,6 +395,8 @@ class OSProcessManager:
         self._lock = threading.RLock()
         self._identity: ProcessIdentity | None = None
         self._popen: subprocess.Popen | None = None
+        self._server_seen = False  # the tracked tree has had a server process
+        self._missing_scans = 0  # consecutive scans without one since then
         self._load_identity_from_file()
 
     # ------------------------------------------------------------------
@@ -396,6 +417,8 @@ class OSProcessManager:
         with self._lock:
             if self._popen is not None and self._popen.pid != identity.pid:
                 self._release_popen_locked()
+            if not identity.matches(self._identity):
+                self._reset_tree_watch_locked()
             self._identity = identity
             self._write_pid_file(identity)
 
@@ -406,6 +429,7 @@ class OSProcessManager:
             if current is None or expected is None or not current.matches(expected):
                 return False
             self._identity = None
+            self._reset_tree_watch_locked()
             self._remove_pid_file()
             if self._popen is not None and self._popen.pid == current.pid:
                 self._release_popen_locked()
@@ -414,8 +438,12 @@ class OSProcessManager:
     def identity_is_running(self, identity: ProcessIdentity | None) -> bool:
         if identity is None:
             return False
-        self._reap(self._popen_for(identity))
-        return _identity_is_live(identity)
+        popen = self._popen_for(identity)
+        self._reap(popen)
+        live = _identity_is_live(identity)
+        if not live:
+            self._reap(popen)  # it may have exited between the two checks
+        return live
 
     def find_process_identity(self) -> ProcessIdentity | None:
         """A live (non-zombie) process whose cwd is settings.serverDir and whose
@@ -447,13 +475,54 @@ class OSProcessManager:
         return any(match_rank(_info_of(member), target) for member in tree)
 
     def observe(self) -> ProcessSnapshot:
-        """I/O-only observation for the lifecycle supervisor."""
+        """I/O-only observation for the lifecycle supervisor (one per scan)."""
         tracked = self.tracked_identity
+        running = self.identity_is_running(tracked)
+        if running and self._launcher_outlived_server(tracked):
+            running = False
         return ProcessSnapshot(
             tracked=tracked,
-            tracked_running=self.identity_is_running(tracked),
+            tracked_running=running,
             found=self.find_process_identity(),
         )
+
+    def _launcher_outlived_server(self, tracked: ProcessIdentity) -> bool:
+        """True once the server has been missing from the tracked tree for
+        SERVER_GONE_SCANS scans in a row while its launcher lingers.
+
+        Only after the tree has had a server process (a launcher may take a
+        moment to start the JVM). The first such scan closes our stdin pipe,
+        so a launcher waiting in ``pause``/``read`` returns by itself.
+        """
+        has_server = _tree_has_server(tracked.pid, str(settings.processName or ""))
+        with self._lock:
+            if has_server is None or not tracked.matches(self._identity):
+                return False
+            if has_server:
+                self._server_seen, self._missing_scans = True, 0
+                return False
+            if not self._server_seen:
+                return False
+            self._missing_scans += 1
+            missing = self._missing_scans
+        if missing == 1:
+            logger.info(
+                f"The server exited but its launcher (pid {tracked.pid}) is still "
+                "running; closing its console input"
+            )
+            popen = self._popen_for(tracked)
+            if popen is not None:
+                self._close_stdin(popen)
+        elif missing == self.SERVER_GONE_SCANS:
+            logger.warning(
+                f"The launcher (pid {tracked.pid}) outlived the server; treating "
+                "the server as stopped"
+            )
+        return missing >= self.SERVER_GONE_SCANS
+
+    def _reset_tree_watch_locked(self):
+        self._server_seen = False
+        self._missing_scans = 0
 
     # ------------------------------------------------------------------
     # Launch
@@ -486,6 +555,7 @@ class OSProcessManager:
             self._release_popen_locked()
             self._popen = popen
             self._identity = identity
+            self._reset_tree_watch_locked()
             self._write_pid_file(identity)
         logger.info(
             f"Launched the Minecraft server (pid {popen.pid}) in {server_dir}: "
@@ -526,12 +596,17 @@ class OSProcessManager:
     # Graceful stop chain
     # ------------------------------------------------------------------
 
-    def terminate_process(self, expected: ProcessIdentity | None = None) -> bool | None:
+    def terminate_process(
+        self, expected: ProcessIdentity | None = None, force: bool = True
+    ) -> bool | None:
         """Graceful stop chain. True=gone, False=still alive, None=pending.
 
         Blocking (runs on the runtime's process worker): ``stop`` on our
-        stdin, else ``graceful_stopper()``; wait up to ``stopTimeout`` for the
-        process tree; terminate the tree and wait ``TERMINATE_TIMEOUT``; kill.
+        stdin (plus RCON if that has not worked within STDIN_STOP_GRACE),
+        else ``graceful_stopper()``; wait up to ``stopTimeout`` for the
+        process tree; terminate the tree and wait ``max(30, stopTimeout)``;
+        kill. ``force=False`` (an unattended auto-stop) never force-kills a
+        server that could not be asked to stop (Windows: no graceful signal).
         """
         with self._lock:
             current = self._identity
@@ -545,7 +620,7 @@ class OSProcessManager:
         if root is None:
             self.clear_identity(current)
             return True
-        if not self._stop_tree(root, popen):
+        if not self._stop_tree(root, popen, force):
             return False
         self.clear_identity(current)
         return True
@@ -562,34 +637,79 @@ class OSProcessManager:
             return None  # the PID now belongs to another process: ours is gone
         return process if _is_alive(process) else None
 
-    def _stop_tree(self, root: psutil.Process, popen) -> bool:
+    def _stop_tree(self, root: psutil.Process, popen, force: bool) -> bool:
         tree = _with_descendants({root})
         timeout = _seconds(settings.stopTimeout, DEFAULT_STOP_TIMEOUT)
-        if self._request_graceful_stop(root.pid, popen):
-            term_wait = self.TERMINATE_TIMEOUT
-        elif self.windows:
-            logger.warning(
-                f"Could not ask server process {root.pid} to stop (no console pipe, "
-                f"RCON unavailable); waiting {timeout:g}s before terminating it"
-            )
-            term_wait = self.TERMINATE_TIMEOUT
-        else:
-            # SIGTERM runs the JVM shutdown hook, which saves the worlds.
-            logger.warning(
-                f"Could not send 'stop' to server process {root.pid} (no console "
-                "pipe, RCON unavailable); sending SIGTERM"
-            )
-            return self._force_stop(tree, popen, max(self.TERMINATE_TIMEOUT, timeout))
-
-        if not self._wait_for_exit(tree, timeout, popen):
+        term_wait = max(self.TERMINATE_TIMEOUT, timeout)  # never kill mid-save
+        channel = self._request_graceful_stop(root.pid, popen)
+        if channel is None:
+            return self._stop_unrequested(tree, popen, root.pid, force)
+        if not self._wait_graceful(tree, popen, channel, timeout, root.pid):
             return True
         logger.warning(f"The server did not stop within {timeout:g}s; terminating it")
         return self._force_stop(tree, popen, term_wait)
 
-    def _request_graceful_stop(self, pid: int, popen) -> bool:
+    def _stop_unrequested(self, tree: set, popen, pid: int, force: bool) -> bool:
+        """No `stop` could be delivered (no console pipe, RCON unavailable)."""
+        timeout = _seconds(settings.stopTimeout, DEFAULT_STOP_TIMEOUT)
+        term_wait = max(self.TERMINATE_TIMEOUT, timeout)
+        if not self.windows:
+            # SIGTERM runs the JVM shutdown hook, which saves the worlds.
+            logger.warning(
+                f"Could not send 'stop' to server process {pid} (no console pipe, "
+                "RCON unavailable); sending SIGTERM"
+            )
+            return self._force_stop(tree, popen, term_wait)
+        if not force:
+            logger.warning(
+                f"Auto-stop skipped: server process {pid} cannot be asked to stop "
+                "(no console pipe, RCON unavailable) and Windows could only "
+                "force-kill it. It keeps running; enable RCON so it can be saved "
+                "and stopped automatically."
+            )
+            return False
+        logger.warning(
+            f"Could not ask server process {pid} to stop (no console pipe, RCON "
+            f"unavailable); waiting {timeout:g}s, then force-terminating it on "
+            "request (progress since the last autosave may be lost)"
+        )
+        if not self._wait_for_exit(tree, timeout, popen):
+            return True
+        return self._force_stop(tree, popen, term_wait)
+
+    def _wait_graceful(
+        self, tree: set, popen, channel: str, timeout: float, pid: int
+    ) -> list:
+        """Wait for the tree after a graceful request. When `stop` went to
+        stdin but the tree lives on after STDIN_STOP_GRACE (a launch script
+        that does not pass stdin to the JVM), also ask over RCON."""
+        grace = self.STDIN_STOP_GRACE
+        if (
+            channel == "stdin"
+            and self._graceful_stopper is not None
+            and timeout > grace
+        ):
+            if not self._wait_for_exit(tree, grace, popen):
+                return []
+            logger.info(
+                f"Server process {pid} is still running {grace:g}s after 'stop' "
+                "on its console; also sending 'stop' over RCON"
+            )
+            self._call_stopper()
+            timeout -= grace
+        return self._wait_for_exit(tree, timeout, popen)
+
+    def _request_graceful_stop(self, pid: int, popen) -> str | None:
+        """'stdin', 'rcon' or None (no stop could be delivered)."""
         if popen is not None and self._send_console_stop(popen):
             logger.info(f"Sent 'stop' to the server console (pid {pid})")
-            return True
+            return "stdin"
+        if self._call_stopper():
+            logger.info(f"Requested a graceful stop over RCON (pid {pid})")
+            return "rcon"
+        return None
+
+    def _call_stopper(self) -> bool:
         stopper = self._graceful_stopper
         if stopper is None:
             return False
@@ -598,9 +718,7 @@ class OSProcessManager:
         except Exception:
             logger.exception("The graceful stop request (RCON) failed")
             return False
-        if sent:
-            logger.info(f"Requested a graceful stop over RCON (pid {pid})")
-        else:
+        if not sent:
             logger.warning("The graceful stop request (RCON) was not delivered")
         return sent
 

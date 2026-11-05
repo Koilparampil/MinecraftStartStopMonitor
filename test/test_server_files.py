@@ -4,7 +4,9 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import struct
+import subprocess
 import zlib
 
 import pytest
@@ -353,3 +355,111 @@ def test_tail_file_replaces_invalid_utf8(tmp_path):
     path = tmp_path / "latest.log"
     path.write_bytes(b"ok\n\xff\xfe bad\n")
     assert tail_file(str(path)) == ["ok", "\ufffd\ufffd bad"]
+
+
+# ----------------------------------------------------------------------
+# Appending after a dangling continuation (Java would join the next line)
+# ----------------------------------------------------------------------
+
+DANGLING = [
+    ("level-name=C:\\worlds\\", {"level-name": "C:worlds"}),
+    ("level-name=C:\\worlds\\\n", {"level-name": "C:worlds"}),
+    ("motd=hi\r\nlevel-name=a\\\r\n", {"motd": "hi", "level-name": "a"}),
+    ("a=x\\\n\\", {"a": "x"}),  # dropping one backslash exposes another
+    ("a=x\\\n  y\\", {"a": "xy"}),
+    ("a=\\\\\\", {"a": "\\"}),
+    ("key\\", {"key": ""}),
+    ("a=x\\\n\n", {"a": "x"}),  # already ended by an empty line
+    ("#comment\\", {}),  # comments never continue
+]
+NEW_KEYS = {"enable-rcon": "true", "rcon.port": "25575", "rcon.password": "p=w:d #1 é"}
+
+
+@pytest.mark.parametrize(("text", "before"), DANGLING)
+def test_append_after_a_dangling_continuation(tmp_path, text, before):
+    path = tmp_path / "server.properties"
+    path.write_bytes(text.encode("utf-8"))
+    assert read_properties(str(path)) == before
+    assert update_properties(str(path), NEW_KEYS) is True
+    assert read_properties(str(path)) == {**before, **NEW_KEYS}
+    written = path.read_bytes()
+    assert update_properties(str(path), NEW_KEYS) is False  # idempotent
+    assert path.read_bytes() == written
+
+
+JAVA_DUMP = r"""
+import java.io.*; import java.nio.charset.StandardCharsets; import java.nio.file.*; import java.util.*;
+public class Dump {
+    static String hex(String s) {
+        StringBuilder b = new StringBuilder("x");
+        for (char c : s.toCharArray()) b.append(String.format("%04x", (int) c));
+        return b.toString();
+    }
+    public static void main(String[] args) throws Exception {
+        for (String a : args) {
+            Properties p = new Properties();
+            try (Reader r = Files.newBufferedReader(Paths.get(a), StandardCharsets.UTF_8)) { p.load(r); }
+            System.out.println("FILE");
+            for (String k : new TreeSet<>(p.stringPropertyNames()))
+                System.out.println(hex(k) + " " + hex(p.getProperty(k)));
+        }
+    }
+}
+"""
+
+
+def _java_properties(tmp_path, files):
+    source = tmp_path / "Dump.java"
+    source.write_text(JAVA_DUMP, encoding="utf-8")
+    out = subprocess.run(
+        ["java", str(source), *map(str, files)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    ).stdout
+    result = []
+    for line in out.splitlines():
+        if line == "FILE":
+            result.append({})
+        elif line:
+            key, value = (
+                bytes.fromhex(part[1:]).decode("utf-16-be", "surrogatepass")
+                for part in line.split(" ")
+            )
+            result[-1][key] = value
+    return result
+
+
+@pytest.mark.skipif(shutil.which("java") is None, reason="needs a Java runtime")
+def test_java_reads_updated_files_like_we_do(tmp_path):
+    """Differential check against java.util.Properties (what the server uses)."""
+    files = []
+    for index, text in enumerate([SAMPLE, *(text for text, _ in DANGLING)]):
+        path = tmp_path / f"case{index}.properties"
+        path.write_bytes(text.encode("utf-8"))
+        update_properties(
+            str(path), {**NEW_KEYS, "motd": " §a lead", "multi": "a\\b\nc"}
+        )
+        files.append(path)
+    assert _java_properties(tmp_path, files) == [
+        read_properties(str(path)) for path in files
+    ]
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() != 0, reason="needs root to chown"
+)
+def test_writes_keep_the_owner(tmp_path):
+    """A wizard run with sudo must not leave root-owned server files."""
+    server = tmp_path / "server"
+    server.mkdir()
+    os.chown(server, 4321, 4322)
+    path = server / "server.properties"
+    path.write_text("a=1\n", encoding="utf-8")
+    os.chown(path, 4321, 4322)
+    update_properties(str(path), {"a": "2"})
+    write_eula(str(server), True)  # a new file takes the directory's owner
+    for written in (path, server / "eula.txt"):
+        info = os.stat(written)
+        assert (info.st_uid, info.st_gid) == (4321, 4322)

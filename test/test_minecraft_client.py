@@ -461,3 +461,36 @@ def test_default_construction_without_password():
     assert client.rcon_enabled is False
     client.close()
     assert MinecraftClient("127.0.0.1", 25565, 25575, "pw").rcon_enabled is True
+
+
+@pytest.mark.parametrize(
+    ("text", "online", "names_expected"),
+    [
+        # EssentialsX with vanished players: visible/hidden, both online.
+        (
+            "There are 1/1 out of maximum 20 players online.\nAdmins: [HIDDEN]Bob, Alex",
+            2,
+            ["Bob", "Alex"],
+        ),
+        (
+            "§6There are §c0§6/§c1§6 out of maximum §c20§6 players online.\n§6Admins§r: [HIDDEN]Bob",
+            1,
+            ["Bob"],
+        ),
+        ("There are 0/2 out of a maximum of 20 players online.", 2, []),
+    ],
+)
+def test_parse_list_counts_hidden_players(text, online, names_expected):
+    roster = parse_list_response(text)
+    assert (roster.online, roster.max_players, names(roster)) == (
+        online,
+        20,
+        names_expected,
+    )
+
+
+def test_roster_from_status_never_counts_below_named_players():
+    roster = roster_from_status(
+        status(online=0, sample=(("Alex", ALEX), ("Steve", STEVE)))
+    )
+    assert roster.online == 2

@@ -18,6 +18,8 @@ calls, and can block to simulate slow I/O. No processes, sockets or files.
 - ``FakePlayerManager`` / ``FakeBanlistManager``: the app-shell managers'
   APIs over dicts, publishing their events when given a bus.
 - ``make_roster(*names, online=None, ...)`` and ``fake_uuid(name)`` helpers.
+- ``HandledSpy(supervisor)``: counts messages once the lifecycle thread has
+  handled them, so tests wait for consumption instead of sleeping.
 """
 
 import hashlib
@@ -125,6 +127,7 @@ class FakeProcessManager:
         self.find_error = None  # exception raised by find_process_identity()
         self.launch_calls = []
         self.terminate_calls = []
+        self.terminate_forced = []  # the force flag of each terminate call
         self.find_calls = 0
         self.closed = False
 
@@ -180,8 +183,9 @@ class FakeProcessManager:
             self.found = self.identity
             return self.identity
 
-    def terminate_process(self, expected=None):
+    def terminate_process(self, expected=None, force=True):
         self.terminate_calls.append(expected)
+        self.terminate_forced.append(force)
         if self.terminate_block is not None:
             self.terminate_entered.set()
             self.terminate_block.wait(5)
@@ -495,3 +499,33 @@ class FakeBanlistManager:
         self.server_pardon(name)
         self.refresh()
         return ActionResult(True, f"Unbanned {name}.")
+
+
+class HandledSpy:
+    """Wrap ``supervisor.handle`` to count messages after they were handled.
+
+    The runtime looks ``supervisor.handle`` up per message, so the spy sees
+    everything the lifecycle thread processes. ``count(kind)`` is the number
+    of handled messages of that type; wait for it to grow instead of sleeping.
+    """
+
+    def __init__(self, supervisor):
+        self._lock = threading.Lock()
+        self._handled = []
+        self._handle = supervisor.handle
+        supervisor.handle = self._spy
+
+    def _spy(self, item):
+        try:
+            return self._handle(item)
+        finally:
+            with self._lock:
+                self._handled.append(item)
+
+    def count(self, kind=object, predicate=None):
+        with self._lock:
+            return sum(
+                1
+                for item in self._handled
+                if isinstance(item, kind) and (predicate is None or predicate(item))
+            )

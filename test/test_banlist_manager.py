@@ -203,10 +203,40 @@ class TestOfflineEdits:
         assert read(bans)[0] == GRIEFER
         assert len(read(bans)) == 2
 
-    def test_uuid_from_usercache_when_not_given(self, bus, server_dir, bans):
+    def test_uuid_and_name_from_usercache_when_not_given(self, bus, server_dir, bans):
         write(server_dir / "usercache.json", [{"name": "Steve", "uuid": STEVE_UUID}])
         assert BanlistManager(bus).add_ban_offline("steve").success
+        assert (read(bans)[0]["uuid"], read(bans)[0]["name"]) == (STEVE_UUID, "Steve")
+
+    def test_uuid_is_normalized(self, bus, bans):
+        undashed = STEVE_UUID.replace("-", "").upper()
+        assert BanlistManager(bus).add_ban_offline("Steve", uuid=undashed).success
         assert read(bans)[0]["uuid"] == STEVE_UUID
+
+    def test_invalid_uuid_argument_is_ignored(self, bus, server_dir, bans):
+        write(server_dir / "usercache.json", [{"name": "Steve", "uuid": STEVE_UUID}])
+        assert BanlistManager(bus).add_ban_offline("Steve", uuid="not-a-uuid").success
+        assert read(bans)[0]["uuid"] == STEVE_UUID
+
+    def test_tracked_players_give_the_canonical_name(self, bus, bans):
+        class Tracked:
+            @staticmethod
+            def find_player(name):
+                if name.lower() == "notch":
+                    return {"name": "Notch", "uuid": STEVE_UUID.upper()}
+                return None
+
+        manager = BanlistManager(bus, known_players=Tracked())
+        assert manager.add_ban_offline("NOTCH").success
+        assert (read(bans)[0]["name"], read(bans)[0]["uuid"]) == ("Notch", STEVE_UUID)
+
+    def test_offline_uuid_uses_the_canonical_name(self, bus, server_dir, bans):
+        (server_dir / "server.properties").write_text(
+            "online-mode=false\n", encoding="utf-8"
+        )
+        write(server_dir / "usercache.json", [{"name": "Steve"}])  # name only
+        assert BanlistManager(bus).add_ban_offline("STEVE").success
+        assert read(bans)[0]["uuid"] == offline_uuid("Steve")
 
     def test_offline_uuid_only_in_offline_mode(self, bus, server_dir, bans):
         manager = BanlistManager(bus)

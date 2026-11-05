@@ -21,9 +21,13 @@ snapshots come from the supervisor. Moderation follows the committed state:
   verified against ``banned-players.json``, which the server writes on
   ``/ban`` and ``/pardon``.
 - STOPPED: ban/unban edit ``banned-players.json`` offline; the server reads it
-  on its next start.
+  on its next start. The edit runs as a lifecycle command, so no start (an
+  auto-start wake) can launch the server between the check and the write.
 - Anything else fails with a clear message: the file is never edited while a
   server process may be running.
+
+Start/stop/restart return an ``ActionResult`` (truthy when accepted) whose
+message says what happens next or why the command was refused.
 
 No method raises: every failure is ``ActionResult(success=False, message=...)``.
 """
@@ -41,7 +45,7 @@ from src.lifecycle.messages import (
     StopCommand,
 )
 from src.lifecycle.runtime import LifecycleRuntime
-from src.lifecycle.supervisor import Supervisor
+from src.lifecycle.supervisor import OfflineEditCommand, Supervisor
 from src.minecraft.client import RconError
 
 logger = logging.getLogger(__name__)
@@ -131,15 +135,15 @@ class MinecraftController:
         Never stops the Minecraft server."""
         self._runtime.close()
 
-    def start_server(self) -> bool:
+    def start_server(self) -> ActionResult:
         logger.info("Minecraft server start requested")
         return self._runtime.submit_command(StartCommand())
 
-    def stop_server(self) -> bool:
+    def stop_server(self) -> ActionResult:
         logger.info("Minecraft server stop requested")
         return self._runtime.submit_command(StopCommand())
 
-    def restart_server(self) -> bool:
+    def restart_server(self) -> ActionResult:
         logger.info("Minecraft server restart requested")
         return self._runtime.submit_command(RestartCommand())
 
@@ -310,12 +314,9 @@ class MinecraftController:
         )
 
     def _edit_offline(self, edit, *args) -> ActionResult:
-        if self._server_process_present():
-            return _failure(
-                "A Minecraft server process is running in the server directory; "
-                "wait until the dashboard shows it running, then try again."
-            )
-        return edit(*args)
+        # On the lifecycle thread: it re-checks STOPPED and that no server
+        # process exists, and no start can run until the edit is written.
+        return self._runtime.submit_command(OfflineEditCommand(lambda: edit(*args)))
 
     def _ban_offline(self, name: str, reason: str | None) -> ActionResult:
         uuid = self._call(self.player_manager.find_uuid, name) or self._call(
@@ -333,13 +334,6 @@ class MinecraftController:
         if result.success:
             logger.info(f"Unbanned {name} (offline edit)")
         return result
-
-    def _server_process_present(self) -> bool:
-        try:
-            return self.process_manager.find_process_identity() is not None
-        except Exception:
-            logger.exception("Process discovery failed")
-            return True  # never edit the file if a server might be running
 
     @staticmethod
     def _call(function, *args):

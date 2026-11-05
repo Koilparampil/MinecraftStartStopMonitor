@@ -13,8 +13,10 @@ One call of handle_connection() serves one accepted connection:
   ``\\0FML3\\0``, ``\\0FORGE``) are ignored. The reply is Login Disconnect
   (packet 0x00 with a JSON text string in every version up to 1.21.x).
 
-After replying, the write side is shut down and the socket drained briefly so
-the client reads the message and closes first.
+After replying, the connection is read until the client closes it (vanilla
+clients close right after a Login Disconnect, a Pong or the status they asked
+for), bounded by DRAIN_SECONDS. The client is then the active closer and holds
+TIME_WAIT, not the game port; on timeout the caller closes the socket.
 """
 
 import json
@@ -38,7 +40,9 @@ from src.minecraft.protocol import (
 logger = logging.getLogger(__name__)
 
 FRAME_LIMIT = 32 * 1024
-MAX_ADDRESS_LENGTH = 1024  # vanilla allows 255; markers/proxies may append more
+# Vanilla allows 255, but Forge markers and BungeeCord-style IP forwarding
+# (host\0ip\0uuid\0properties JSON, ~2-3 KB) append more; FRAME_LIMIT bounds memory.
+MAX_ADDRESS_LENGTH = 32767
 MAX_STATUS_JSON = 32767  # the vanilla client's limit for the status string
 MAX_NAME_LENGTH = 16
 LEGACY_PROTOCOL = 127  # what vanilla answers legacy pings with
@@ -98,8 +102,8 @@ def handle_connection(
     """Serve one accepted client connection as the sleeping server.
 
     Never raises for client/protocol errors (returns INVALID). Does not close
-    the listening socket; closes nothing but may shut down `conn` gracefully
-    after the response is sent. The caller closes `conn`.
+    the listening socket or `conn`: after a reply it waits (at most
+    DRAIN_SECONDS) for the client to close first. The caller closes `conn`.
     """
     if not isinstance(timeout, (int, float)) or timeout <= 0:
         timeout = 5.0
@@ -261,12 +265,12 @@ def _send_disconnect(conn, deadline, message: str) -> None:
 
 
 def _finish(conn: socket.socket) -> None:
-    """Half-close, then drain until the client closes (bounded), so the client
-    reads the reply and holds the TIME_WAIT state. Never raises."""
-    try:
-        conn.shutdown(socket.SHUT_WR)
-    except OSError:
-        return
+    """Read (and discard) until the client closes, bounded by DRAIN_SECONDS.
+
+    No half-close first: whoever sends the first FIN ends in TIME_WAIT, and
+    that must be the client, not the game port the real server binds next.
+    Reading to EOF also leaves nothing unread, so the caller's close() sends a
+    FIN rather than a reset that could destroy the reply. Never raises."""
     deadline = time.monotonic() + DRAIN_SECONDS
     drained = 0
     try:

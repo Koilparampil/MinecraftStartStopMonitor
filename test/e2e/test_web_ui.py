@@ -6,7 +6,6 @@ RCON command, restart and stop.
 """
 
 import re
-import time
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -19,8 +18,6 @@ pytestmark = [pytest.mark.e2e, pytest.mark.slow]
 
 # A short startup delay makes the RUNNING-but-not-ready ("LOADING") phase visible.
 MONITOR_OPTIONS = {"dummy_env": {"DUMMY_STARTUP_DELAY": "2"}, "auto_stop_delay": 600}
-
-STOP_COOLDOWN = 6.0  # supervisor.server_stopping_cooldown (5 s) + margin
 
 RECORD_STATES = """() => {
   const node = document.getElementById('statusText');
@@ -54,6 +51,20 @@ def confirm(page: Page, reason: str | None = None) -> None:
         page.fill("#confirmReason", reason)
     page.click("#confirmOk")
     expect(dialog).to_be_hidden()
+
+
+def click_until_accepted(page: Page, selector: str, attempts: int = 40) -> None:
+    """Click a confirmed control until /action reports success (bounded)."""
+    for _ in range(attempts):
+        page.click(selector)
+        with page.expect_response(
+            lambda r: r.url.endswith("/action") and r.request.method == "POST"
+        ) as answer:
+            confirm(page)
+        if answer.value.json().get("success"):
+            return
+        page.wait_for_timeout(1000)
+    raise AssertionError(f"{selector} was never accepted")
 
 
 def row(page: Page, name: str):
@@ -135,17 +146,14 @@ def test_full_lifecycle(page, monitor_app):
     page.click("#restartBtn")
     confirm(page)
     expect(page.locator("#statusText")).to_have_text("STOPPING", timeout=20000)
-    stopped_at = time.monotonic()
     expect(page.locator("#statusText")).to_have_text("ONLINE", timeout=90000)
     seen = states(page)
     assert seen[0] == "ONLINE" and "STOPPING" in seen and seen[-1] == "ONLINE", seen
     expect(page.locator("#playersBody tr.is-online")).to_have_count(3, timeout=30000)
 
-    # Stop: OFFLINE and the dummy process is gone. The supervisor refuses a
-    # stop within its cooldown after the previous stop (the restart's).
-    time.sleep(max(0.0, STOP_COOLDOWN - (time.monotonic() - stopped_at)))
-    page.click("#stopBtn")
-    confirm(page)
+    # Stop: OFFLINE and the dummy process is gone. The supervisor may refuse a
+    # stop right after the restart's stop, so retry like an admin would.
+    click_until_accepted(page, "#stopBtn")
     expect(page.locator("#statusText")).to_have_text("OFFLINE", timeout=60000)
     wait_until(
         lambda: not app.dummy_processes(), timeout=15, message="dummy still running"

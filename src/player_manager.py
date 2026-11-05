@@ -36,6 +36,8 @@ def write_json_atomic(path, payload):
         with os.fdopen(fd, "w", encoding="utf-8") as file:
             json.dump(payload, file, indent=2, ensure_ascii=False)
             file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())  # a crash never leaves a half-written file
         os.replace(temp_path, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -120,11 +122,15 @@ class PlayerManager:
         try:
             with open(path, encoding="utf-8") as file:
                 data = json.load(file)
-        except (OSError, ValueError) as e:
-            logger.warning(f"Ignoring unreadable player data in {path}: {e}")
+        except OSError as e:
+            logger.warning(f"Could not read player data from {path}: {e}")
+            return {}
+        except ValueError as e:
+            self._quarantine(path, f"not valid JSON ({e})")
             return {}
         players = data.get("players") if isinstance(data, dict) else None
         if not isinstance(players, dict):
+            self._quarantine(path, "unexpected structure")
             return {}
         loaded = {}
         for record in players.values():
@@ -132,6 +138,18 @@ class PlayerManager:
             if clean is not None:
                 loaded[clean["name"].lower()] = clean
         return loaded
+
+    @staticmethod
+    def _quarantine(path, reason):
+        """Keep an unreadable file for inspection instead of overwriting it."""
+        target = f"{path}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
+        try:
+            os.replace(path, target)
+            logger.warning(f"Player data in {path} is {reason}; moved it to {target}")
+        except OSError as e:
+            logger.warning(
+                f"Player data in {path} is {reason} and could not be moved: {e}"
+            )
 
     def _save_locked(self, force=False):
         """Persist now when forced; otherwise flush pending timestamp-only
@@ -162,8 +180,11 @@ class PlayerManager:
         PLAYER_JOINED for newly-online ones) and the rest offline (PLAYER_LEFT).
 
         A partial roster (fewer names than ``roster.online``: status-ping
-        samples are capped at 12 and servers can hide names) only adds; it does
-        not mark unlisted players offline, which would make them flap.
+        samples are capped at 12 and servers can hide names) cannot tell who
+        left, so it never marks a listed-somewhere-else player offline just
+        for missing from one sample. Only when more players are tracked online
+        than ``roster.online`` are the excess ones marked offline, those seen
+        least recently first (players who left stop being seen).
         """
         now = self._clock()
         events = []
@@ -179,6 +200,8 @@ class PlayerManager:
                 self._unsaved = True  # last_online moved
             if len(roster.players) >= roster.online:
                 changed = self._mark_offline_except(listed, events) or changed
+            else:
+                changed = self._trim_excess(listed, roster.online, events) or changed
             self._save_locked(force=changed)
         self._publish(events)
 
@@ -244,6 +267,17 @@ class PlayerManager:
             }
         return changed
 
+    def _trim_excess(self, listed, online, events):
+        tracked = [r for r in self._players.values() if r.get("currently_online")]
+        excess = len(tracked) - max(0, online)
+        if excess <= 0:
+            return False
+        unlisted = [r for r in tracked if r["name"].lower() not in listed]
+        unlisted.sort(key=lambda r: r.get("last_online") or 0.0)
+        stale = {r["name"].lower() for r in unlisted[:excess]}
+        keep = {r["name"].lower() for r in tracked} - stale
+        return self._mark_offline_except(keep, events)
+
     def mark_all_offline(self) -> None:
         """Release tracked players when the server goes down (records are kept)."""
         now = self._clock()
@@ -286,6 +320,14 @@ class PlayerManager:
     def get_total_player_count(self) -> int:
         with self._lock:
             return len(self._players)
+
+    def find_player(self, name: str) -> dict[str, Any] | None:
+        """Copy of a tracked player's record (case-insensitive name), or None."""
+        if not name:
+            return None
+        with self._lock:
+            record = self._players.get(name.strip().lower())
+            return dict(record) if record else None
 
     def find_uuid(self, name: str) -> str | None:
         """UUID of a tracked player (case-insensitive name), or None."""

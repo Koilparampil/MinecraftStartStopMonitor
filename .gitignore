@@ -1,6 +1,7 @@
 /venv/
 .venv/
 /data/
+/src/data/
 /backups/
 __pycache__/
 *.pyc

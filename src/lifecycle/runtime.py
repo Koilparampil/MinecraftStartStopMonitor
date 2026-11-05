@@ -27,6 +27,7 @@ import queue
 import threading
 
 from src.lifecycle.messages import (
+    ActionResult,
     LaunchRequest,
     LaunchResult,
     PollRequest,
@@ -35,7 +36,7 @@ from src.lifecycle.messages import (
     StopRequest,
     StopResult,
 )
-from src.lifecycle.supervisor import Supervisor
+from src.lifecycle.supervisor import AutoStopRequest, Supervisor
 from src.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -49,10 +50,15 @@ THREAD_NAMES = (LIFECYCLE_THREAD, DETECTION_THREAD, POLL_THREAD, PROCESS_THREAD)
 _SHUTDOWN = object()
 _WORKER_JOIN_TIMEOUT = 5
 _COMMAND_TIMEOUT = 5
-# A graceful stop may wait stopTimeout, then 30 s after SIGTERM and 10 s after
-# SIGKILL. A launch or stop must finish before close() returns, or it would act
-# on a server the monitor no longer supervises.
+# A graceful stop may wait stopTimeout, then max(30, stopTimeout) after SIGTERM
+# and 10 s after SIGKILL. A launch or stop must finish before close() returns,
+# or it would act on a server the monitor no longer supervises.
 _PROCESS_WORKER_JOIN_MARGIN = 60
+_MIN_TERMINATE_WAIT = 30.0
+NOT_RUNNING_MESSAGE = "The monitor's lifecycle controller is not running."
+TIMED_OUT_MESSAGE = (
+    "The lifecycle controller did not answer in time; see the monitor log."
+)
 
 
 def _process_worker_join_timeout() -> float:
@@ -60,7 +66,11 @@ def _process_worker_join_timeout() -> float:
         stop_timeout = max(0.0, float(settings.stopTimeout))
     except (TypeError, ValueError):
         stop_timeout = 120.0
-    return stop_timeout + _PROCESS_WORKER_JOIN_MARGIN
+    return (
+        stop_timeout
+        + max(_MIN_TERMINATE_WAIT, stop_timeout)
+        + _PROCESS_WORKER_JOIN_MARGIN
+    )
 
 
 class LifecycleRuntime:
@@ -145,15 +155,23 @@ class LifecycleRuntime:
             except Exception:
                 logger.exception("Closing the process manager failed")
 
-    def submit_command(self, command) -> bool:
+    def submit_command(self, command) -> ActionResult:
+        """Hand a command to the lifecycle thread and wait for its outcome.
+
+        The ActionResult is truthy when the command was accepted; its message
+        says what happens next or why the command was refused.
+        """
         if not self._started or self._closing.is_set():
             logger.warning("Controller is not running; command ignored")
-            return False
+            return ActionResult(False, NOT_RUNNING_MESSAGE)
         self._observations.put(command)
         if not command.done.wait(timeout=_COMMAND_TIMEOUT):
             logger.error("Lifecycle command timed out")
-            return False
-        return command.result
+            return ActionResult(False, TIMED_OUT_MESSAGE)
+        outcome = getattr(command, "outcome", None)
+        if isinstance(outcome, ActionResult):
+            return outcome
+        return ActionResult(bool(command.result))
 
     # ------------------------------------------------------------------
     # Lifecycle thread
@@ -246,7 +264,12 @@ class LifecycleRuntime:
 
     def _terminate(self, request: StopRequest) -> StopResult:
         try:
-            stopped = self.process_manager.terminate_process(request.identity)
+            # Nobody waits for an auto-stop: never force-kill what cannot be
+            # stopped gracefully (Windows has no graceful signal).
+            force = not isinstance(request, AutoStopRequest)
+            stopped = self.process_manager.terminate_process(
+                request.identity, force=force
+            )
         except Exception:
             logger.exception("Server termination failed")
             stopped = False

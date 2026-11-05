@@ -23,10 +23,10 @@ Rules (unchanged from palworld-monitor):
   sample cancels it and forgets the last sample, so a server that stops
   answering is never stopped for looking empty.
 - Samples taken during the startup guard never arm the deadline.
-- When the deadline expires, the server is stopped only if the newest valid
-  sample is fresh, empty and no poll is in flight or overdue. Otherwise one
-  more sample is requested (revalidation) and only a sample taken after the
-  expiry can confirm the stop.
+- When the deadline expires, nothing already known can stop the server: one
+  more sample is always requested (revalidation), and only a successful,
+  empty sample from a poll issued after the expiry confirms the stop. A
+  player who joined just before the deadline is seen by that poll.
 """
 
 from dataclasses import dataclass, replace
@@ -114,28 +114,19 @@ def on_expiry(
     state: AutoStopState,
     *,
     config: AutoStopConfig,
-    now: float,
     generation: int,
-    poll_inflight: bool,
-    poll_due_at: float | None,
     poll_seq: int,
-    poll_interval: float,
 ) -> tuple[AutoStopState, str]:
+    """The deadline passed: always revalidate.
+
+    ``poll_seq`` is the newest poll issued so far; only a sample with a higher
+    seq (a poll issued after this moment) can confirm the stop in on_roster().
+    """
     if not config.enabled or state.generation != generation or state.deadline is None:
         return cancelled(state), AutoStopDecision.CANCEL
 
     if state.revalidation == generation:
         return state, AutoStopDecision.NONE
-
-    if _is_fresh_empty_sample(
-        state,
-        now=now,
-        generation=generation,
-        poll_inflight=poll_inflight,
-        poll_due_at=poll_due_at,
-        poll_interval=poll_interval,
-    ):
-        return cancelled(state), AutoStopDecision.STOP
 
     return (
         replace(
@@ -146,23 +137,4 @@ def on_expiry(
             revalidation_seq=poll_seq + 1,
         ),
         AutoStopDecision.REVALIDATE,
-    )
-
-
-def _is_fresh_empty_sample(
-    state: AutoStopState,
-    *,
-    now: float,
-    generation: int,
-    poll_inflight: bool,
-    poll_due_at: float | None,
-    poll_interval: float,
-) -> bool:
-    return (
-        state.last_valid_sample_generation == generation
-        and state.last_valid_sample_at is not None
-        and now - state.last_valid_sample_at <= max(poll_interval * 2, 1.0)
-        and state.last_valid_roster_empty
-        and not poll_inflight
-        and (poll_due_at is None or poll_due_at > now)
     )

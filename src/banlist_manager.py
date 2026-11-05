@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import threading
+import uuid as uuid_module
 from datetime import datetime
 
 from src.events import Event, EventBus
@@ -66,6 +67,17 @@ def ban_is_active(entry, now=None):
     return moment > now
 
 
+def canonical_uuid(value):
+    """Dashed lowercase UUID (``str(uuid.UUID(...))``), or None if invalid."""
+    text = _text(value)
+    if not text:
+        return None
+    try:
+        return str(uuid_module.UUID(text))
+    except ValueError:
+        return None
+
+
 def _vanilla_timestamp():
     return datetime.now().astimezone().strftime(_DATE_FORMAT)
 
@@ -95,9 +107,15 @@ class BanlistManager:
     after the internal lock is released.
     """
 
-    def __init__(self, bus: EventBus, server_dir: str | None = None):
+    def __init__(
+        self, bus: EventBus, server_dir: str | None = None, *, known_players=None
+    ):
+        """*known_players*: optional PlayerManager-like object with
+        ``find_player(name) -> {name, uuid} | None`` (tracked players), used
+        for the canonical name and UUID of offline bans."""
         self.bus = bus
         self._server_dir = server_dir
+        self._known_players = known_players
         self._lock = threading.RLock()
         self._cache_key = None
         self._cache: list[dict] = []
@@ -180,23 +198,39 @@ class BanlistManager:
 
     def lookup_uuid(self, name: str) -> str | None:
         """UUID for a name from usercache.json (then the ban list), else None."""
-        if not name:
-            return None
-        lowered = name.strip().lower()
-        path = self._path(USERCACHE_FILE)
-        cached = server_files.read_json_list(path) if path else []
-        for entry in cached:
-            if (
-                isinstance(entry, dict)
-                and str(entry.get("name", "")).lower() == lowered
-            ):
-                uuid = _text(entry.get("uuid"))
-                if uuid:
-                    return uuid.lower()
+        cached = self._usercache_entry(name)
+        if cached is not None and cached[1]:
+            return cached[1]
+        lowered = (name or "").strip().lower()
         for entry in self.get_banned_players():
-            if entry["name"].lower() == lowered and entry["uuid"]:
-                return entry["uuid"]
+            if lowered and entry["name"].lower() == lowered and entry["uuid"]:
+                return canonical_uuid(entry["uuid"])
         return None
+
+    def _usercache_entry(self, name):
+        """(canonical name, uuid or None) from usercache.json, or None."""
+        lowered = (name or "").strip().lower()
+        path = self._path(USERCACHE_FILE)
+        if not lowered or not path:
+            return None
+        for entry in server_files.read_json_list(path):
+            entry_name = _text(entry.get("name"))
+            if entry_name and entry_name.lower() == lowered:
+                return entry_name, canonical_uuid(entry.get("uuid"))
+        return None
+
+    def _identity(self, name, uuid):
+        """Canonical (name, uuid): tracked players, then usercache.json, then
+        the offline-mode UUID (online-mode=false only); the typed name last."""
+        uuid = canonical_uuid(uuid)
+        tracked = self._known_players.find_player(name) if self._known_players else None
+        if tracked:
+            name, uuid = tracked["name"], uuid or canonical_uuid(tracked.get("uuid"))
+        cached = self._usercache_entry(name)
+        if cached is not None:
+            name = name if tracked else cached[0]
+            uuid = uuid or cached[1]
+        return name, uuid or self.lookup_uuid(name) or self._offline_mode_uuid(name)
 
     def _offline_mode_uuid(self, name):
         path = self._path("server.properties")
@@ -232,7 +266,7 @@ class BanlistManager:
             return ActionResult(
                 False, f"Cannot read {path} ({e}); fix or remove it first"
             )
-        uuid = _text(uuid) or self.lookup_uuid(name) or self._offline_mode_uuid(name)
+        name, uuid = self._identity(name, uuid)
         if self._find(entries, name, uuid) is not None:
             return ActionResult(
                 True, f"{name} is already banned", details={"changed": False}
@@ -245,7 +279,7 @@ class BanlistManager:
             )
         entries.append(
             {
-                "uuid": uuid.lower(),
+                "uuid": uuid,
                 "name": name,
                 "created": _vanilla_timestamp(),
                 "source": DEFAULT_SOURCE,
@@ -259,7 +293,7 @@ class BanlistManager:
             return ActionResult(False, f"Could not write {path}: {e}")
         logger.info(f"Banned {name} ({uuid}) in {path} while the server is stopped")
         return ActionResult(
-            True, f"Banned {name}", details={"changed": True, "uuid": uuid.lower()}
+            True, f"Banned {name}", details={"changed": True, "uuid": uuid}
         )
 
     @staticmethod

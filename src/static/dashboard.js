@@ -40,7 +40,9 @@
     lastUpdate: null,
     info: null,
     playersKey: '',
-    controlBusy: false
+    controlBusy: false,
+    previousStatus: null,  // status of the last snapshot on this stream
+    userStopAt: 0  // when the admin last asked for a stop/restart (ms)
   };
 
   // ---------------------------------------------------------------------
@@ -219,15 +221,16 @@
 
   var TOAST_ICONS = { success: 'i-check', error: 'i-alert', info: 'i-info' };
 
-  function toast(message, kind, timeout) {
+  function toast(message, kind, timeout, action) {
     var box = $('toasts');
     if (!box) return;
     kind = kind || 'info';
     var close = h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Dismiss notification' }, icon('i-close'));
     var label = kind === 'error' ? h('span', { class: 'sr-only', text: 'Error: ' }) : null;
+    var actionButton = action ? h('button', { type: 'button', class: 'toast-action', text: action.label }) : null;
     var node = h('div', { class: 'toast toast--' + kind },
       icon(TOAST_ICONS[kind] || 'i-info'),
-      h('p', { class: 'toast-msg' }, label, String(message)),
+      h('div', { class: 'toast-body' }, h('p', { class: 'toast-msg' }, label, String(message)), actionButton),
       close);
     var removed = false;
     function remove() {
@@ -237,6 +240,9 @@
       window.setTimeout(function () { node.remove(); }, 170);
     }
     close.addEventListener('click', remove);
+    if (actionButton) {
+      actionButton.addEventListener('click', function () { remove(); action.run(); });
+    }
     box.append(node);
     while (box.childElementCount > 4) box.firstElementChild.remove();
     window.setTimeout(remove, timeout || (kind === 'error' ? 9000 : 5000));
@@ -268,6 +274,7 @@
       setText($('confirmTitle'), options.title);
       setText($('confirmBody'), options.body);
       setText(ok, options.confirmLabel || 'Confirm');
+      setText($('confirmCancel'), options.cancelLabel || 'Cancel');
       ok.className = tone.button;
       iconBox.className = tone.icon;
       iconBox.replaceChildren(icon(options.icon || 'i-alert'));
@@ -334,13 +341,44 @@
     view.revision = revision;
     view.snapshot = snapshot;
     view.lastUpdate = new Date();
+    noticeFailedLaunch(snapshot);
     render();
     return true;
+  }
+
+  // STARTING/LOADING -> STOPPED that nobody asked for: the launch failed or
+  // the server crashed while loading. Point the admin at the launch output.
+  function noticeFailedLaunch(snapshot) {
+    var status = statusOf(snapshot);
+    var before = view.previousStatus;
+    view.previousStatus = status;
+    if (status !== 'OFFLINE' || (before !== 'STARTING' && before !== 'LOADING')) return;
+    if (Date.now() - view.userStopAt < 120000) return;  // the admin stopped it
+    if (!$('consolePanel')) {
+      toast('The server stopped while starting. Check the server logs.', 'error', 15000);
+      return;
+    }
+    toast('The server stopped while starting — see Launch output', 'error', 20000,
+      { label: 'Show launch output', run: showLaunchOutput });
+  }
+
+  function showLaunchOutput() {
+    var radio = document.querySelector('input[name="consoleSource"][value="launch"]');
+    var details = $('consoleDetails');
+    if (details && !details.open) details.open = true;
+    if (radio && !radio.checked) {
+      radio.checked = true;
+      radio.dispatchEvent(new Event('change'));
+    }
+    $('consolePanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (radio) radio.focus({ preventScroll: true });
   }
 
   function statusOf(snapshot) {
     if (!snapshot) return 'OFFLINE';
     if (snapshot.state === 'RUNNING') return snapshot.ready ? 'ONLINE' : 'LOADING';
+    // The instant between a restart's stop and its start is not "offline".
+    if (snapshot.state === 'STOPPED' && snapshot.restartPending) return 'STARTING';
     if (snapshot.state === 'STARTING' || snapshot.state === 'STOPPING') return snapshot.state;
     return 'OFFLINE';
   }
@@ -365,7 +403,7 @@
 
   function statusDetail(snapshot, status) {
     switch (status) {
-      case 'STARTING': return 'Launching the server…';
+      case 'STARTING': return snapshot.restartPending ? 'Restarting — starting again…' : 'Launching the server…';
       case 'LOADING': return 'Process is up — loading mods…';
       case 'ONLINE': return 'Accepting players';
       case 'STOPPING':
@@ -409,22 +447,29 @@
 
   function controlsHint(snapshot, status) {
     switch (status) {
-      case 'STARTING': return 'The server is starting. Controls unlock once the process is up.';
+      case 'STARTING':
+        return snapshot.restartPending ? 'Restarting: the server is starting again.' : 'The server is starting. Controls unlock once the process is up.';
       case 'LOADING': return 'Mods are loading. You can still stop or restart if it hangs.';
       case 'STOPPING':
-        return snapshot.restartPending ? 'Restarting: it starts again as soon as it has stopped.' : 'Stopping: the world is being saved.';
+        return snapshot.restartPending ? 'Restarting: it starts again as soon as it has stopped. "Cancel restart" keeps it offline.' : 'Stopping: the world is being saved.';
       case 'ONLINE': return 'Stop and restart save the world first.';
       default:
         return config.autoStart ? 'Start it now, or let the first player who joins wake it up.' : 'Start the server when you need it.';
     }
   }
 
+  function cancelsRestart(snapshot) {
+    return snapshot.state === 'STOPPING' && !!snapshot.restartPending;
+  }
+
   function renderControls(snapshot) {
     if (!config.controlServer) return;
     var state = snapshot.state;
     var busy = view.controlBusy;
-    setDisabled($('startBtn'), busy || state !== 'STOPPED');
-    setDisabled($('stopBtn'), busy || state !== 'RUNNING');
+    var cancel = cancelsRestart(snapshot);
+    setDisabled($('startBtn'), busy || state !== 'STOPPED' || !!snapshot.restartPending);
+    setDisabled($('stopBtn'), busy || !(state === 'RUNNING' || cancel));
+    setText($('stopLabel'), cancel ? 'Cancel restart' : 'Stop');
     setDisabled($('restartBtn'), busy || state !== 'RUNNING');
     setText($('controlsHint'), controlsHint(snapshot, statusOf(snapshot)));
   }
@@ -446,10 +491,22 @@
     }
   };
 
+  var CANCEL_RESTART_COPY = {
+    title: 'Cancel the restart?',
+    body: 'The server finishes shutting down and stays offline instead of starting again.',
+    confirmLabel: 'Cancel restart',
+    cancelLabel: 'Keep restarting',
+    tone: 'warn',
+    icon: 'i-stop'
+  };
+
   function runControl(action, button) {
     var copy = CONTROL_COPY[action];
+    if (action === 'stopServer' && view.snapshot && cancelsRestart(view.snapshot)) copy = CANCEL_RESTART_COPY;
     var confirmation = Promise.resolve({});
-    if (copy) {
+    if (copy === CANCEL_RESTART_COPY) {
+      confirmation = confirmAction(copy);
+    } else if (copy) {
       var count = view.snapshot && view.snapshot.state === 'RUNNING' ? (view.snapshot.playerCount || 0) : 0;
       var who = count ? ' ' + plural(count, 'player') + ' online will be disconnected.' : ' Nobody is online.';
       confirmation = confirmAction(Object.assign({}, copy, { body: copy.body + who }));
@@ -460,6 +517,7 @@
       setBusy(button, true);
       renderControls(view.snapshot || {});
       return api('/action', { action: action }).then(function (result) {
+        if (result.data.success && action !== 'startServer') view.userStopAt = Date.now();
         applyPayload(result.data);
         toast(result.data.message || (result.data.success ? 'Done.' : 'Request failed.'),
           result.data.success ? 'success' : 'error');
@@ -499,7 +557,7 @@
     var startText = $('autoStartText');
     if (startText && config.autoStart) {
       var motd = view.info && view.info.sleepingMotd;
-      if (snapshot.state === 'STOPPED') {
+      if (snapshot.state === 'STOPPED' && !snapshot.restartPending) {
         var parts = ['Sleeping: the monitor answers on the game port'];
         if (motd) {
           startText.replaceChildren(parts[0] + '. Players see ', h('q', { text: motd }),
@@ -534,7 +592,10 @@
     if (!show) return;
     var delay = view.autoStopDelay;
     var count = snapshot.playerCount || 0;
-    if (typeof snapshot.autoStopAt === 'number') {
+    if (snapshot.playerData === 'unavailable') {
+      // Auto-stop only trusts fresh player counts: it waits while the server is silent.
+      setCountdown('countdown', ['Paused — the server is not answering'], 1);
+    } else if (typeof snapshot.autoStopAt === 'number') {
       var remaining = snapshot.autoStopAt - serverNow();
       if (remaining <= 0) {
         setCountdown('countdown countdown--armed', ['Stopping now — no players online'], 0);
@@ -591,7 +652,7 @@
   function moderationState(snapshot) {
     var viaPing = !!(snapshot.server && snapshot.server.source === 'ping');
     var online = snapshot.state === 'RUNNING' && snapshot.ready;
-    if (snapshot.state === 'STOPPED') return { banOk: true, kickOk: false, why: 'Kicking needs a running server' };
+    if (snapshot.state === 'STOPPED' && !snapshot.restartPending) return { banOk: true, kickOk: false, why: 'Kicking needs a running server' };
     if (!online) return { banOk: false, kickOk: false, why: 'Wait until the server has started or stopped' };
     if (viaPing) return { banOk: false, kickOk: false, why: 'Needs RCON (enable-rcon in server.properties)' };
     return { banOk: true, kickOk: true, why: '' };
@@ -1099,6 +1160,7 @@
       // A reconnected stream may come from a restarted monitor whose
       // revisions start over: accept its first snapshot whatever it is.
       view.revision = -1;
+      view.previousStatus = null;
       retryDelay = 2000;
       setConnection('live', 'Live');
     };

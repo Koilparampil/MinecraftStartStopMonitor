@@ -107,8 +107,10 @@ def update_properties(path: str, updates: dict[str, Any]) -> bool:
             entry.raw = line + _line_terminator(entry.raw)
             found.add(entry.key)
 
-    new_text = "".join(entry.raw for entry in entries)
     missing = [key for key in pending if key not in found]
+    if missing:
+        _close_dangling_continuation(entries)
+    new_text = "".join(entry.raw for entry in entries)
     if missing:
         if new_text and not new_text.endswith(("\n", "\r")):
             new_text += newline
@@ -122,6 +124,23 @@ def update_properties(path: str, updates: dict[str, Any]) -> bool:
     bom = source.bom if source else b""
     _atomic_write(path, bom + new_text.encode(encoding))
     return True
+
+
+def _close_dangling_continuation(entries: list[_Entry]) -> None:
+    """Drop the backslash ending the file's last line when it is a
+    continuation: Java ignores it at end of file, but it would join whatever is
+    appended after it into that value (``level-name=C:\\worlds\\``)."""
+    if not entries or entries[-1].key is None:
+        return
+    raw = entries[-1].raw
+    while True:
+        terminator = _line_terminator(raw)
+        content = raw[: len(raw) - len(terminator)]
+        # Dropping it can expose an earlier continuation ("a=x\\\n\\"): repeat.
+        if not _continues(_NEWLINE_SPLIT.split(content)[-1]):
+            break
+        raw = content[:-1] + terminator
+    entries[-1].raw = raw
 
 
 def _read_source(path: str) -> _Source | None:
@@ -284,15 +303,18 @@ def _detect_newline(text: str) -> str:
 def _atomic_write(path: str, data: bytes) -> None:
     """Write via a temp file in the same directory, then os.replace().
 
-    Symlinks are followed (the link survives) and the existing file mode is
-    kept; new files get 0644.
+    Symlinks are followed (the link survives). The existing file's mode and,
+    on POSIX, its owner are kept (a wizard run with sudo must not leave
+    root-owned files the server can no longer save); new files get 0644 and
+    the directory's owner.
     """
     target = os.path.realpath(os.fspath(path))
     directory = os.path.dirname(target)
     try:
-        mode = os.stat(target).st_mode & 0o7777
+        existing = os.stat(target)
+        mode, owner = existing.st_mode & 0o7777, (existing.st_uid, existing.st_gid)
     except OSError:
-        mode = 0o644
+        mode, owner = 0o644, _owner_of(directory)
     fd, tmp_path = tempfile.mkstemp(
         prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=directory
     )
@@ -301,6 +323,7 @@ def _atomic_write(path: str, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        _set_owner(tmp_path, owner)  # before chmod: chown clears setuid/setgid
         with contextlib.suppress(OSError):
             os.chmod(tmp_path, mode)
         _replace(tmp_path, target)
@@ -308,6 +331,24 @@ def _atomic_write(path: str, data: bytes) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
         raise
+
+
+def _owner_of(path: str) -> tuple[int, int] | None:
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return info.st_uid, info.st_gid
+
+
+def _set_owner(path: str, owner: tuple[int, int] | None) -> None:
+    """chown to `owner` when it differs (POSIX; only root can change the uid,
+    so a failure just keeps the writer as owner, like a plain write would)."""
+    if owner is None or not hasattr(os, "chown"):
+        return
+    with contextlib.suppress(OSError):
+        if _owner_of(path) != owner:
+            os.chown(path, *owner)
 
 
 def _replace(source: str, target: str) -> None:

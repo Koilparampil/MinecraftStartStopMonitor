@@ -17,8 +17,10 @@ Vanilla quirks this client respects:
   own (sending it right behind the command can coalesce both into one read,
   which vanilla treats as a protocol error).
 
-One persistent connection, guarded by a lock; a connection found dead (the
-server restarted) is reopened once transparently.
+One persistent connection, guarded by a lock. An idle connection the server
+has closed (it restarted) is detected with a non-blocking peek and replaced
+before a command is sent. A command is never sent twice: once its packet went
+out, a failure is reported, because the server may already have run it.
 """
 
 import contextlib
@@ -129,18 +131,6 @@ class RconClient:
         with replacement). Raises RconUnavailable, RconAuthError or RconError."""
         payload = _encode_payload(command, "command")
         with self._lock:
-            reused = self._sock is not None
-            try:
-                return self._run(payload)
-            except (OSError, ProtocolError) as exc:
-                if not (reused and isinstance(exc, ConnectionError)):
-                    raise self._translate(exc) from exc
-                logger.debug(
-                    "RCON connection to %s:%s was stale (%s); reconnecting",
-                    self.host,
-                    self.port,
-                    exc,
-                )
             try:
                 return self._run(payload)
             except (OSError, ProtocolError) as exc:
@@ -176,12 +166,46 @@ class RconClient:
 
     def _run(self, payload: bytes) -> str:
         try:
-            if self._sock is None:
-                self._connect_locked()
-            return self._exchange(payload)
+            fresh = self._ensure_connected()
+            request_id = self._next_id()
+            try:
+                self._send(request_id, TYPE_COMMAND, payload)
+            except ConnectionError:
+                if fresh:
+                    raise
+                # The dead connection refused the packet: it never arrived.
+                logger.debug("RCON connection to %s:%s was stale", self.host, self.port)
+                self._close_locked()
+                self._ensure_connected()
+                request_id = self._next_id()
+                self._send(request_id, TYPE_COMMAND, payload)
+            return self._receive(request_id)
         except BaseException:
             self._close_locked()
             raise
+
+    def _ensure_connected(self) -> bool:
+        """Connect and authenticate unless a live connection exists; True if new."""
+        if self._sock is not None and not self._peer_closed():
+            return False
+        self._close_locked()
+        self._connect_locked()
+        return True
+
+    def _peer_closed(self) -> bool:
+        """Non-blocking probe of the idle connection: True when the server has
+        closed it (EOF or a reset is pending)."""
+        sock = self._sock
+        try:
+            sock.setblocking(False)
+            try:
+                return sock.recv(1, socket.MSG_PEEK) == b""
+            finally:
+                sock.setblocking(True)
+        except BlockingIOError:
+            return False  # nothing pending: still open
+        except OSError:
+            return True
 
     def _connect_locked(self) -> None:
         sock = socket.create_connection(
@@ -215,9 +239,7 @@ class RconClient:
             # Older servers send an empty RESPONSE_VALUE (type 0) first: skip it.
         raise ProtocolError("no RCON authentication reply")
 
-    def _exchange(self, payload: bytes) -> str:
-        request_id = self._next_id()
-        self._send(request_id, TYPE_COMMAND, payload)
+    def _receive(self, request_id: int) -> str:
         first = self._read_reply(request_id)
         fragments = [first]
         if len(first) >= FRAGMENT_SIZE:

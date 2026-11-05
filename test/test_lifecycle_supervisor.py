@@ -6,6 +6,7 @@ import pytest
 
 from src.events import Event, EventBus
 from src.lifecycle.messages import (
+    ActionResult,
     LaunchRequest,
     LaunchResult,
     LifecycleState,
@@ -22,7 +23,14 @@ from src.lifecycle.messages import (
     StopRequest,
     StopResult,
 )
-from src.lifecycle.supervisor import SNAPSHOT_KEYS, Supervisor
+from src.lifecycle.supervisor import (
+    DISCOVERY_FAILED_MESSAGE,
+    PROCESS_PRESENT_MESSAGE,
+    SNAPSHOT_KEYS,
+    AutoStopRequest,
+    OfflineEditCommand,
+    Supervisor,
+)
 from test.support.fakes import (
     FakeBanlistManager,
     FakeClock,
@@ -278,6 +286,7 @@ class TestTransitions:
         requests = env.supervisor.handle(command)
 
         assert command.result is False
+        assert command.outcome == ActionResult(False, PROCESS_PRESENT_MESSAGE)
         assert requests == []
         assert env.supervisor.state == STOPPED
 
@@ -296,6 +305,7 @@ class TestTransitions:
 
         assert env.supervisor.handle(command) == []
         assert command.result is False
+        assert command.outcome.message == DISCOVERY_FAILED_MESSAGE
 
     def test_start_cooldown_after_stop(self, env):
         env.supervisor.server_stopping_cooldown = 5
@@ -303,7 +313,9 @@ class TestTransitions:
 
         command = StartCommand()
         assert env.supervisor.handle(command) == []
-        assert command.result is False
+        assert command.outcome == ActionResult(
+            False, "The server stopped moments ago; try again in 5 s."
+        )
 
         env.clock.advance(5)
         assert len(env.supervisor.handle(StartCommand())) == 1
@@ -555,7 +567,8 @@ class TestAutoStop:
         )
 
         if stops:
-            assert [type(r) for r in requests] == [StopRequest]
+            # Unattended: the backend must never force-kill for it.
+            assert [type(r) for r in requests] == [AutoStopRequest]
             assert env.supervisor.state == STOPPING
         else:
             assert requests == []
@@ -675,8 +688,14 @@ class TestRestart:
         assert env.supervisor.handle(command) == []
         assert command.result is False
 
-    @pytest.mark.parametrize("busy_state", [STARTING, STOPPING])
-    def test_restart_is_rejected_while_busy(self, env, busy_state):
+    @pytest.mark.parametrize(
+        ("busy_state", "message"),
+        [
+            (STARTING, "The server is still launching; restart it once it is running."),
+            (STOPPING, "The server is stopping; start it again once it has stopped."),
+        ],
+    )
+    def test_restart_is_rejected_while_busy(self, env, busy_state, message):
         if busy_state == STARTING:
             env.supervisor.handle(StartCommand())
         else:
@@ -688,7 +707,7 @@ class TestRestart:
         command = RestartCommand()
         assert env.supervisor.handle(command) == []
 
-        assert command.result is False
+        assert command.outcome == ActionResult(False, message)
         assert command.done.is_set()
         assert env.supervisor.state == busy_state
         assert snapshot(env)["restartPending"] is False
@@ -758,14 +777,151 @@ class TestRestart:
         assert env.supervisor.state == RUNNING
         assert env.pm.tracked_identity == leftover
 
-    def test_restart_respects_the_stop_cooldown(self, env):
-        stop(env, launch(env))
-        launch(env, ProcessIdentity(3003, 30.0))
-        env.supervisor.server_stopping_cooldown = 5
+    def test_stop_right_after_a_restart_is_accepted(self, env):
+        # There is no stop -> stop cooldown: a stop needs RUNNING, which
+        # already proves the previous stop is over.
+        env.supervisor.server_stopping_cooldown = 60
+        first = launch(env)
+        [stop_request] = env.supervisor.handle(RestartCommand())
+        env.pm.terminate_process(first)
+        [request] = env.supervisor.handle(
+            StopResult(stop_request.generation, first, True)
+        )
+        second = ProcessIdentity(2002, 30.0)
+        env.pm.launch_identity = second
+        env.pm.launch_process()
+        env.supervisor.handle(LaunchResult(request.generation, second))
 
-        command = RestartCommand()
+        command = StopCommand()
+        [admin_stop] = env.supervisor.handle(command)
+
+        assert command.outcome == ActionResult(True, "Stopping the server.")
+        assert type(admin_stop) is StopRequest  # an admin stop may force
+
+
+class TestCommandOutcomes:
+    def test_accepted_commands_say_what_happens(self, env):
+        start = StartCommand()
+        [launch_request] = env.supervisor.handle(start)
+        assert start.outcome == ActionResult(True, "Starting the server.")
+        identity = ProcessIdentity(2001, 20.0)
+        env.pm.set_known_identity(identity)
+        env.supervisor.handle(LaunchResult(launch_request.generation, identity))
+
+        restart = RestartCommand()
+        env.supervisor.handle(restart)
+        assert restart.outcome == ActionResult(True, "Restarting the server.")
+
+        cancel = StopCommand()
+        env.supervisor.handle(cancel)
+        assert cancel.outcome == ActionResult(
+            True, "Restart cancelled: the server will stay stopped."
+        )
+
+    def test_refusals_explain_the_state(self, env):
+        def outcome(command):
+            env.supervisor.handle(command)
+            assert command.done.is_set()
+            return command.outcome
+
+        assert outcome(StopCommand()) == ActionResult(
+            False, "The server is not running."
+        )
+        env.supervisor.handle(StartCommand())
+        assert outcome(StartCommand()) == ActionResult(
+            False, "The server is already starting."
+        )
+        assert outcome(StopCommand()).message == (
+            "The server is still launching; stop it once it is running."
+        )
+        env.supervisor.handle(
+            LaunchResult(env.supervisor.generation, ProcessIdentity(2001, 20.0))
+        )
+        assert outcome(StartCommand()).message == "The server is already running."
+        env.supervisor.handle(StopCommand())
+        assert outcome(StopCommand()).message == "The server is already stopping."
+        assert outcome(StartCommand()).message == (
+            "The server is stopping; start it again once it has stopped."
+        )
+
+    def test_a_restart_in_progress_is_named(self, env):
+        launch(env)
+        env.supervisor.handle(RestartCommand())
+
+        for command in (RestartCommand(), StartCommand()):
+            env.supervisor.handle(command)
+            assert command.outcome == ActionResult(
+                False, "A restart is already in progress."
+            )
+
+    def test_start_cooldown_after_start(self, env):
+        env.supervisor.server_starting_cooldown = 5
+        identity = launch(env)
+        env.pm.exit(identity)
+        observe(env)  # crashed right away
+        env.supervisor.server_stopping_cooldown = 0
+
+        command = StartCommand()
+        env.supervisor.handle(command)
+
+        assert command.outcome == ActionResult(
+            False, "The server was started moments ago; try again in 5 s."
+        )
+
+
+class TestOfflineEdit:
+    def edit_command(self, outcome=None, error=None):
+        calls = []
+
+        def edit():
+            calls.append(True)
+            if error is not None:
+                raise error
+            return outcome
+
+        return OfflineEditCommand(edit), calls
+
+    def test_runs_while_stopped_and_returns_the_edit_outcome(self, env):
+        result = ActionResult(True, "Banned Griefer", details={"changed": True})
+        command, calls = self.edit_command(result)
 
         assert env.supervisor.handle(command) == []
-        assert command.result is False
-        assert env.supervisor.state == RUNNING
-        assert snapshot(env)["restartPending"] is False
+
+        assert calls == [True]
+        assert command.done.is_set()
+        assert command.outcome is result
+
+    @pytest.mark.parametrize("state", [RUNNING, STARTING, STOPPING])
+    def test_refused_unless_stopped(self, env, state):
+        if state == STARTING:
+            env.supervisor.handle(StartCommand())
+        else:
+            launch(env)
+        if state == STOPPING:
+            env.supervisor.handle(StopCommand())
+        command, calls = self.edit_command(ActionResult(True))
+
+        env.supervisor.handle(command)
+
+        assert calls == []
+        assert command.outcome.success is False
+        assert state.lower() in command.outcome.message
+
+    def test_refused_while_an_unadopted_server_process_exists(self, env):
+        env.pm.found = ProcessIdentity(4242, 42.0)
+        command, calls = self.edit_command(ActionResult(True))
+
+        env.supervisor.handle(command)
+
+        assert calls == []
+        assert command.outcome == ActionResult(False, PROCESS_PRESENT_MESSAGE)
+
+    def test_a_failing_edit_is_a_failure_not_an_exception(self, env):
+        command, calls = self.edit_command(error=OSError("disk full"))
+
+        env.supervisor.handle(command)
+
+        assert calls == [True]
+        assert command.outcome == ActionResult(
+            False, "The ban list could not be changed; see the monitor log."
+        )

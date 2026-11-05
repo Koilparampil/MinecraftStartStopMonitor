@@ -15,6 +15,7 @@
 minecraft:
   # Server folder (required): the one with server.properties, eula.txt,
   # mods/, world/ and logs/. The start command runs inside this folder.
+  # A relative path is relative to the folder holding this settings file.
   serverDir: "/home/minecraft/server"
   # Windows example:
   # serverDir: "C:\\Minecraft\\server"
@@ -128,8 +129,9 @@ autoStop:
 # Monitor state
 # ============================================================================
 monitor:
-  # Folder for players.json, server.pid and server-console.log
-  # (relative paths are relative to the working directory).
+  # Folder for players.json, server.pid and server-console.log. A relative
+  # path is relative to the folder holding this settings file (monitor.log
+  # is written there too), wherever the monitor is started from.
   dataDir: "data"
 
 # ============================================================================

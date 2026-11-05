@@ -62,6 +62,37 @@ BANNED_MESSAGE = "You are banned from this server."
 BANNED_IP_MESSAGE = "Your IP address is banned from this server."
 _BAN_DATE_FORMAT = "%Y-%m-%d %H:%M:%S %z"
 
+# accept() errors that concern one client only (keep accepting), and the ones
+# meaning the process is out of resources (back off, keep the port bound).
+_TRANSIENT_ACCEPT_ERRNOS = frozenset(
+    code
+    for code in (
+        errno.ECONNABORTED,
+        errno.ECONNRESET,
+        errno.EPROTO,
+        errno.EPERM,
+        errno.EINTR,
+        errno.EAGAIN,
+        errno.ETIMEDOUT,
+        getattr(errno, "WSAECONNRESET", None),
+        getattr(errno, "WSAECONNABORTED", None),
+        getattr(errno, "WSAEWOULDBLOCK", None),
+    )
+    if code is not None
+)
+_RESOURCE_ERRNOS = frozenset(
+    code
+    for code in (
+        errno.EMFILE,
+        errno.ENFILE,
+        errno.ENOBUFS,
+        errno.ENOMEM,
+        getattr(errno, "WSAEMFILE", None),
+        getattr(errno, "WSAENOBUFS", None),
+    )
+    if code is not None
+)
+
 # Errors after which a dual-stack bind falls back to plain IPv4.
 _IPV4_FALLBACK_ERRNOS = {
     errno.EAFNOSUPPORT,
@@ -79,8 +110,10 @@ class ListenerOptions:
     retry_delay: float = 2.0
     slow_retry_delay: float = 30.0  # afterwards keep trying while still armed
     accept_timeout: float = 0.2  # how quickly a cancel/wake is noticed
-    connection_timeout: float = 5.0  # per client connection
-    max_connections: int = 16
+    connection_timeout: float = 5.0  # per client connection, overall
+    first_byte_timeout: float = 1.0  # idle sockets are dropped after this
+    max_connections: int = 64  # concurrent connections being served
+    max_connections_per_client: int = 4  # per IPv4 address / IPv6 /64
     release_timeout: float = 5.0  # stop_listening() wait for the port release
 
 
@@ -152,6 +185,77 @@ def normalize_client_ip(ip):
         return text
     mapped = getattr(address, "ipv4_mapped", None)
     return str(mapped or address)
+
+
+def accept_error_action(error):
+    """What the accept loop does after *error*: ``"retry"`` (one client's
+    problem), ``"backoff"`` (out of descriptors/memory) or ``"rebind"`` (the
+    listening socket itself is broken)."""
+    if isinstance(error, (ConnectionError, InterruptedError, BlockingIOError)):
+        return "retry"
+    code = getattr(error, "errno", None)
+    if code in _TRANSIENT_ACCEPT_ERRNOS:
+        return "retry"
+    if code in _RESOURCE_ERRNOS:
+        return "backoff"
+    return "rebind"
+
+
+def client_key(ip):
+    """Rate-limit key: the IPv4 address, or the /64 network of an IPv6 one
+    (one host usually owns a whole /64)."""
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if address.version == 6:
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return str(address)
+
+
+class ConnectionSlots:
+    """Admission control: a global cap plus a per-client cap, so a handful of
+    idle sockets from one host cannot lock everybody else out."""
+
+    def __init__(self, total, per_client):
+        self._total = total
+        self._per_client = per_client
+        self._lock = threading.Lock()
+        self._counts: dict[str, int] = {}
+        self._in_use = 0
+
+    @property
+    def in_use(self):
+        return self._in_use
+
+    def acquire(self, key):
+        with self._lock:
+            if (
+                self._in_use >= self._total
+                or self._counts.get(key, 0) >= self._per_client
+            ):
+                return False
+            self._in_use += 1
+            self._counts[key] = self._counts.get(key, 0) + 1
+            return True
+
+    def release(self, key):
+        with self._lock:
+            self._in_use -= 1
+            remaining = self._counts.get(key, 1) - 1
+            if remaining > 0:
+                self._counts[key] = remaining
+            else:
+                self._counts.pop(key, None)
+
+
+def _first_byte_arrives(conn, timeout):
+    """True once the client sent something; idle sockets give up their slot."""
+    try:
+        conn.settimeout(timeout)
+        return bool(conn.recv(1, socket.MSG_PEEK))
+    except OSError:  # TimeoutError included
+        return False
 
 
 def _close_quietly(sock):
@@ -246,7 +350,10 @@ class _ListenCycle:
         self._claim_lock = threading.Lock()
         self._waker = None
         self._sock = None
-        self._connections = threading.BoundedSemaphore(self._options.max_connections)
+        self._slots = ConnectionSlots(
+            self._options.max_connections, self._options.max_connections_per_client
+        )
+        self.bind_failures = 0
         self.thread = threading.Thread(
             target=self._run, name=f"minecraft-autostart-{number}", daemon=True
         )
@@ -261,6 +368,10 @@ class _ListenCycle:
             and not self.cancelled.is_set()
             and not self._woken.is_set()
         )
+
+    @property
+    def active_connections(self):
+        return self._slots.in_use
 
     @property
     def bound_address(self):
@@ -322,6 +433,7 @@ class _ListenCycle:
                 sock = create_listener(host, port)
             except OSError as e:
                 failures += 1
+                self.bind_failures = failures
                 delay = self._retry_delay(failures, port, e)
                 if self.cancelled.wait(delay):
                     return None
@@ -357,15 +469,29 @@ class _ListenCycle:
             except TimeoutError:
                 continue
             except OSError as e:
-                if not self._done():
-                    logger.warning(
-                        f"Auto-start listener accept failed ({e}); re-binding"
-                    )
-                    self.cancelled.wait(0.5)
-                return
+                if self._done() or not self._survive_accept_error(e):
+                    break
+                continue
             self._dispatch(conn, address, config)
-        if not self.cancelled.is_set():
+        if self._woken.is_set() and not self.cancelled.is_set():
             self._drain_backlog(sock, config)
+
+    def _survive_accept_error(self, error):
+        """Keep the port bound through per-client and resource errors; only a
+        broken listening socket is closed and bound again (False)."""
+        action = accept_error_action(error)
+        if action == "retry":
+            logger.debug(f"A client connection failed during accept: {error}")
+            return True
+        if action == "backoff":
+            logger.warning(
+                f"Auto-start listener is out of resources ({error}); backing off"
+            )
+            self.cancelled.wait(0.5)
+            return True
+        logger.warning(f"Auto-start listener accept failed ({error}); re-binding")
+        self.cancelled.wait(0.5)
+        return False
 
     def _drain_backlog(self, sock, config):
         """Serve connections already queued when the wake came (friends joining
@@ -384,33 +510,37 @@ class _ListenCycle:
         if self.cancelled.is_set():
             _close_quietly(conn)
             return
-        if not self._connections.acquire(blocking=False):
-            logger.debug("Too many sleeping-server connections; dropping one")
+        ip = normalize_client_ip(address[0])
+        key = client_key(ip)
+        if not self._slots.acquire(key):
+            logger.debug(f"Connection limit reached ({ip}); dropping a connection")
             _close_quietly(conn)
             return
-        ip = normalize_client_ip(address[0])
         worker = threading.Thread(
             target=self._handle,
-            args=(conn, ip, config),
+            args=(conn, ip, key, config),
             name="minecraft-autostart-conn",
             daemon=True,
         )
         try:
             worker.start()
         except RuntimeError:
-            self._connections.release()
+            self._slots.release(key)
             _close_quietly(conn)
 
-    def _handle(self, conn, ip, config):
+    def _handle(self, conn, ip, key, config):
         outcome = None
         try:
-            conn.settimeout(self._options.connection_timeout)
-            outcome = self._manager.serve_connection(conn, ip, config)
+            if _first_byte_arrives(conn, self._options.first_byte_timeout):
+                conn.settimeout(self._options.connection_timeout)
+                outcome = self._manager.serve_connection(conn, ip, config)
+            else:
+                logger.debug(f"Idle sleeping-server connection from {ip} dropped")
         except Exception:
             logger.exception(f"Sleeping-server connection from {ip} failed")
         finally:
             _close_quietly(conn)
-            self._connections.release()
+            self._slots.release(key)
         if outcome is None:
             return
         logger.debug(f"Sleeping-server connection from {ip}: {outcome}")
@@ -548,6 +678,20 @@ class AutoStartManager:
         with self._lock:
             cycle = self._cycle
         return cycle is not None and cycle.bound_address is not None
+
+    @property
+    def is_armed(self) -> bool:
+        """True while a listen cycle is armed (binding, retrying or listening)."""
+        with self._lock:
+            cycle = self._cycle
+        return cycle is not None and cycle.active
+
+    @property
+    def active_connections(self) -> int:
+        """Sleeping-server connections being served by the latest cycle."""
+        with self._lock:
+            cycle = self._last_cycle
+        return cycle.active_connections if cycle is not None else 0
 
     @property
     def bound_address(self):
