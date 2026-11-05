@@ -170,3 +170,8 @@ class ActionResult:
     message: str = ""
     output: Optional[str] = None  # raw RCON response text, when there was one
     details: dict = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        # Lets lifecycle commands return a reason while callers that only
+        # need "did it work" keep using plain truthiness.
+        return self.success
