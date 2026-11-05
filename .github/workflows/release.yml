@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --python 3.11
+
+      - name: Build exe
+        run: uv run poe build-exe
+
+      - name: Rename
+        run: ren dist\minecraft-monitor.exe minecraft-monitor-windows.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: minecraft-monitor-win64
+          path: dist/minecraft-monitor-windows.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --python 3.11
+
+      - name: Build binary
+        run: uv run poe build-exe
+
+      - name: Rename
+        run: mv dist/minecraft-monitor dist/minecraft-monitor-linux
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: minecraft-monitor-linux64
+          path: dist/minecraft-monitor-linux
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: minecraft-monitor-win64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: minecraft-monitor-linux64
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            minecraft-monitor-windows.exe
+            minecraft-monitor-linux
+          generate_release_notes: true
