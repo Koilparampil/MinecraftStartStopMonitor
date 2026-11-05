@@ -270,19 +270,25 @@ class FakeClient:
 
     def kick_player(self, name, reason=None):
         self.kick_calls.append((name, reason))
-        return self.kick_result or ActionResult(True, f"Kicked {name}")
+        if self.kick_result is not None:
+            return self.kick_result
+        return ActionResult(True, f"Kicked {name}")
 
     def ban_player(self, name, reason=None):
         self.ban_calls.append((name, reason))
         if self.banlist is not None and self.ban_writes_file:
             self.banlist.server_ban(name, fake_uuid(name), reason)
-        return self.ban_result or ActionResult(True, f"Banned {name}")
+        if self.ban_result is not None:
+            return self.ban_result
+        return ActionResult(True, f"Banned {name}")
 
     def unban_player(self, name):
         self.unban_calls.append(name)
         if self.banlist is not None and self.ban_writes_file:
             self.banlist.server_pardon(name)
-        return self.unban_result or ActionResult(True, f"Unbanned {name}")
+        if self.unban_result is not None:
+            return self.unban_result
+        return ActionResult(True, f"Unbanned {name}")
 
     def say(self, message):
         self.said.append(message)
