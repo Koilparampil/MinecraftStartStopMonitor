@@ -23,13 +23,17 @@ Modules read settings through the module-level singleton
 at import time, so tests can monkeypatch attributes on the singleton.
 """
 
+import ipaddress
 import logging
 import os
 import secrets
+import shlex
 import shutil
 import subprocess
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SECURITY_SETTINGS = {
     "sessionSecretKey": None,
@@ -137,6 +141,48 @@ SENSITIVE_SETTINGS = {"webPassword", "rconPassword", "sessionSecretKey"}
 DEFAULT_GAME_PORT = 25565
 DEFAULT_RCON_PORT = 25575
 
+# Typed settings: YAML strings such as "25565" or "false" are coerced on load,
+# anything still of the wrong type is reported by validate_settings().
+BOOLEAN_SETTINGS = (
+    "useWebServer",
+    "controlServerThroughWeb",
+    "showServerIPAddress",
+    "webConsole",
+    "playerAvatars",
+    "enablePlayerTracking",
+    "autoStart",
+    "autoStop",
+    "respectWhitelist",
+    "rateLimitEnabled",
+)
+PORT_SETTINGS = ("serverPort", "rconPort", "webServerPort")
+POSITIVE_NUMBER_SETTINGS = ("pollingRate", "stopTimeout", "autoStopDelay")
+POSITIVE_INT_SETTINGS = (
+    "sessionTimeout",
+    "maxLoginAttempts",
+    "lockoutDuration",
+    "rateLimitRequests",
+    "rateLimitWindow",
+)
+_TRUE_WORDS = {"true", "yes", "on", "1"}
+_FALSE_WORDS = {"false", "no", "off", "0"}
+
+
+def yaml_name(flat_key):
+    """Nested YAML name (``section.key``) of a flat attribute, for messages."""
+    for section, mapping in YAML_MAPPING.items():
+        for nested_key, flat in mapping.items():
+            if flat == flat_key:
+                return f"{section}.{nested_key}"
+    return flat_key
+
+
+def mask_setting(key, value):
+    """Printable form of a setting value; sensitive values are masked."""
+    if key in SENSITIVE_SETTINGS:
+        return "***" if value else repr(value)
+    return repr(value)
+
 
 class Settings:
     """Application settings held as attributes; item access mirrors attribute access."""
@@ -179,7 +225,9 @@ class Settings:
         try:
             with open(key_file, "w") as f:
                 f.write(self.sessionSecretKey)
-            logging.info("Auto-generated sessionSecretKey and saved to session_secret.key")
+            logger.info(
+                "Auto-generated sessionSecretKey and saved to session_secret.key"
+            )
         except OSError:
             pass
 
@@ -206,17 +254,33 @@ class Settings:
         try:
             with open(file_path, "r", encoding="utf-8") as file:
                 file_data = yaml.safe_load(file) or {}
+            if not isinstance(file_data, dict):
+                raise yaml.YAMLError("the top level must be a mapping")
             for key, value in self._load_nested_settings(file_data).items():
                 self[key] = value
+            self.coerce_types()
             print("Settings loaded successfully.")
         except FileNotFoundError:
-            logging.warning(f"Settings file not found: {file_path}")
+            logger.warning(f"Settings file not found: {file_path}")
         except yaml.YAMLError as e:
-            logging.warning(f"Error: Invalid YAML format in {file_path}: {e}")
+            logger.warning(f"Error: Invalid YAML format in {file_path}: {e}")
         except Exception:
-            logging.exception("Error from readSettings")
+            logger.exception("Error from readSettings")
 
         self._ensure_session_secret_key(file_path)
+
+    def coerce_types(self):
+        """Turn YAML strings like ``"25565"`` / ``"false"`` into int/bool.
+
+        Values that cannot be coerced are left alone; validate_settings()
+        reports them.
+        """
+        for key in BOOLEAN_SETTINGS:
+            self[key] = _coerce_bool(self.get(key))
+        for key in PORT_SETTINGS + POSITIVE_INT_SETTINGS:
+            self[key] = _coerce_number(self.get(key), integer=True)
+        for key in POSITIVE_NUMBER_SETTINGS:
+            self[key] = _coerce_number(self.get(key), integer=False)
 
     def data_path(self, *parts):
         """Path inside the monitor's data directory (created on demand)."""
@@ -233,31 +297,63 @@ class Settings:
             return None
         return os.path.join(self.serverDir, "server.properties")
 
+    def read_server_properties(self):
+        """server.properties as a dict ({} if missing or unreadable)."""
+        from src.minecraft.server_files import read_properties
+
+        path = self.server_properties_path()
+        if not path or not os.path.isfile(path):
+            return {}
+        try:
+            return read_properties(path)
+        except Exception:
+            logger.exception(f"Could not read {path}")
+            return {}
+
     def resolve_server_properties(self):
         """Fill unset ports/password/bind host from the server's server.properties.
 
-        Explicit settings (YAML or CLI) always win. Called by main after CLI
-        overrides and before validation. Safe to call when the file is missing.
+        Explicit settings (YAML or CLI) always win; an empty string counts as
+        unset for the ports and the RCON password (an empty RCON password
+        cannot work anyway). Also expands ``serverDir`` to an absolute path.
+        Called by main after CLI overrides and before validation. Safe to call
+        when the file is missing. Returns the parsed properties.
         """
-        from src.minecraft.server_files import read_properties
+        if isinstance(self.serverDir, str) and self.serverDir.strip():
+            self.serverDir = os.path.abspath(os.path.expanduser(self.serverDir.strip()))
+        props = self.read_server_properties()
+        explicit_password = _blank_to_none(self.rconPassword)
 
-        props = {}
-        path = self.server_properties_path()
-        if path and os.path.isfile(path):
-            try:
-                props = read_properties(path)
-            except Exception:
-                logging.exception(f"Could not read {path}")
-
-        if self.serverPort is None:
-            self.serverPort = _int_or(props.get("server-port"), DEFAULT_GAME_PORT)
-        if self.rconPort is None:
-            self.rconPort = _int_or(props.get("rcon.port"), DEFAULT_RCON_PORT)
+        self.serverPort = _resolved_port(
+            self.serverPort, props.get("server-port"), DEFAULT_GAME_PORT
+        )
+        self.rconPort = _resolved_port(
+            self.rconPort, props.get("rcon.port"), DEFAULT_RCON_PORT
+        )
+        self.rconPassword = explicit_password
         if self.rconPassword is None and _truthy(props.get("enable-rcon")):
             self.rconPassword = props.get("rcon.password") or None
         if self.listenerBindHost is None:
             self.listenerBindHost = props.get("server-ip", "") or ""
+
+        self._warn_about_properties(props, explicit_password)
         return props
+
+    def _warn_about_properties(self, props, explicit_password):
+        if not props:
+            return
+        if explicit_password is not None and not _truthy(props.get("enable-rcon")):
+            logger.warning(
+                "minecraft.rconPassword is set but server.properties does not have "
+                "enable-rcon=true: RCON will not answer until it is enabled there."
+            )
+        server_ip = (props.get("server-ip") or "").strip()
+        if server_ip and _is_loopback(self.serverHost) and not _is_loopback(server_ip):
+            logger.warning(
+                f"server.properties binds server-ip={server_ip}, but minecraft.host is "
+                f"{self.serverHost}: RCON and the status ping may not reach the server. "
+                f"Set minecraft.host to {server_ip}."
+            )
 
     # ------------------------------------------------------------------
     # Validation
@@ -266,48 +362,148 @@ class Settings:
     def validate_settings(self):
         """Validate mandatory settings.
 
+        Returns:
+            list[str]: non-fatal warnings (already logged).
+
         Raises:
             ValueError: listing every problem found.
         """
         errors = []
-
-        if not self.get("serverDir"):
-            errors.append("minecraft.serverDir is required")
-        elif not os.path.isdir(self.serverDir):
-            errors.append(f"minecraft.serverDir does not exist: {self.serverDir}")
-
-        if not self.get("startCommand"):
-            errors.append("minecraft.startCommand is required")
-
-        if self.get("useWebServer", True) and not self.get("webPassword"):
-            errors.append("web.password is required when the web server is enabled")
-
-        for name, value in [
-            ("minecraft.port", self.serverPort),
-            ("minecraft.rconPort", self.rconPort),
-            ("web.port", self.webServerPort),
-        ]:
-            if value is None:
-                continue
-            try:
-                port = int(value)
-                if not 1 <= port <= 65535:
-                    errors.append(f"{name} must be between 1 and 65535 (got {port})")
-            except (TypeError, ValueError):
-                errors.append(f"{name} is not a valid integer: {value}")
-
-        for name in ("pollingRate", "stopTimeout", "autoStopDelay"):
-            try:
-                if float(self.get(name)) <= 0:
-                    errors.append(f"{name} must be positive")
-            except (TypeError, ValueError):
-                errors.append(f"{name} is not a number: {self.get(name)}")
+        errors += self._required_errors()
+        errors += start_command_errors(self.get("startCommand"))
+        errors += self._port_errors()
+        errors += self._number_errors()
+        errors += self._type_errors()
 
         if errors:
             raise ValueError(
                 "Settings validation failed:\n"
                 + "\n".join(f"  - {error}" for error in errors)
             )
+
+        warnings = self.validation_warnings()
+        for warning in warnings:
+            logger.warning(warning)
+        return warnings
+
+    def _required_errors(self):
+        errors = []
+        if not self.get("serverDir"):
+            errors.append("minecraft.serverDir is required")
+        elif not os.path.isdir(self.serverDir):
+            errors.append(f"minecraft.serverDir does not exist: {self.serverDir}")
+
+        if self.get("useWebServer", True) and not self.get("webPassword"):
+            errors.append("web.password is required when the web server is enabled")
+
+        process_name = self.get("processName")
+        if not isinstance(process_name, str) or not process_name.strip():
+            errors.append("minecraft.processName must be a non-empty string")
+        host = self.get("serverHost")
+        if not isinstance(host, str) or not host.strip():
+            errors.append("minecraft.host must be a non-empty host name or address")
+        bind_host = self.get("listenerBindHost")
+        if bind_host is not None and not isinstance(bind_host, str):
+            errors.append("autoStart.bindHost must be a host name, an address or empty")
+        return errors
+
+    def _port_errors(self):
+        errors = []
+        ports = {}
+        for key in PORT_SETTINGS:
+            value = self.get(key)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                errors.append(f"{yaml_name(key)} is not a valid integer: {value!r}")
+            elif not 1 <= value <= 65535:
+                errors.append(
+                    f"{yaml_name(key)} must be between 1 and 65535 (got {value})"
+                )
+            else:
+                ports[key] = value
+
+        game = ports.get("serverPort")
+        for other in ("rconPort", "webServerPort"):
+            if game is not None and ports.get(other) == game:
+                errors.append(
+                    f"{yaml_name(other)} must differ from the game port ({game})"
+                )
+        rcon, web = ports.get("rconPort"), ports.get("webServerPort")
+        if rcon is not None and rcon == web and rcon != game:
+            errors.append(f"web.port must differ from the RCON port ({rcon})")
+        return errors
+
+    def _number_errors(self):
+        errors = []
+        for key in POSITIVE_NUMBER_SETTINGS + POSITIVE_INT_SETTINGS:
+            value = self.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                errors.append(f"{yaml_name(key)} is not a number: {value!r}")
+            elif value <= 0:
+                errors.append(f"{yaml_name(key)} must be positive (got {value})")
+        return errors
+
+    def _type_errors(self):
+        errors = []
+        for key in BOOLEAN_SETTINGS:
+            if not isinstance(self.get(key), bool):
+                errors.append(
+                    f"{yaml_name(key)} must be true or false (got {self.get(key)!r})"
+                )
+        for key in (
+            "sleepingMotd",
+            "startingMessage",
+            "sleepingVersionName",
+            "webUsername",
+        ):
+            if not isinstance(self.get(key), str):
+                errors.append(f"{yaml_name(key)} must be a string")
+        password = self.get("rconPassword")
+        if password is not None and not isinstance(password, str):
+            errors.append("minecraft.rconPassword must be a string")
+        return errors
+
+    def validation_warnings(self):
+        """Non-fatal configuration problems worth telling the admin about."""
+        warnings = []
+        if not self.get("rconPassword"):
+            warnings.append(
+                "RCON is not configured (no minecraft.rconPassword and no enable-rcon=true "
+                "in server.properties): the monitor falls back to the status ping. "
+                "Server state and auto-stop still work, but kick/ban/unban and console "
+                "commands are disabled, and an adopted server cannot be stopped gracefully."
+            )
+        warnings += self._server_dir_warnings()
+        warnings += start_command_warnings(
+            self.get("startCommand"), self.get("serverDir")
+        )
+        return warnings
+
+    def _server_dir_warnings(self):
+        server_dir = self.get("serverDir")
+        if not server_dir or not os.path.isdir(server_dir):
+            return []
+        warnings = []
+        if not os.path.isfile(os.path.join(server_dir, "server.properties")):
+            warnings.append(
+                f"No server.properties in {server_dir} yet: ports and RCON use "
+                "defaults until the server has been started once."
+            )
+        try:
+            from src.minecraft.server_files import read_eula
+
+            eula = read_eula(server_dir)
+        except Exception:
+            logger.debug("Could not read eula.txt", exc_info=True)
+            eula = None
+        if eula is not True:
+            warnings.append(
+                f"The Minecraft EULA is not accepted in {os.path.join(server_dir, 'eula.txt')}:"
+                " the server will exit right after starting. Read https://aka.ms/MinecraftEULA"
+                " and set eula=true."
+            )
+        return warnings
 
     # ------------------------------------------------------------------
     # Misc
@@ -326,16 +522,83 @@ class Settings:
         try:
             result = subprocess.run(
                 ["git", "rev-parse", "--short", "HEAD"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 text=True,
                 cwd=os.path.dirname(__file__),
                 check=True,
                 timeout=5,
             )
             return result.stdout.strip() or None
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             return None
+
+
+# ----------------------------------------------------------------------
+# startCommand helpers
+# ----------------------------------------------------------------------
+
+
+def start_command_argv(command, os_name=None):
+    """The startCommand as an argv list (POSIX strings are split with shlex).
+
+    On Windows a string is returned as a one-element list: it is handed to
+    CreateProcess unsplit. Raises ValueError for unusable values.
+    """
+    os_name = os_name or os.name
+    if isinstance(command, (list, tuple)):
+        if not command or not all(isinstance(arg, str) and arg for arg in command):
+            raise ValueError("a list startCommand must contain non-empty strings only")
+        return list(command)
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("startCommand must be a non-empty string or list")
+    if os_name == "nt":
+        return [command.strip()]
+    argv = shlex.split(command)  # ValueError on unbalanced quotes
+    if not argv:
+        raise ValueError("startCommand must not be empty")
+    return argv
+
+
+def start_command_errors(command, os_name=None):
+    if command is None or command in ("", []):
+        return ["minecraft.startCommand is required"]
+    try:
+        start_command_argv(command, os_name)
+    except ValueError as e:
+        return [f"minecraft.startCommand is invalid: {e}"]
+    return []
+
+
+def start_command_warnings(command, server_dir, os_name=None):
+    """Warn when the launch executable cannot be found (PATH may differ at runtime)."""
+    os_name = os_name or os.name
+    try:
+        argv = start_command_argv(command, os_name)
+    except ValueError:
+        return []
+    if os_name == "nt" and isinstance(command, str):
+        return []  # CreateProcess parses the string; do not guess
+    executable = argv[0]
+    if os.sep in executable or (os.altsep and os.altsep in executable):
+        candidate = os.path.join(server_dir or "", executable)
+        if not os.path.exists(candidate):
+            return [
+                f"minecraft.startCommand: {executable} does not exist in {server_dir}"
+            ]
+        return []
+    if shutil.which(executable) is None:
+        return [
+            (
+                f"minecraft.startCommand: '{executable}' was not found on PATH "
+                "(install Java or use the full path to the java executable)"
+            )
+        ]
+    return []
+
+
+# ----------------------------------------------------------------------
+# Value helpers
+# ----------------------------------------------------------------------
 
 
 def _int_or(value, default):
@@ -347,6 +610,56 @@ def _int_or(value, default):
 
 def _truthy(value):
     return str(value).strip().lower() == "true"
+
+
+def _blank_to_none(value):
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+def _resolved_port(explicit, from_properties, default):
+    explicit = _blank_to_none(explicit)
+    if explicit is None:
+        return _int_or(from_properties, default)
+    return _coerce_number(explicit, integer=True)
+
+
+def _coerce_bool(value):
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in _TRUE_WORDS:
+            return True
+        if word in _FALSE_WORDS:
+            return False
+    return value
+
+
+def _coerce_number(value, integer):
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    if integer:
+        return value
+    try:
+        return float(text)
+    except ValueError:
+        return value
+
+
+def _is_loopback(host):
+    if not isinstance(host, str):
+        return False
+    if host.strip().lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip()).is_loopback
+    except ValueError:
+        return False
 
 
 settings = Settings()

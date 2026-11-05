@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Log in · Minecraft Monitor{% endblock %}
+{% block body_class %}page-login{% endblock %}
+{% block body %}
+<div class="login-tools">
+  {% include "_theme_toggle.html" %}
+</div>
+
+<main class="login-wrap" id="main">
+  <section class="panel login-card" aria-labelledby="loginTitle">
+    <div class="login-brand">
+      <svg class="login-art" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#art-voxel"></use></svg>
+      <p class="brand">Minecraft Monitor</p>
+      <h1 class="login-title" id="loginTitle">Admin login</h1>
+    </div>
+
+    {% for category, message in get_flashed_messages(with_categories=true) %}
+    <div class="banner banner--info" role="status">
+      <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-info"></use></svg>
+      <span>{{ message }}</span>
+    </div>
+    {% endfor %}
+    {% if error %}
+    <div class="banner banner--error" role="alert" id="loginError">
+      <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-alert"></use></svg>
+      <span>{{ error }}</span>
+    </div>
+    {% endif %}
+    {% if warning %}
+    <div class="banner banner--warn" role="status">
+      <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-info"></use></svg>
+      <span>{{ warning }}</span>
+    </div>
+    {% endif %}
+
+    <form class="login-form" method="post" action="{{ url_for('login') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="next" value="{{ next_url }}">
+
+      <label class="field">
+        <span class="field-label">Username</span>
+        <input class="input" type="text" name="username" id="username" value="{{ username or '' }}"
+               autocomplete="username" autocapitalize="none" spellcheck="false" required
+               {% if not username %}autofocus{% endif %}>
+      </label>
+
+      <label class="field">
+        <span class="field-label">Password</span>
+        <input class="input" type="password" name="password" id="password"
+               autocomplete="current-password" required {% if username %}autofocus{% endif %}>
+      </label>
+
+      <label class="check">
+        <input type="checkbox" name="remember" value="on">
+        <span>Keep me signed in for 7 days</span>
+      </label>
+
+      <button type="submit" class="btn btn--primary btn--block" {% if locked_out %}disabled{% endif %}>
+        {% if locked_out %}Temporarily locked{% else %}Log in{% endif %}
+      </button>
+    </form>
+  </section>
+  <p class="login-foot">Your server's control panel. Access is limited to the configured admin account.</p>
+</main>
+
+<div class="ground" aria-hidden="true"></div>
+{% endblock %}

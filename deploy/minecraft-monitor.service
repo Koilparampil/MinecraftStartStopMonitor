@@ -1,0 +1,66 @@
+# Example systemd unit for running minecraft-monitor as a service on Linux.
+#
+# Prerequisites:
+#   - Run minecraft-monitor manually once and finish the interactive first-run
+#     setup: settings.yaml must already exist (systemd has no terminal for the
+#     setup questions). Accept the Minecraft EULA there or in eula.txt.
+#
+# Install:
+#   1. Copy this file to /etc/systemd/system/minecraft-monitor.service
+#   2. Edit User / WorkingDirectory / ExecStart below for your setup
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now minecraft-monitor
+#   5. journalctl -u minecraft-monitor -f   # follow the logs
+#
+# How it treats the Minecraft server:
+#   The monitor launches the Minecraft server as its own child process, so by
+#   default systemd would count the server as part of this service and kill it
+#   whenever the monitor is stopped or restarted. KillMode=process below makes
+#   systemd signal only the monitor itself. The Minecraft server keeps running
+#   (players stay connected), and the next monitor instance finds it again by
+#   its working directory (minecraft.serverDir) and adopts it. To stop the
+#   game server, use the dashboard's Stop button (or let auto-stop do it) --
+#   the monitor saves the world and stops it gracefully.
+#
+#   Caveat: a server left running when you `systemctl stop` the monitor is no
+#   longer managed (no auto-stop) until the monitor starts again. On machine
+#   shutdown systemd still sends it SIGTERM, which makes the server save and exit.
+
+[Unit]
+Description=Minecraft Monitor (auto start/stop + web dashboard)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Must be the user that owns the Minecraft server folder: the monitor launches,
+# finds and signals the server process, and edits server.properties/eula.txt.
+User=<your-minecraft-user>
+# monitor.log, data/ (players.json, server.pid, server-console.log) and, for
+# the built executable, settings.yaml + session_secret.key live here.
+# Default below assumes the repo was cloned to ~<your-minecraft-user>/minecraft-monitor
+# and built with `uv run poe build-exe` (which outputs to dist/) -- adjust if yours differs.
+WorkingDirectory=/home/<your-minecraft-user>/minecraft-monitor/dist
+ExecStart=/home/<your-minecraft-user>/minecraft-monitor/dist/minecraft-monitor
+# Running from source instead of the executable:
+# WorkingDirectory=/home/<your-minecraft-user>/minecraft-monitor
+# ExecStart=/usr/bin/env uv run --frozen python -m src.main
+# Environment=MINECRAFT_MONITOR_SETTINGS=/home/<your-minecraft-user>/minecraft-monitor/src/settings.yaml
+
+# Only stop the monitor, never the Minecraft server it launched (see above).
+KillMode=process
+# SIGTERM makes the monitor shut down cleanly: it releases the game port and
+# waits for an in-flight server start/stop to finish, which can take a few
+# minutes with a big modpack (minecraft.stopTimeout + margin).
+KillSignal=SIGTERM
+TimeoutStopSec=240
+Restart=on-failure
+RestartSec=5
+Environment=LOG_LEVEL=INFO
+# Java servers open many files (mods, region files); the server inherits this.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

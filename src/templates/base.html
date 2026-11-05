@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en"{% if theme %} data-theme="{{ theme }}"{% endif %}>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{% block title %}Minecraft Monitor{% endblock %}</title>
+  <link rel="icon" type="image/svg+xml" href="{{ static_url('favicon.svg') }}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&amp;display=swap">
+  <link rel="stylesheet" href="{{ static_url('styles.css') }}">
+  {% block head %}{% endblock %}
+  <script src="{{ static_url('theme.js') }}" defer></script>
+</head>
+<body class="{% block body_class %}{% endblock %}">
+  {% include "_icons.html" %}
+  {% block body %}{% endblock %}
+</body>
+</html>

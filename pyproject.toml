@@ -28,7 +28,9 @@ dev = [
 package = false
 
 [tool.ruff.lint]
-extend-select = ["B", "SIM", "C90", "PLR"]
+# Explicit rule set so newer ruff releases (whose defaults grew much broader)
+# don't change what CI enforces.
+select = ["E4", "E7", "E9", "F", "B", "SIM", "C90", "PLR"]
 ignore = ["PLR2004", "SIM112"]  # test magic values, Windows env var casing
 
 [tool.ruff.lint.per-file-ignores]

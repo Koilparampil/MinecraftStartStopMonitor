@@ -1,0 +1,8 @@
+{# Theme toggle: cycles system -> light -> dark (theme.js). The server picks
+   the initial icon from the theme cookie so the first paint is already right. #}
+{% set theme_icon = {'light': 'i-sun', 'dark': 'i-moon'}.get(theme, 'i-auto') %}
+{% set theme_name = {'light': 'Light', 'dark': 'Dark'}.get(theme, 'System') %}
+<button type="button" class="icon-btn theme-toggle" id="themeToggle"
+        aria-label="Theme: {{ theme_name }}. Change theme" title="Theme: {{ theme_name }}">
+  <svg class="ico" aria-hidden="true" focusable="false"><use href="#{{ theme_icon }}"></use></svg>
+</button>

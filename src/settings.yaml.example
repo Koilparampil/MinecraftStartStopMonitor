@@ -1,0 +1,153 @@
+# ============================================================================
+# Minecraft Monitor settings
+# ============================================================================
+# Copy this file to settings.yaml (next to the program, or point to it with
+# --settings PATH / $MINECRAFT_MONITOR_SETTINGS) and edit it. On the first run
+# without a settings file, an interactive setup writes one for you.
+#
+# Every setting can be overridden on the command line (run with --help).
+# `null` means "not set": ports, the RCON password and the auto-start bind
+# address are then read from the server's own server.properties.
+
+# ============================================================================
+# Minecraft server
+# ============================================================================
+minecraft:
+  # Server folder (required): the one with server.properties, eula.txt,
+  # mods/, world/ and logs/. The start command runs inside this folder.
+  serverDir: "/home/minecraft/server"
+  # Windows example:
+  # serverDir: "C:\\Minecraft\\server"
+
+  # Command that starts the server (required). It runs with the server folder
+  # as working directory. Use the plain launcher, not a start script that
+  # restarts the server in a loop (many modpack "start.sh" scripts do), or
+  # auto-stop would be undone immediately.
+  #
+  # Forge / NeoForge 1.17+ (memory flags go in user_jvm_args.txt, e.g. -Xmx6G):
+  startCommand: "./run.sh nogui"
+  #   Windows: "run.bat nogui"
+  # Fabric (fabric-server-launch.jar from the Fabric installer):
+  # startCommand: "java -Xms1G -Xmx6G -jar fabric-server-launch.jar nogui"
+  # Quilt:
+  # startCommand: "java -Xms1G -Xmx6G -jar quilt-server-launch.jar nogui"
+  # Forge 1.16.5 and older:
+  # startCommand: "java -Xms1G -Xmx6G -jar forge-1.16.5-36.2.39.jar nogui"
+  # Vanilla:
+  # startCommand: "java -Xms1G -Xmx4G -jar server.jar nogui"
+  # A list skips shell-style parsing (handy for paths with spaces):
+  # startCommand: ["java", "-Xmx6G", "-jar", "fabric-server-launch.jar", "nogui"]
+  #
+  # -Xmx is the most memory Java may use. Modded servers usually want 4-10G;
+  # leave a couple of GB for the operating system.
+
+  # Host the monitor uses to reach the server for RCON and the status ping.
+  # Keep 127.0.0.1 unless server.properties binds server-ip to one address.
+  host: "127.0.0.1"
+  # Game port. null = server-port from server.properties (default 25565).
+  # While the server is stopped, the monitor listens on this port itself.
+  port: null
+  # RCON port and password. null = rcon.port / rcon.password from
+  # server.properties (the password is only used when enable-rcon=true).
+  # Without RCON the monitor still works using the status ping, but kick,
+  # ban and console commands are disabled.
+  rconPort: null
+  rconPassword: null
+  # Seconds between status / player-list polls.
+  pollingRate: 5
+  # Seconds to wait for the server to save the world and exit after `stop`
+  # before it is terminated. Big modpacks can take a while.
+  stopTimeout: 120
+  # Used to recognise an already running server (for example after the
+  # monitor restarts): a process whose working directory is serverDir and
+  # whose name or command line contains this text.
+  processName: "java"
+
+# ============================================================================
+# Web dashboard
+# ============================================================================
+web:
+  # Whether to serve the dashboard.
+  enabled: true
+  # Address to listen on: 0.0.0.0 = every network interface,
+  # 127.0.0.1 = this computer only (use a reverse proxy for HTTPS).
+  host: "0.0.0.0"
+  # Dashboard port (must differ from the game and RCON ports).
+  port: 25580
+  # Dashboard login (the password is required) -- change it on first use.
+  username: "admin"
+  password: "changeme"
+  # Allow start / stop / restart and console commands from the dashboard.
+  controlServer: true
+  # Show the server's address on the dashboard.
+  showServerIP: false
+  # Server log viewer and RCON console in the dashboard.
+  console: true
+  # Show player heads (loaded from an external avatar service).
+  playerAvatars: true
+
+# ============================================================================
+# Feature flags
+# ============================================================================
+features:
+  # Remember players and when they were last online (data/players.json).
+  playerTracking: true
+  # Start the server when a player tries to join while it is stopped.
+  autoStart: true
+  # Stop the server when nobody has been online for autoStop.stopDelay.
+  autoStop: true
+
+# ============================================================================
+# Auto start: the "sleeping" server shown while the real one is stopped
+# ============================================================================
+autoStart:
+  # Address the sleeping listener binds. null = server-ip from
+  # server.properties; empty = all interfaces (IPv4 and IPv6).
+  bindHost: null
+  # Text shown in the multiplayer server list while sleeping.
+  # Section-sign colour codes work (§a green, §7 grey, §e yellow...).
+  motd: "§7Server is sleeping §8- §aJoin to wake it up!"
+  # Message shown to the player whose join attempt starts the server.
+  kickMessage: "§eThe server is starting up!\n§7Modded servers can take a few minutes. Please reconnect shortly."
+  # Version label shown in the server list while sleeping.
+  versionName: "Sleeping"
+  # Only wake the server for players it would let in: names in
+  # banned-players.json and IPs in banned-ips.json are refused, and with
+  # white-list=true only whitelist.json / ops.json names may wake it.
+  respectWhitelist: true
+
+# ============================================================================
+# Auto stop
+# ============================================================================
+autoStop:
+  # Seconds the server must be empty before it is stopped (saved and shut
+  # down gracefully).
+  stopDelay: 600
+
+# ============================================================================
+# Monitor state
+# ============================================================================
+monitor:
+  # Folder for players.json, server.pid and server-console.log
+  # (relative paths are relative to the working directory).
+  dataDir: "data"
+
+# ============================================================================
+# Security & rate limiting (web dashboard)
+# ============================================================================
+security:
+  # Secret key for session cookies (auto-generated into session_secret.key
+  # next to this file when null).
+  sessionSecretKey: null
+  # Session timeout in seconds (default: 1 hour).
+  sessionTimeout: 3600
+  # Failed logins before the account is locked out for a while.
+  maxLoginAttempts: 5
+  # Lockout duration in seconds (default: 5 minutes).
+  lockoutDuration: 300
+  # Rate limiting for dashboard requests.
+  rateLimitEnabled: true
+  # Maximum requests per window.
+  rateLimitRequests: 300
+  # Rate limit window in seconds.
+  rateLimitWindow: 60

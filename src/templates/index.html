@@ -1,0 +1,251 @@
+{% extends "base.html" %}
+{% block title %}{{ motd or 'Minecraft server' }} · Minecraft Monitor{% endblock %}
+{% block head %}
+  <meta name="csrf-token" content="{{ csrf_token() }}">
+  <script src="{{ static_url('dashboard.js') }}" defer></script>
+{% endblock %}
+{% block body_class %}page-dashboard{% endblock %}
+{% block body %}
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="hero">
+  <div class="hero-inner">
+    <div class="hero-icon">
+      <img id="serverIcon" class="server-icon" width="64" height="64" alt="Server icon" hidden>
+      <svg id="serverIconFallback" class="server-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#art-voxel"></use></svg>
+    </div>
+    <div class="hero-text">
+      <p class="brand">Minecraft Monitor</p>
+      <h1 class="motd" id="serverMotd">{{ motd or 'Minecraft server' }}</h1>
+      <p class="hero-meta">
+        <span class="meta-item" id="serverVersion">{% if server.version %}Minecraft {{ server.version }}{% else %}Version unknown{% endif %}</span>
+        <span class="meta-item" id="playerSummary">{{ snapshot.playerCount or 0 }}{% if snapshot.maxPlayers %} / {{ snapshot.maxPlayers }}{% endif %} players</span>
+        <span class="meta-item" id="uptime" hidden></span>
+      </p>
+    </div>
+    <div class="hero-status">
+      <div class="pill pill--{{ status|lower }}" id="statusPill" role="status" aria-live="polite" aria-atomic="true">
+        <span class="pill-led" aria-hidden="true"></span>
+        <span class="sr-only">Server status: </span><span id="statusText">{{ status }}</span>
+      </div>
+      <p class="status-detail" id="statusDetail">
+        {%- if status == 'LOADING' %}Process is up — loading mods…
+        {%- elif status == 'STARTING' %}Launching the server…
+        {%- elif status == 'STOPPING' %}Saving worlds and shutting down…
+        {%- elif status == 'ONLINE' %}Accepting players
+        {%- else %}{% if config.autoStart %}Sleeping — a join attempt wakes it{% else %}Stopped{% endif %}{% endif -%}
+      </p>
+    </div>
+    <div class="hero-tools">
+      {% include "_theme_toggle.html" %}
+      <form method="post" action="{{ url_for('logout') }}" class="logout-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="btn btn--ghost btn--sm" title="Signed in as {{ username }}">
+          <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-logout"></use></svg>
+          <span>Log out</span>
+        </button>
+      </form>
+    </div>
+  </div>
+</header>
+
+<main class="layout" id="main">
+  <section class="panel toolbar" aria-label="Server controls">
+    <div class="btn-row">
+      {% if config.controlServer %}
+      <button type="button" class="btn btn--primary" id="startBtn" {% if state != 'STOPPED' %}disabled{% endif %}>
+        <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-play"></use></svg><span>Start</span>
+      </button>
+      <button type="button" class="btn btn--danger" id="stopBtn" {% if state != 'RUNNING' %}disabled{% endif %}>
+        <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-stop"></use></svg><span>Stop</span>
+      </button>
+      <button type="button" class="btn btn--warn" id="restartBtn" {% if state != 'RUNNING' %}disabled{% endif %}>
+        <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-restart"></use></svg><span>Restart</span>
+      </button>
+      {% endif %}
+      <button type="button" class="btn btn--ghost" id="refreshBtn">
+        <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-refresh"></use></svg><span>Refresh</span>
+      </button>
+    </div>
+    <p class="toolbar-hint" id="controlsHint">
+      {% if not config.controlServer %}Server control from the web UI is turned off (<code>web.controlServer</code>).{% endif %}
+    </p>
+  </section>
+
+  <div class="col col-main">
+    <section class="panel" id="playersPanel" aria-labelledby="playersTitle">
+      <div class="panel-head">
+        <h2 class="panel-title" id="playersTitle">
+          <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-players"></use></svg>Players
+        </h2>
+        <span class="chip" id="playerCountChip">{{ snapshot.playerCount or 0 }} online</span>
+      </div>
+      <div class="notices" id="playersNotices" role="status"></div>
+      <div class="table-wrap">
+        <table class="players" id="playersTable" hidden>
+          <thead>
+            <tr>
+              <th scope="col">Player</th>
+              <th scope="col">Status</th>
+              <th scope="col" class="col-actions"><span class="sr-only">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody id="playersBody"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="playersEmpty">
+        <svg class="empty-art" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#art-voxel"></use></svg>
+        <p id="playersEmptyText">Loading players…</p>
+      </div>
+    </section>
+
+    {% if config.webConsole %}
+    <section class="panel panel--console" id="consolePanel" aria-labelledby="consoleTitle">
+      <details id="consoleDetails" open>
+        <summary class="panel-head panel-head--toggle">
+          <h2 class="panel-title" id="consoleTitle">
+            <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-console"></use></svg>Console
+          </h2>
+          <span class="chip" id="consoleChip">Server log</span>
+          <svg class="ico chevron" aria-hidden="true" focusable="false"><use href="#i-chevron"></use></svg>
+        </summary>
+        <div class="console-toolbar">
+          <div class="segmented" role="radiogroup" aria-label="Log source">
+            <label><input type="radio" name="consoleSource" value="log" checked><span>Server log</span></label>
+            <label><input type="radio" name="consoleSource" value="launch"><span>Launch output</span></label>
+          </div>
+          <div class="console-options">
+            <label class="check check--sm"><input type="checkbox" id="consoleFollow" checked><span>Follow</span></label>
+            <label class="select-label">
+              <span>Lines</span>
+              <select id="consoleLines" class="select">
+                <option value="100">100</option>
+                <option value="200" selected>200</option>
+                <option value="500">500</option>
+                <option value="1000">1000</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <div class="console" id="consoleLog" tabindex="0" role="log" aria-live="off" aria-label="Log output">
+          <p class="console-empty">Loading log…</p>
+        </div>
+        {% if config.commands %}
+        <div class="console-transcript" id="consoleTranscript" aria-live="polite" hidden></div>
+        <form class="console-input" id="commandForm" autocomplete="off">
+          <label for="commandInput" class="sr-only">Console command</label>
+          <span class="prompt" aria-hidden="true">&gt;</span>
+          <input class="input input--mono" id="commandInput" name="command" maxlength="{{ config.maxCommandLength }}"
+                 spellcheck="false" autocapitalize="none" placeholder="list, say Hello, time set day…">
+          <button type="submit" class="btn btn--primary btn--sm" id="commandSend">
+            <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-enter"></use></svg><span>Run</span>
+          </button>
+        </form>
+        <p class="console-hint" id="commandHint">Commands run over RCON. ↑/↓ recalls history.</p>
+        {% endif %}
+      </details>
+    </section>
+    {% endif %}
+  </div>
+
+  <div class="col col-side">
+    <section class="panel" id="automationPanel" aria-labelledby="automationTitle">
+      <div class="panel-head">
+        <h2 class="panel-title" id="automationTitle">
+          <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-clock"></use></svg>Automation
+        </h2>
+      </div>
+      <div class="auto-row">
+        <div class="auto-head">
+          <h3>Auto-start</h3>
+          <span class="chip {{ 'chip--on' if config.autoStart else 'chip--off' }}" id="autoStartChip">{{ 'On' if config.autoStart else 'Off' }}</span>
+        </div>
+        <p class="auto-text" id="autoStartText">
+          {% if config.autoStart %}While the server is stopped, the monitor answers on the game port as a sleeping server. The first player who tries to join wakes it up.{% else %}Disabled — start the server from this dashboard.{% endif %}
+        </p>
+      </div>
+      <div class="auto-row">
+        <div class="auto-head">
+          <h3>Auto-stop</h3>
+          <span class="chip {{ 'chip--on' if config.autoStop else 'chip--off' }}" id="autoStopChip">{{ 'On' if config.autoStop else 'Off' }}</span>
+        </div>
+        <p class="auto-text" id="autoStopText">
+          {% if config.autoStop %}Stops the server gracefully after it has been empty for a while.{% else %}Disabled — the server keeps running until you stop it.{% endif %}
+        </p>
+        <div class="countdown" id="autoStopCountdown" hidden>
+          <p class="countdown-text" id="autoStopCountdownText" role="timer" aria-live="off"></p>
+          <div class="meter" aria-hidden="true"><div class="meter-fill" id="autoStopMeter"></div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="serverPanel" aria-labelledby="serverTitle">
+      <div class="panel-head">
+        <h2 class="panel-title" id="serverTitle">
+          <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-server"></use></svg>Server
+        </h2>
+      </div>
+      <dl class="facts">
+        <div class="fact" id="addressFact" hidden>
+          <dt>Address</dt>
+          <dd><code id="serverAddress"></code>
+            <button type="button" class="icon-btn icon-btn--sm" id="copyAddress" aria-label="Copy address" title="Copy address">
+              <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-copy"></use></svg>
+            </button>
+          </dd>
+        </div>
+        <div class="fact"><dt>Version</dt><dd id="factVersion">{{ server.version or '—' }}</dd></div>
+        <div class="fact"><dt>Slots</dt><dd id="factSlots">{{ snapshot.maxPlayers or '—' }}</dd></div>
+        <div class="fact"><dt>Data source</dt><dd id="factSource">—</dd></div>
+        <div class="fact"><dt>Started</dt><dd id="factStarted">—</dd></div>
+      </dl>
+    </section>
+
+    <section class="panel" id="modsPanel" aria-labelledby="modsTitle">
+      <div class="panel-head">
+        <h2 class="panel-title" id="modsTitle">
+          <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-mods"></use></svg>Mods
+        </h2>
+        <span class="chip" id="modCount">…</span>
+      </div>
+      <label class="search" id="modFilterWrap" hidden>
+        <svg class="ico" aria-hidden="true" focusable="false"><use href="#i-search"></use></svg>
+        <span class="sr-only">Filter mods</span>
+        <input class="input input--bare" type="search" id="modFilter" placeholder="Filter mods" autocomplete="off" spellcheck="false">
+      </label>
+      <ul class="mods" id="modList"></ul>
+      <p class="empty-text" id="modsEmpty">Loading mods…</p>
+    </section>
+  </div>
+</main>
+
+<footer class="footer">
+  <span class="conn conn--connecting" id="connState">
+    <span class="conn-dot" aria-hidden="true"></span><span id="connText">Connecting…</span>
+  </span>
+  <span>Last update <time id="lastUpdated">—</time></span>
+  <span class="footer-version">minecraft-monitor{% if git_hash %} · <code id="gitHash">{{ git_hash }}</code>{% endif %}</span>
+</footer>
+
+<div class="toasts" id="toasts" aria-live="polite" aria-relevant="additions"></div>
+
+<dialog class="modal" id="confirmDialog" aria-labelledby="confirmTitle" aria-describedby="confirmBody">
+  <form method="dialog" class="modal-card" id="confirmForm">
+    <div class="modal-head">
+      <span class="modal-icon" id="confirmIcon" aria-hidden="true"><svg class="ico"><use href="#i-alert"></use></svg></span>
+      <h2 class="modal-title" id="confirmTitle">Are you sure?</h2>
+    </div>
+    <p class="modal-body" id="confirmBody"></p>
+    <label class="field" id="confirmReasonField" hidden>
+      <span class="field-label">Reason <span class="optional">(optional, shown to the player)</span></span>
+      <input class="input" type="text" id="confirmReason" maxlength="{{ config.maxReasonLength }}" autocomplete="off">
+    </label>
+    <div class="modal-actions">
+      <button type="button" class="btn btn--ghost" id="confirmCancel">Cancel</button>
+      <button type="submit" class="btn btn--danger" id="confirmOk" value="confirm">Confirm</button>
+    </div>
+  </form>
+</dialog>
+
+<script type="application/json" id="bootstrap">{{ bootstrap|tojson }}</script>
+{% endblock %}
