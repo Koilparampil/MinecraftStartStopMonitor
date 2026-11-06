@@ -356,9 +356,7 @@ class TestTransitions:
         # No separate start -> start cooldown under-reporting the wait.
         assert command.outcome == ActionResult(True, "Starting the server in 1 s.")
 
-    def test_server_started_by_hand_during_the_debounce_cancels_the_launch(
-        self, env
-    ):
+    def test_server_started_by_hand_during_the_debounce_cancels_the_launch(self, env):
         env.supervisor.server_stopping_cooldown = 5
         stop(env, launch(env))
         env.supervisor.handle(StartCommand())
