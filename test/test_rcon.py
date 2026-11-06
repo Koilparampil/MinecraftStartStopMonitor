@@ -15,6 +15,7 @@ from src.minecraft.rcon import (
     RconAuthError,
     RconClient,
     RconError,
+    RconProtocolError,
     RconUnavailable,
     encode_packet,
     read_packet,
@@ -210,9 +211,17 @@ def test_auth_then_command(make_server, make_client):
 def test_wrong_password(make_server, make_client):
     server = make_server(vanilla())
     client = make_client(server, password="wrong")
-    with pytest.raises(RconAuthError):
+    with pytest.raises(RconAuthError, match="rcon.password / enable-rcon"):
         client.command("list")
     assert not client.connected
+
+
+@pytest.mark.parametrize("password", ["x" * (MAX_PAYLOAD + 1), "nul\x00byte"])
+def test_unusable_password_fails_auth_without_connecting(password):
+    # Nothing listens on the port: a connection attempt would be "refused".
+    client = RconClient("127.0.0.1", free_tcp_port(), password, connect_timeout=1)
+    with pytest.raises(RconAuthError, match="password"):
+        client.command("list")
 
 
 def test_auth_skips_stray_type0_packet(make_server, make_client):
@@ -398,7 +407,7 @@ def test_garbage_is_a_protocol_error(make_server, make_client):
         ctx.conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
 
     server = make_server(vanilla({"cmd": garbage}))
-    with pytest.raises(RconError, match="invalid RCON") as info:
+    with pytest.raises(RconProtocolError, match="invalid RCON") as info:
         make_client(server).command("cmd")
     assert not isinstance(info.value, RconUnavailable)
 

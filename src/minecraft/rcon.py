@@ -57,7 +57,14 @@ class RconUnavailable(RconError):
 
 
 class RconAuthError(RconError):
-    """The server rejected the RCON password."""
+    """The server rejected the RCON password (or it cannot be sent)."""
+
+
+class RconProtocolError(RconError):
+    """The RCON endpoint answered with data that is not valid RCON."""
+
+
+AUTH_GUIDANCE = "check rcon.password / enable-rcon in server.properties"
 
 
 @dataclass(frozen=True)
@@ -208,6 +215,10 @@ class RconClient:
             return True
 
     def _connect_locked(self) -> None:
+        try:  # an unusable password never opens a connection the server would log
+            password = _encode_payload(self._password, "password")
+        except RconError as exc:
+            raise RconAuthError(f"{exc} ({AUTH_GUIDANCE})") from exc
         sock = socket.create_connection(
             (self.host, self.port), timeout=self._connect_timeout
         )
@@ -216,20 +227,21 @@ class RconClient:
         self._sock = sock
         self._reader = SocketReader(sock)
         try:
-            self._authenticate()
+            self._authenticate(password)
         except BaseException:
             self._close_locked()
             raise
 
-    def _authenticate(self) -> None:
+    def _authenticate(self, password: bytes) -> None:
         request_id = self._next_id()
-        self._send(request_id, TYPE_AUTH, _encode_payload(self._password, "password"))
+        self._send(request_id, TYPE_AUTH, password)
         deadline = time.monotonic() + self._read_timeout
         for _ in range(_AUTH_SKIP_LIMIT):
             packet = read_packet(self._reader, deadline)
             if packet.request_id == -1:
                 raise RconAuthError(
-                    f"RCON authentication failed at {self.host}:{self.port} (check rcon.password)"
+                    f"RCON authentication failed at {self.host}:{self.port}: "
+                    f"the server rejected the password ({AUTH_GUIDANCE})"
                 )
             if (
                 packet.request_id == request_id
@@ -297,7 +309,7 @@ class RconClient:
     def _translate(self, exc: Exception) -> RconError:
         where = f"{self.host}:{self.port}"
         if isinstance(exc, ProtocolError):
-            return RconError(f"invalid RCON data from {where}: {exc}")
+            return RconProtocolError(f"invalid RCON data from {where}: {exc}")
         if isinstance(exc, ConnectionRefusedError):
             return RconUnavailable(f"RCON connection refused at {where}")
         if isinstance(exc, TimeoutError):

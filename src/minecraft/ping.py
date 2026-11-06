@@ -8,6 +8,7 @@ by every server version with a 0xFF kick packet) is also supported.
 import contextlib
 import json
 import random
+import re
 import socket
 import time
 from dataclasses import dataclass, field, replace
@@ -34,6 +35,10 @@ STATUS_PROTOCOL = -1
 # Forge 1.13-1.17 servers put whole mod lists in the status JSON, far above
 # the 32767-character limit vanilla clients enforce: accept large frames.
 MAX_STATUS_FRAME = 2 * 1024 * 1024
+# Player counts outside this range are treated as unknown, never clamped: a
+# bogus value must not turn into a low count that arms auto-stop.
+MAX_PLAYER_COUNT = 1_000_000
+_INT_TEXT = re.compile(r"[+-]?[0-9]{1,10}")  # ASCII only (`\d` matches other scripts)
 
 
 class PingError(Exception):
@@ -45,7 +50,7 @@ class ServerStatus:
     version_name: str
     protocol: int | None
     online: int
-    max_players: int
+    max_players: int | None  # None when missing or not a sane count
     sample: tuple[
         tuple[str, str], ...
     ] = ()  # (name, id) as reported, anonymous ones included
@@ -94,7 +99,7 @@ def ping_status(
             status = parse_status(PacketReader(payload).read_string(max_length=None))
             latency = _pong_latency(sock, reader, deadline) if measure_latency else None
             return replace(status, latency_ms=status_ms if latency is None else latency)
-    except (OSError, ProtocolError) as exc:
+    except (OSError, ValueError) as exc:  # ProtocolError is a ValueError
         raise PingError(f"status ping to {host}:{port} failed: {exc}") from exc
 
 
@@ -127,8 +132,9 @@ def _pong_latency(
 def parse_status(raw: Any) -> ServerStatus:
     """Validate a status response (JSON text or decoded dict) tolerantly.
 
-    Only ``players.online`` is required: without it the sample cannot be
-    trusted for auto-stop, so it raises PingError.
+    Only ``players.online`` is required, as an integer in
+    0..MAX_PLAYER_COUNT (JSON number or ASCII digits): without a sane count the
+    response cannot be trusted for auto-stop, so it raises PingError.
     """
     if isinstance(raw, (str, bytes, bytearray)):
         try:
@@ -138,9 +144,9 @@ def parse_status(raw: Any) -> ServerStatus:
     if not isinstance(raw, dict):
         raise PingError("status response is not a JSON object")
     players = raw.get("players")
-    online = _as_int(players.get("online")) if isinstance(players, dict) else None
-    if online is None or online < 0:
-        raise PingError("status response has no player count")
+    online = _as_count(players.get("online")) if isinstance(players, dict) else None
+    if online is None:
+        raise PingError("status response has no valid player count")
     version = raw.get("version") if isinstance(raw.get("version"), dict) else {}
     name = version.get("name")
     try:
@@ -151,7 +157,7 @@ def parse_status(raw: Any) -> ServerStatus:
         version_name=strip_formatting(name) if isinstance(name, str) else "",
         protocol=_as_int(version.get("protocol")),
         online=online,
-        max_players=max(0, _as_int(players.get("max")) or 0),
+        max_players=_as_count(players.get("max")),
         sample=_parse_sample(players.get("sample")),
         motd=motd,
         favicon=isinstance(raw.get("favicon"), str) and bool(raw.get("favicon")),
@@ -159,14 +165,21 @@ def parse_status(raw: Any) -> ServerStatus:
     )
 
 
-def _as_int(value: Any) -> int | None:
-    if isinstance(value, bool):
+def _as_int(
+    value: Any, minimum: int = -(2**31), maximum: int = 2**31 - 1
+) -> int | None:
+    """A JSON integer (not bool/float) or a string of at most 10 ASCII digits,
+    within [minimum, maximum]; None (unknown) for anything else."""
+    if isinstance(value, str):
+        text = value.strip()
+        value = int(text) if _INT_TEXT.fullmatch(text) else None
+    if isinstance(value, bool) or not isinstance(value, int):
         return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
-        return int(value.strip())
-    return None
+    return value if minimum <= value <= maximum else None
+
+
+def _as_count(value: Any) -> int | None:
+    return _as_int(value, 0, MAX_PLAYER_COUNT)
 
 
 def _parse_sample(sample: Any) -> tuple[tuple[str, str], ...]:
@@ -200,7 +213,7 @@ def parse_legacy_response(text: str) -> LegacyStatus:
             raise PingError("unrecognised legacy ping response")
         motd, online, maximum = parts
         protocol, version = "", ""
-    online_count, max_count = _as_int(online), _as_int(maximum)
+    online_count, max_count = _as_count(online), _as_count(maximum)
     if online_count is None or max_count is None:
         raise PingError("legacy ping response has invalid player counts")
     return LegacyStatus(

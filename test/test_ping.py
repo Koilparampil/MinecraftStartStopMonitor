@@ -80,7 +80,7 @@ def test_parse_status_tolerates_missing_optional_fields():
         status.max_players,
         status.version_name,
         status.protocol,
-    ) == (2, 0, "", None)
+    ) == (2, None, "", None)
     assert status.sample == () and status.favicon is False
 
 
@@ -100,6 +100,32 @@ def test_parse_status_tolerates_missing_optional_fields():
 def test_parse_status_rejects_unusable_responses(raw):
     with pytest.raises(PingError):
         parse_status(raw)
+
+
+@pytest.mark.parametrize(
+    "online",
+    ["²", "٣", "1" * 5000, "12abc", "1e3", 1_000_001, -1, 2.0, None, [], {}],
+)
+def test_parse_status_rejects_bad_player_counts(online):
+    # Never a ValueError, never a clamped (falsely low) count.
+    with pytest.raises(PingError):
+        parse_status({"players": {"online": online, "max": 20}})
+
+
+def test_parse_status_huge_json_integer_is_a_ping_error():
+    with pytest.raises(PingError):
+        parse_status('{"players": {"online": ' + "9" * 5000 + "}}")
+
+
+@pytest.mark.parametrize("raw_count", [" 7 ", "+7", 7])
+def test_parse_status_accepts_plain_counts(raw_count):
+    assert parse_status({"players": {"online": raw_count}}).online == 7
+
+
+@pytest.mark.parametrize("maximum", ["²", "9" * 50, -1, 2**31, True, "x", 1.5])
+def test_parse_status_bad_max_is_unknown(maximum):
+    status = parse_status({"players": {"online": 2, "max": maximum}})
+    assert (status.online, status.max_players) == (2, None)
 
 
 def test_parse_status_survives_deep_description():
@@ -236,6 +262,13 @@ def test_ping_status_errors_are_ping_errors(scripted, script):
         ping_status("127.0.0.1", server.port, timeout=2)
 
 
+def test_ping_status_bad_count_is_a_ping_error(scripted):
+    text = json.dumps({"players": {"online": "²", "max": 20}})
+    server = scripted(answer_status(text, pong=False))
+    with pytest.raises(PingError, match="player count"):
+        ping_status("127.0.0.1", server.port, timeout=2)
+
+
 def test_ping_status_silent_server_times_out(scripted):
     release = threading.Event()
     server = scripted(lambda conn, reader: release.wait(5))
@@ -279,7 +312,15 @@ def test_parse_legacy_response_pre_14_format():
 
 
 @pytest.mark.parametrize(
-    "text", ["", "§1\x00127\x00x", "no separators", "§1\x00127\x00v\x00m\x00x\x00y"]
+    "text",
+    [
+        "",
+        "§1\x00127\x00x",
+        "no separators",
+        "§1\x00127\x00v\x00m\x00x\x00y",
+        "§1\x00127\x00v\x00m\x00²\x0020",
+        "§1\x00127\x00v\x00m\x00-1\x0020",
+    ],
 )
 def test_parse_legacy_response_rejects_garbage(text):
     with pytest.raises(PingError):

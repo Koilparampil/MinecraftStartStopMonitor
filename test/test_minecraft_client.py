@@ -1,5 +1,7 @@
 """MinecraftClient: list parsing, RCON/ping fallback, caching, moderation."""
 
+import logging
+
 import pytest
 
 from src.lifecycle.messages import OnlinePlayer
@@ -12,6 +14,7 @@ from src.minecraft.client import (
     roster_from_status,
 )
 from src.minecraft.ping import PingError, ServerStatus
+from src.minecraft.rcon import RconProtocolError
 
 ALEX = "8667ba71-b85a-4004-af54-457a9734eed7"
 STEVE = "5627dd98-e6be-3c21-b8a8-e92344183641"
@@ -494,3 +497,141 @@ def test_roster_from_status_never_counts_below_named_players():
         status(online=0, sample=(("Alex", ALEX), ("Steve", STEVE)))
     )
     assert roster.online == 2
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "There are 1000001 of a max of 20 players online: ",
+        "There are " + "9" * 5000 + " of a max of 20 players online: ",
+        "There are ² of a max of 20 players online: ",
+        "There are ٣ of a max of 20 players online: ",
+        "There are 999999/999999 out of maximum 20 players online.",
+    ],
+)
+def test_parse_list_rejects_bad_counts(text):
+    # Unrecognised (RCON counts as failed), never an exception or a low count.
+    assert parse_list_response(text) is None
+
+
+def test_parse_list_huge_max_is_unknown():
+    roster = parse_list_response("There are 1 of a max of 2147483647 players online: A")
+    assert (roster.online, roster.max_players) == (1, None)
+
+
+# ----------------------------------------------------------------------
+# RCON status and the authentication backoff
+# ----------------------------------------------------------------------
+
+AUTH_ERROR = RconAuthError(
+    "RCON authentication failed at 127.0.0.1:25575: the server rejected the "
+    "password (check rcon.password / enable-rcon in server.properties)"
+)
+
+
+def attempts_until_next_rcon_try(client, rcon, clock):
+    """Advance the clock 1 s per poll until the client tries RCON again."""
+    start, tried = clock.now, len(rcon.commands)
+    while len(rcon.commands) == tried:
+        clock.now += 1
+        client.get_roster()
+    return clock.now - start
+
+
+def test_rcon_status_values():
+    assert make_client(None).rcon_status == "disabled"
+    rcon = FakeRcon({"list uuids": UUID_LIST})
+    client = make_client(rcon)
+    assert client.rcon_status == "unknown"
+    client.get_roster()
+    assert client.rcon_status == "ok"
+    for error in (RconUnavailable("refused"), RconProtocolError("not RCON")):
+        rcon.error = error
+        client.get_roster()
+        assert client.rcon_status == "unreachable"
+    rcon.error = None
+    client.get_roster()
+    rcon.replies["bad"] = RconError("RCON command is too long")
+    with pytest.raises(RconError):
+        client.run_command("bad")
+    assert client.rcon_status == "ok"  # a local error says nothing about RCON
+    rcon.error = AUTH_ERROR
+    client.get_roster()
+    assert client.rcon_status == "auth_failed"
+
+
+def test_auth_failure_backs_off_with_one_error_log(caplog):
+    clock = Clock()
+    rcon = FakeRcon(error=AUTH_ERROR)
+    client = make_client(
+        rcon, FakePinger(status(online=1, sample=(("Alex", ALEX),))), clock
+    )
+    with caplog.at_level(logging.DEBUG, logger="src.minecraft.client"):
+        roster = client.get_roster()
+        assert (roster.source, roster.online) == ("ping", 1)  # still sampled
+        assert attempts_until_next_rcon_try(client, rcon, clock) == 60
+        assert attempts_until_next_rcon_try(client, rcon, clock) == 120
+    assert client.rcon_status == "auth_failed"
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert "rcon.password / enable-rcon in server.properties" in errors[0]
+    assert "status ping" in errors[0]
+
+
+def test_auth_backoff_doubles_up_to_ten_minutes():
+    # A server that never answers the ping (enable-status=false) keeps the
+    # plain doubling: nothing shortens it.
+    clock, rcon = Clock(), FakeRcon(error=AUTH_ERROR)
+    client = make_client(rcon, FakePinger(PingError("no status")), clock)
+    assert client.get_roster() is None
+    waits = [attempts_until_next_rcon_try(client, rcon, clock) for _ in range(6)]
+    assert waits == [60, 120, 240, 480, 600, 600]
+
+
+def test_rcon_recovers_after_the_backoff(caplog):
+    clock, rcon = Clock(), FakeRcon({"list uuids": UUID_LIST}, error=AUTH_ERROR)
+    client = make_client(rcon, FakePinger(status()), clock)
+    client.get_roster()
+    rcon.error = None
+    clock.now += 60
+    with caplog.at_level(logging.INFO, logger="src.minecraft.client"):
+        assert client.get_roster().source == "rcon"
+    assert client.rcon_status == "ok"
+    assert any("works again" in r.getMessage() for r in caplog.records)
+    rcon.error = AUTH_ERROR  # a new failure after recovery starts at 60 s again
+    client.get_roster()
+    assert attempts_until_next_rcon_try(client, rcon, clock) == 60
+
+
+def test_commands_fail_fast_during_the_backoff_but_stop_is_tried():
+    clock, rcon = Clock(), FakeRcon(error=AUTH_ERROR)
+    client = make_client(rcon, FakePinger(status()), clock)
+    client.get_roster()
+    clock.now += 8
+    with pytest.raises(RconAuthError, match="rcon.password.*next attempt in 52 s"):
+        client.run_command("list")
+    result = client.kick_player("Alex")
+    assert result.success is False and "rcon.password" in result.message
+    assert rcon.commands == ["list uuids"]  # nothing else reached the server
+    assert client.request_stop() is False and rcon.final == ["stop"]
+
+
+def test_server_restart_shortens_the_auth_backoff():
+    clock, rcon = Clock(), FakeRcon({"list uuids": UUID_LIST}, error=AUTH_ERROR)
+    pinger = FakePinger(status())
+    client = make_client(rcon, pinger, clock)
+    client.get_roster()  # failure 1
+    clock.now += 60
+    client.get_roster()  # failure 2: next try in 120 s
+    assert len(rcon.commands) == 2
+    clock.now += 10
+    client.get_roster()  # the ping answers...
+    pinger.result = PingError("restarting")
+    clock.now += 10
+    assert client.get_roster() is None  # ...then stops: the server restarts
+    rcon.error, pinger.result = None, status()
+    clock.now += 39
+    client.get_roster()
+    assert len(rcon.commands) == 2  # still at least 60 s after the failure
+    clock.now += 1
+    assert client.get_roster().source == "rcon" and client.rcon_status == "ok"
