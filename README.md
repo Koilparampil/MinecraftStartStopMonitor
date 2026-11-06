@@ -213,8 +213,11 @@ instead of filling the server log.
     proxy_set_header Host $http_host;   # not $host, which drops the public port
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-Port $server_port;
     ```
+    `$http_host` already carries the public port, so don't add
+    `X-Forwarded-Port $server_port`: it is wrong when nginx listens on a
+    different port than the one players use (Docker port mapping, router
+    forwarding).
     The live stream disables proxy buffering itself, so no `proxy_buffering`
     change is needed. Serving HTTP/2 at the proxy also lifts browsers' limit of
     6 connections per host;
