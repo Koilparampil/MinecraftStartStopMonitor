@@ -8,6 +8,9 @@ Explore the project before making changes. Use `uv` for dependencies and
 commands, always `uv run` for Python. [README.md](README.md) covers user-facing
 setup and the CLI flags. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the
 design contract: snapshot schema, event payloads, module APIs.
+[docs/FOLLOW_UP_PLAN.md](docs/FOLLOW_UP_PLAN.md) lists the open follow-up items
+from QA, with fixes and tests to add. Read it before touching the listener,
+the launch/stop chain or the dashboard's live stream.
 
 ## Commands
 

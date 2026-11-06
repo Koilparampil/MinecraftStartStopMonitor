@@ -280,7 +280,9 @@ Minecraft server on free ports and temp folders, and only stops processes it
 started, so it is safe to run on a machine with a real server.
 `uv run playwright install chromium` once before the first smoke run. See
 [`AGENTS.md`](AGENTS.md) for the architecture and
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design contract.
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design contract. Open
+follow-up work from the QA rounds is planned in
+[`docs/FOLLOW_UP_PLAN.md`](docs/FOLLOW_UP_PLAN.md).
 
 ## License
 
