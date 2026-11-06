@@ -27,7 +27,7 @@ from src.events import EventBus
 from src.minecraft.client import MinecraftClient
 from src.minecraft_control import MinecraftController
 from src.player_manager import PlayerManager
-from src.process_manager import create_process_manager
+from src.process_manager import ProcessStateUnknown, create_process_manager
 from src.settings import SENSITIVE_SETTINGS, settings
 from src.setup_wizard import (
     detect_server_dir,
@@ -265,7 +265,14 @@ class MonitorApp:
             return
         # The supervisor reports STOPPED until its first scan: never bind the
         # game port while an undiscovered server may already hold it.
-        found = self.process_manager.find_process_identity()
+        try:
+            found = self.process_manager.find_process_identity()
+        except ProcessStateUnknown as e:
+            # Can't tell yet (e.g. out of file descriptors). Stay off the port;
+            # the supervisor's first good scan publishes SERVER_STOPPED, which
+            # arms the listener.
+            logger.warning(f"Could not scan for a running server yet ({e}); waiting")
+            return
         if found is None:
             self.auto_start.listen()
         else:
