@@ -252,3 +252,12 @@ class TestFirstRunWithoutTerminal:
         monkeypatch.setattr(main, "interactive_setup", unwritable)
         assert not main.run_first_time_setup(str(tmp_path / "s.yaml"), parse_args([]))
         assert "cannot write the settings file" in capsys.readouterr().out
+
+
+def test_example_web_password_flag_is_refused_before_anything(tmp_path, capsys):
+    from src.main import main
+
+    settings_path = tmp_path / "settings.yaml"
+    assert main(["--settings", str(settings_path), "--web-password", "changeme"]) == 1
+    assert "--web-password is the example password" in capsys.readouterr().out
+    assert not settings_path.exists()

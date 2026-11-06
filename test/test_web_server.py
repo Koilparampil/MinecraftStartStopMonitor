@@ -589,7 +589,8 @@ class TestProxyHelpers:
         _apply_forwarded_headers(environ, _trusted_networks())
         assert environ["REMOTE_ADDR"] == "127.0.0.1"
         assert environ["wsgi.url_scheme"] == "http"
-        assert environ["HTTP_HOST"] == "mc.example.net:8443"
+        assert environ["HTTP_HOST"] == "mc.example.net"  # never rewritten
+        assert environ["mcmonitor.forwarded_port"] == 8443
 
     def test_peer_key_groups_ipv6_by_64(self):
         assert (

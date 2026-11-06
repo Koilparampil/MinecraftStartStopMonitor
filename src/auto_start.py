@@ -66,6 +66,7 @@ BANNED_MESSAGE = "You are banned from this server."
 BANNED_IP_MESSAGE = "Your IP address is banned from this server."
 _BAN_DATE_FORMAT = "%Y-%m-%d %H:%M:%S %z"
 BUSY_MESSAGE = "Too many connections, try again in a moment."
+FINAL_WAIT = 0.5  # seconds a closing triage still waits for requests to arrive
 _REQUEST_LIMIT = 2 * sleeping.FRAME_LIMIT + 8  # a handshake plus the next packet
 
 # accept() errors that concern one client only (keep accepting), and the ones
@@ -277,12 +278,11 @@ class ConnectionSlots:
     def admit(self, conn, key, phase="pending"):
         """A slot for *conn* (evicting if needed), or None."""
         now = self._clock()
-        grace = 0.0 if phase == "login" else self._grace
         victim = None
         with self._lock:
             full = self._full(key)
             if full is not None:
-                victim = self._oldest_evictable(full, now, grace)
+                victim = self._victim(full, now, for_login=phase == "login")
                 if victim is None:
                     return None
                 victim.evicted = True
@@ -301,15 +301,25 @@ class ConnectionSlots:
             return self._entries
         return None
 
-    @staticmethod
-    def _oldest_evictable(entries, now, grace):
-        for entry in entries:
-            if entry.phase != "login" and now - entry.admitted_at >= grace:
-                return entry
+    def _victim(self, entries, now, for_login):
+        """The connection to evict: the oldest finished-or-cheap one (a ping
+        or a refused login) first, then the oldest still waiting for its
+        request or its access check. Only allowed logins (about to wake the
+        server) are never evicted. Connections younger than the grace period
+        are spared, except pings and refused logins when a login needs room."""
+        cheap_grace = 0.0 if for_login else self._grace
+        for phases, grace in (
+            (("status", "refused"), cheap_grace),
+            (("pending", "login"), self._grace),
+        ):
+            for entry in entries:
+                if entry.phase in phases and now - entry.admitted_at >= grace:
+                    return entry
         return None
 
     def promote(self, entry, phase):
-        """Its request arrived (``"status"`` or ``"login"``). False if evicted."""
+        """Its request arrived (``"status"`` or ``"login"``), or the access
+        check decided (``"allowed"`` / ``"refused"``). False if evicted."""
         with self._lock:
             if entry.evicted:
                 return False
@@ -389,11 +399,11 @@ class MinecraftRequests:
         raise ValueError(f"unknown next state {next_state}")
 
     @staticmethod
-    def busy_reply(kind, data, config):
-        """ "Too many connections" for a login, the sleeping status (without
-        the icon) for a ping; None to just close."""
+    def busy_reply(kind, data, config, message=None):
+        """*message* ("Too many connections" by default) for a login, the
+        sleeping status (without the icon) for a ping; None to just close."""
         if kind == "login":
-            text = json.dumps({"text": BUSY_MESSAGE})
+            text = json.dumps({"text": message or BUSY_MESSAGE})
             return frame_packet(0x00, encode_string(text, None))
         if kind == "status":
             protocol, _next_state = _handshake(_frames(data, 1)[0])
@@ -467,15 +477,26 @@ class _Triage:
         self._incoming = []
         self._waiting = {}  # socket -> [ip, key, config, deadline, data]
         self._closed = False
+        self._final_message = None  # set by close(): the reply for logins
         self._selector = selectors.DefaultSelector()
-        self._wake_r, self._wake_w = socket.socketpair()
-        self._wake_r.setblocking(False)
-        self._wake_w.setblocking(False)
-        self._selector.register(self._wake_r, selectors.EVENT_READ)
-        self.thread = threading.Thread(
-            target=self._run, name="minecraft-autostart-triage", daemon=True
-        )
-        self.thread.start()
+        try:
+            self._wake_r, self._wake_w = socket.socketpair()
+            self._wake_r.setblocking(False)
+            self._wake_w.setblocking(False)
+            self._selector.register(self._wake_r, selectors.EVENT_READ)
+            self.thread = threading.Thread(
+                target=self._run, name="minecraft-autostart-triage", daemon=True
+            )
+            self.thread.start()
+        except BaseException:
+            for sock in (
+                getattr(self, "_wake_r", None),
+                getattr(self, "_wake_w", None),
+            ):
+                if sock is not None:
+                    _close_quietly(sock)
+            self._selector.close()
+            raise
 
     def add(self, conn, ip, key, config):
         with self._lock:
@@ -485,9 +506,12 @@ class _Triage:
             self._incoming.append((conn, ip, key, config))
         self._poke()
 
-    def close(self):
+    def close(self, login_message=BUSY_MESSAGE):
+        """Stop. Requests that are complete (or arrive within FINAL_WAIT) are
+        still answered: logins get *login_message* ("starting" after a wake)."""
         with self._lock:
             self._closed = True
+            self._final_message = login_message
         self._poke()
 
     def _poke(self):
@@ -557,10 +581,15 @@ class _Triage:
             self._resolve(conn, kind, *state)
 
     def _resolve(self, conn, kind, ip, key, config, _deadline, data):
-        if kind == "login" and self._cycle.admit_login(conn, ip, key, config, data):
+        final = self._final_message
+        if (
+            final is None
+            and kind == "login"
+            and self._cycle.admit_login(conn, ip, key, config, data)
+        ):
             return
         try:
-            reply = self._cycle.requests.busy_reply(kind, data, config)
+            reply = self._cycle.requests.busy_reply(kind, data, config, final)
             if reply:
                 conn.send(reply)  # small: fits the socket buffer, never blocks
         except (OSError, ValueError):
@@ -582,12 +611,23 @@ class _Triage:
         _close_quietly(conn)
 
     def _shutdown(self):
-        for conn in list(self._waiting):
-            self._drop(conn)
+        """Answer what is still here: requests that are complete or arrive
+        within FINAL_WAIT get their reply; the rest are read before closing,
+        so clients see a clean close rather than a reset."""
         with self._lock:
             leftover, self._incoming = self._incoming, []
         for item in leftover:
-            _close_quietly(item[0])
+            self._register(*item)
+        deadline = time.monotonic() + FINAL_WAIT
+        while self._waiting and time.monotonic() < deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            for key, _events in self._selector.select(remaining):
+                if key.fileobj is not self._wake_r:
+                    self._read(key.fileobj)
+        for conn in list(self._waiting):
+            with contextlib.suppress(OSError):
+                conn.recv(_REQUEST_LIMIT)  # nothing unread: FIN, not RST
+            self._drop(conn)
         self._selector.close()
         _close_quietly(self._wake_r)
         _close_quietly(self._wake_w)
@@ -596,6 +636,31 @@ class _Triage:
 def _close_quietly(sock):
     with contextlib.suppress(OSError):
         sock.close()
+
+
+class _RefusalLog:
+    """Logs refused join attempts without flooding the log: the first one at
+    once, then at most one line per *interval* with the count since."""
+
+    def __init__(self, interval=10.0, clock=time.monotonic):
+        self._interval = interval
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._quiet_until = 0.0
+        self._suppressed = 0
+
+    def note(self, name, ip, reason):
+        with self._lock:
+            now = self._clock()
+            if now < self._quiet_until:
+                self._suppressed += 1
+                return
+            suppressed, self._suppressed = self._suppressed, 0
+            self._quiet_until = now + self._interval
+        more = (
+            f" ({suppressed} more refused since the last report)" if suppressed else ""
+        )
+        logger.info(f"Not starting the server for {name} ({ip}): {reason}{more}")
 
 
 # ----------------------------------------------------------------------
@@ -692,6 +757,7 @@ class _ListenCycle:
         )
         self.requests = manager.requests
         self._triage = None
+        self._config = None
         self.bind_failures = 0
         self.bind_error = None  # why the last bind failed, until one succeeds
         self.thread = threading.Thread(
@@ -742,9 +808,6 @@ class _ListenCycle:
     # --- the cycle thread --------------------------------------------
 
     def _run(self):
-        self._triage = _Triage(
-            self, self._options.triage_capacity, self._options.triage_timeout
-        )
         try:
             while not self._done():
                 sock = self._bind()
@@ -756,7 +819,12 @@ class _ListenCycle:
             logger.exception("Auto-start listener failed")
         finally:
             self._close_socket()
-            self._triage.close()
+            if self._triage is not None:
+                # After a wake (or a start from elsewhere) "starting" is the
+                # truth; when the monitor shuts down, "busy".
+                closing = self._manager.closed and not self._woken.is_set()
+                kick = None if closing else self._last_config_kick()
+                self._triage.close(kick or BUSY_MESSAGE)
             self.released.set()
         # The port is released before the start request: the real server binds
         # the same port seconds later.
@@ -774,12 +842,13 @@ class _ListenCycle:
         while not self.cancelled.is_set():
             host, port = self._manager.listen_address()
             try:
-                sock = create_listener(host, port)
-            except OSError as e:
+                sock = self._open(host, port)
+            except (OSError, RuntimeError) as e:
                 failures += 1
                 self.bind_failures = failures
                 self.bind_error = (
-                    f"Cannot listen on game port {port}: {e.strerror or e}"
+                    f"Cannot listen on game port {port}: "
+                    f"{getattr(e, 'strerror', None) or e}"
                 )
                 delay = self._retry_delay(failures, port, e)
                 if self.cancelled.wait(delay):
@@ -794,6 +863,24 @@ class _ListenCycle:
             )
             return sock
         return None
+
+    def _open(self, host, port):
+        """Bind the game port; the triage is created with it (lazily), so a
+        failure to create either is retried like a busy port."""
+        sock = create_listener(host, port)
+        try:
+            if self._triage is None:
+                self._triage = _Triage(
+                    self, self._options.triage_capacity, self._options.triage_timeout
+                )
+        except BaseException:
+            _close_quietly(sock)
+            raise
+        return sock
+
+    def _last_config_kick(self):
+        config = self._config
+        return config.kick_message if config is not None else None
 
     def _retry_delay(self, failures, port, error):
         attempts = self._options.bind_attempts
@@ -810,7 +897,7 @@ class _ListenCycle:
 
     def _serve(self, sock):
         sock.settimeout(self._options.accept_timeout)
-        config = self._manager.sleeping_config()
+        config = self._config = self._manager.sleeping_config()
         while not self._done():
             try:
                 conn, address = sock.accept()
@@ -899,7 +986,7 @@ class _ListenCycle:
             if kind is None or not self._slots.promote(entry, kind):
                 logger.debug(f"Incomplete sleeping-server request from {ip} dropped")
             else:
-                outcome = self._serve_request(entry.conn, ip, config, request, kind)
+                outcome = self._serve_request(entry, ip, config, request, kind)
         except Exception:
             logger.exception(f"Sleeping-server connection from {ip} failed")
         finally:
@@ -908,21 +995,38 @@ class _ListenCycle:
         if outcome is None:
             return
         logger.debug(f"Sleeping-server connection from {ip}: {outcome}")
+        if (
+            kind == "login"
+            and entry.phase == "login"
+            and outcome.player_name
+            and not outcome.wake
+        ):
+            # Refused before any access check: an invalid player name.
+            self._manager.refusals.note(outcome.player_name, ip, "invalid name")
         if outcome.wake and not self.claim_wake(outcome.player_name, ip):
             logger.debug(
                 f"{outcome.player_name} ({ip}) joined while the server is already starting"
             )
 
-    def _serve_request(self, conn, ip, config, request, kind):
+    def _serve_request(self, entry, ip, config, request, kind):
         # A ping gets little time (a client that never sends the Ping must
-        # not hold its slot); a login gets the full connection timeout.
+        # not hold its slot); a login gets the full connection timeout, and
+        # only an allowed one is protected from eviction meanwhile.
         if kind == "login":
             timeout = self._options.connection_timeout
         else:
             timeout = self._options.status_timeout
-        conn.settimeout(timeout)
-        replay = _ReplaySocket(conn, request)
-        return self._manager.serve_connection(replay, ip, config, timeout=timeout)
+
+        def is_allowed(name, client_ip):
+            allowed, message = self._manager.is_allowed(name, client_ip)
+            self._slots.promote(entry, "allowed" if allowed else "refused")
+            return allowed, message
+
+        entry.conn.settimeout(timeout)
+        replay = _ReplaySocket(entry.conn, request)
+        return self._manager.serve_connection(
+            replay, ip, config, is_allowed=is_allowed, timeout=timeout
+        )
 
     def _close_socket(self):
         sock, self._sock = self._sock, None
@@ -960,6 +1064,7 @@ class AutoStartManager:
         self._access_policy = access_policy or AccessPolicy()
         # Recognises first requests and builds busy replies (tests use lines).
         self.requests = requests or MinecraftRequests()
+        self.refusals = _RefusalLog()
         self._lock = threading.Lock()
         self._cycle: _ListenCycle | None = None
         self._last_cycle: _ListenCycle | None = None
@@ -1142,8 +1247,13 @@ class AutoStartManager:
             return True, None
         if not allowed:
             reason = (message or "access denied").splitlines()[0]
-            logger.info(f"Not starting the server for {name} ({ip}): {reason}")
+            self.refusals.note(name, ip, reason)
         return allowed, message
+
+    @property
+    def closed(self):
+        with self._lock:
+            return self._closed
 
     def _wake_server(self, cycle, name, ip):
         with self._lock:

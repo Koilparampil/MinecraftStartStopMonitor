@@ -28,7 +28,7 @@ from src.minecraft.client import MinecraftClient
 from src.minecraft_control import MinecraftController
 from src.player_manager import PlayerManager
 from src.process_manager import ProcessStateUnknown, create_process_manager
-from src.settings import SENSITIVE_SETTINGS, settings
+from src.settings import EXAMPLE_WEB_PASSWORD, SENSITIVE_SETTINGS, settings
 from src.setup_wizard import (
     SettingsWriteError,
     command_line_config,
@@ -342,6 +342,12 @@ class MonitorApp:
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.webPassword == EXAMPLE_WEB_PASSWORD:
+        print(
+            "error: --web-password is the example password from "
+            "settings.yaml.example; choose your own."
+        )
+        return 1
     signals = ShutdownSignals()
     signals.install()
     print(BANNER, flush=True)

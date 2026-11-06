@@ -1269,11 +1269,20 @@
   var retryDelay = 2000;
   var retryTimer = null;
 
+  var CONNECTION_KINDS = ['live', 'connecting', 'offline', 'paused'];
+
   function setConnection(kind, text) {
+    if (CONNECTION_KINDS.indexOf(kind) === -1) return;
     var node = $('connState');
     var className = 'conn conn--' + kind;
     if (node.className !== className) node.className = className;
-    setText($('connText'), text);
+    setText($('connText'), String(text));
+    live.conn = { kind: kind, text: String(text) };
+    if (live.role === 'leader') post('conn', live.conn);  // followers mirror it
+  }
+
+  function streamOpen() {
+    return !!stream && stream.readyState === EventSource.OPEN;
   }
 
   function connectStream() {
@@ -1343,7 +1352,7 @@
   var HEARTBEAT_MS = 2000;
   var LEADER_TIMEOUT_MS = 5000;
   var channel = openChannel();
-  var live = { role: 'paused', leaderSeenAt: 0, lastPayload: null };
+  var live = { role: 'paused', leaderSeenAt: 0, lastPayload: null, conn: null };
   var pauseTimer = null;
 
   function openChannel() {
@@ -1398,8 +1407,9 @@
   function onChannelMessage(event) {
     var message = event.data || {};
     if (message.from === TAB_ID) return;
-    if (message.type === 'hello' && live.role === 'leader') {
-      post('leader');
+    if (message.type === 'hello' && live.role === 'leader' && streamOpen()) {
+      // A leader whose stream is down stays silent: the newcomer tries itself.
+      post('leader', { conn: live.conn });
       // Bring the newcomer up to date, with this session's token.
       if (live.lastPayload) post('payload', Object.assign({}, live.lastPayload, { csrfToken: csrfToken }));
     } else if (message.type === 'leader' || message.type === 'payload') {
@@ -1407,6 +1417,9 @@
       // Two leaders (a race): the one with the smaller id keeps streaming.
       if (live.role === 'candidate' || (live.role === 'leader' && message.from < TAB_ID)) becomeFollower();
       if (message.type === 'payload' && live.role === 'follower') applyPayload(message.payload);
+      if (message.type === 'leader' && live.role === 'follower') mirrorConnection(message.payload);
+    } else if (message.type === 'conn' && live.role === 'follower') {
+      mirrorConnection({ conn: message.payload });
     } else if (message.type === 'reset' && live.role === 'follower') {
       view.revision = -1;
       view.previousStatus = null;
@@ -1416,8 +1429,15 @@
     }
   }
 
+  function mirrorConnection(payload) {
+    var conn = payload && payload.conn;
+    if (conn && typeof conn.text === 'string') setConnection(conn.kind, conn.text);
+  }
+
   function liveTick() {
-    if (live.role === 'leader') post('leader');
+    // No heartbeat while the leader's own stream is down, so that followers
+    // notice, take over and show the real state themselves.
+    if (live.role === 'leader' && streamOpen()) post('leader', { conn: live.conn });
     if (live.role === 'follower' && !document.hidden && Date.now() - live.leaderSeenAt > LEADER_TIMEOUT_MS) {
       becomeLeader();
     }

@@ -561,11 +561,23 @@ def _apply_forwarded_headers(environ, networks) -> None:
     if host and _HOST_RE.fullmatch(host):
         environ["HTTP_HOST"] = host
     port = _last_value(environ.get("HTTP_X_FORWARDED_PORT"))
-    current = environ.get("HTTP_HOST", "")
-    if port.isdigit() and current and not current.endswith("]") and ":" not in current:
-        default = "443" if environ.get("wsgi.url_scheme") == "https" else "80"
-        if port != default:
-            environ["HTTP_HOST"] = f"{current}:{port}"
+    if port.isdigit() and 0 < int(port) < 65536:
+        # The port the proxy itself listens on: the public port, unless the
+        # proxy sits behind port mapping (Docker -p 443:8443, a router).
+        # _check_origin accepts it in addition to the Host header's port.
+        environ["mcmonitor.forwarded_port"] = int(port)
+
+
+def _acceptable_origins(expected) -> set:
+    """The dashboard's own origin, plus the same scheme and host on the port a
+    trusted proxy reports in X-Forwarded-Port."""
+    if expected is None:
+        return set()
+    origins = {expected}
+    port = request.environ.get("mcmonitor.forwarded_port")
+    if port:
+        origins.add((expected[0], expected[1], port))
+    return origins
 
 
 def _origin_of(url):
@@ -605,6 +617,7 @@ class WebServer:
         self.server_limits = ServerLimits()
         self.sessions = SessionStore(settings.data_path(SESSION_STORE_FILE))
         self._console_errors: dict[str, int | None] = {}  # path -> errno logged
+        self._origin_warned_at = -3600.0
 
         self._lock = threading.RLock()  # snapshot cache + SSE broadcast order
         self.snapshot = self._read_snapshot()
@@ -787,9 +800,14 @@ class WebServer:
             return None
         expected = _origin_of(request.host_url)
         actual = _origin_of(claimed)
-        if expected is not None and actual == expected:
+        if actual is not None and actual in _acceptable_origins(expected):
             return None
-        logger.warning(
+        # Anonymous clients can send these at will: warn at most every 10 s.
+        now = time.monotonic()
+        quiet = now - self._origin_warned_at < 10
+        if not quiet:
+            self._origin_warned_at = now
+        (logger.debug if quiet else logger.warning)(
             "Refused a cross-origin %s %s from %s (origin %r, expected %s)",
             request.method,
             request.path,
@@ -806,7 +824,7 @@ class WebServer:
             message = (
                 "Request blocked: the reverse proxy did not pass on the public "
                 "port. Forward the browser's Host header with its port (nginx: "
-                "proxy_set_header Host $http_host;) or send X-Forwarded-Port."
+                "proxy_set_header Host $http_host;)."
             )
         if request.endpoint == "login":
             return self._render_login(error=message, status=403)
@@ -947,12 +965,15 @@ class WebServer:
             return self._render_login(
                 error="Your login form expired. Please try again.", status=400
             )
-        if request.endpoint == "logout":
-            # Same-origin was already checked; a stale token must never keep
-            # anyone from logging out.
-            return self._handle_logout()
         if not current_user.is_authenticated:
+            # Nothing happens before authentication: an anonymous POST /logout
+            # only forgets the remember cookie it presents itself.
             return self._unauthorized()
+        if request.endpoint == "logout":
+            # A stale token (from a session renewed elsewhere) must not keep
+            # the admin from logging out: end this caller's own session only.
+            # "Everywhere" always needs a valid token.
+            return self._handle_logout(allow_everywhere=False)
         logger.warning("CSRF check failed for %s: %s", request.path, error.description)
         return (
             jsonify(
@@ -1175,8 +1196,8 @@ class WebServer:
             status,
         )
 
-    def _handle_logout(self):
-        everywhere = request.form.get("scope") == "all"
+    def _handle_logout(self, allow_everywhere: bool = True):
+        everywhere = allow_everywhere and request.form.get("scope") == "all"
         logger.info(
             "Web logout%s from %s",
             " of every session" if everywhere else "",

@@ -1665,3 +1665,98 @@ class TestServerCleanup:
         finally:
             for sock in flood:
                 sock.close()
+
+
+# ----------------------------------------------------------------------
+# Fix round 3
+# ----------------------------------------------------------------------
+
+
+class TestLogoutCannotBeForged:
+    @pytest.fixture
+    def victim(self, build, mock_settings):
+        web = build(csrf=True)
+        client = web.app.test_client()
+        assert login(client, csrf=True, remember="on").status_code == 302
+        return web, client
+
+    @pytest.mark.parametrize("headers", [{}, {"Origin": "http://localhost"}])
+    def test_anonymous_logout_everywhere_changes_nothing(self, victim, headers):
+        web, client = victim
+        anonymous = web.app.test_client()
+        response = anonymous.post("/logout", data={"scope": "all"}, headers=headers)
+        assert response.status_code in (302, 401)
+        assert client.get("/info").status_code == 200
+        assert web.sessions.token_count() == 1
+        assert web.sessions.session_count() == 1
+
+    def test_anonymous_logout_without_csrf_protection_changes_nothing(self, build):
+        web = build()  # CSRF checks off: the login_required path
+        client = web.app.test_client()
+        login(client, remember="on")
+        web.app.test_client().post("/logout", data={"scope": "all"})
+        assert client.get("/info").status_code == 200
+        assert web.sessions.token_count() == 1
+
+    def test_stale_token_logout_ends_only_its_own_session(self, build):
+        web = build(csrf=True)
+        mine, theirs = web.app.test_client(), web.app.test_client()
+        login(mine, csrf=True)
+        login(theirs, csrf=True, remember="on")
+        response = mine.post("/logout", data={"scope": "all", "csrf_token": "stale"})
+        assert response.status_code == 302
+        assert mine.get("/info").status_code == 401
+        assert theirs.get("/info").status_code == 200
+        assert web.sessions.token_count() == 1
+
+    def test_logout_everywhere_needs_a_valid_token(self, build):
+        web = build(csrf=True)
+        mine, theirs = web.app.test_client(), web.app.test_client()
+        login(mine, csrf=True)
+        login(theirs, csrf=True)
+        token = csrf_from(mine.get("/").get_data(as_text=True))
+        mine.post("/logout", data={"scope": "all", "csrf_token": token})
+        assert theirs.get("/info").status_code == 401
+
+    def test_cross_origin_warnings_are_throttled(self, auth_client, caplog):
+        with caplog.at_level(logging.WARNING, logger="src.web_server"):
+            for _ in range(5):
+                auth_client.post(
+                    "/action",
+                    data={"action": "getStatus"},
+                    headers={"Origin": "http://evil.example"},
+                )
+        assert sum("cross-origin" in r.getMessage() for r in caplog.records) == 1
+
+
+class TestPortMappedProxy:
+    def test_proxy_listening_on_another_port_than_the_public_one(
+        self, build, mock_settings
+    ):
+        """nginx inside Docker (-p 443:8443): $server_port is 8443 while the
+        browser uses the default port."""
+        mock_settings.trustedProxies = ["127.0.0.1"]
+        client = build().app.test_client()
+        base = {
+            "Host": "mc.example.com",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Port": "8443",
+        }
+        logged_in = client.post(
+            "/login",
+            data={"username": USERNAME, "password": PASSWORD},
+            headers={**base, "Origin": "https://mc.example.com"},
+        )
+        assert logged_in.status_code == 302
+        for origin, status in [
+            ("https://mc.example.com", 200),
+            ("https://mc.example.com:8443", 200),
+            ("https://mc.example.com:9999", 403),
+            ("http://mc.example.com", 403),
+        ]:
+            response = client.post(
+                "/action",
+                data={"action": "getStatus"},
+                headers={**base, "Origin": origin},
+            )
+            assert response.status_code == status, origin

@@ -9,6 +9,7 @@ and a fake controller.
 import contextlib
 import errno
 import json
+import logging
 import socket
 import threading
 import time
@@ -71,9 +72,16 @@ def fake_handler(conn, ip, config, is_allowed, timeout=5.0):
         with contextlib.suppress(OSError):
             conn.recv(64)
         return ConnectionOutcome(ConnectionKind.STATUS)
-    allowed, message = is_allowed(name, ip)
-    reply = config.kick_message if allowed else message
+    if " " in name:  # invalid name: refused before any access check
+        allowed, reply = False, "Invalid player name."
+    else:
+        allowed, message = is_allowed(name, ip)
+        reply = config.kick_message if allowed else message
     conn.sendall(f"{'KICK' if allowed else 'DENY'} {reply}\n".encode())
+    conn.settimeout(timeout)  # like the real handler: drain until the client closes
+    with contextlib.suppress(OSError):
+        while conn.recv(64):
+            pass
     return ConnectionOutcome(ConnectionKind.LOGIN, player_name=name, wake=allowed)
 
 
@@ -87,9 +95,9 @@ class LineRequests:
         return "login" if data.startswith(b"LOGIN") else "status"
 
     @staticmethod
-    def busy_reply(kind, data, config):
+    def busy_reply(kind, data, config, message=None):
         if kind == "login":
-            return f"DENY {BUSY_MESSAGE}\n".encode()
+            return f"DENY {message or BUSY_MESSAGE}\n".encode()
         return f"MOTD {config.motd}\n".encode()
 
 
@@ -706,9 +714,9 @@ class TestAdmission:
     def test_when_every_slot_holds_a_login_a_join_is_told_to_retry(self, port):
         gate = threading.Event()
 
-        class DenySlow:
+        class DenySlow:  # "Slow" is let in (protected), so is everyone else
             def check(self, name, ip):
-                return name != "Slow", "go away"
+                return True, None
 
         def handler(conn, ip, config, is_allowed, timeout=5.0):
             outcome = fake_handler(conn, ip, config, is_allowed, timeout)
@@ -728,11 +736,11 @@ class TestAdmission:
         try:
             manager.listen()
             wait_until(lambda: manager.is_listening)
-            assert talk(port, "LOGIN Slow") == "DENY go away"
+            assert talk(port, "LOGIN Slow").startswith("KICK ")
             wait_until(lambda: manager.active_connections == 1)
             assert talk(port, "LOGIN Steve") == f"DENY {BUSY_MESSAGE}"
             assert talk(port, "STATUS").startswith("MOTD ")  # pings still answered
-            assert not controller.started.is_set()
+            assert not controller.started.is_set()  # Slow's wake is still pending
         finally:
             gate.set()
             manager.close()
@@ -826,7 +834,7 @@ class TestAdmission:
 
         now = [0.0]
         slots = ConnectionSlots(total=3, per_client=2, grace=1.0, clock=lambda: now[0])
-        conns = [Conn() for _ in range(5)]
+        conns = [Conn() for _ in range(6)]
         a1, a2 = slots.admit(conns[0], "a"), slots.admit(conns[1], "a")
         assert a1 and a2
         assert slots.admit(conns[2], "a") is None  # per-client cap; too young to evict
@@ -834,17 +842,20 @@ class TestAdmission:
         a3 = slots.admit(conns[2], "a")  # evicts the oldest pending one of "a"
         assert a3 and a1.evicted and conns[0].shut_down
         assert not slots.promote(a1, "login")
-        assert slots.promote(a2, "login") and slots.promote(a3, "login")
+        assert slots.promote(a2, "allowed") and slots.promote(a3, "allowed")
         b1 = slots.admit(conns[3], "b")
-        assert slots.promote(b1, "status")
-        assert slots.admit(conns[4], "c") is None  # the ping is too young
+        assert slots.promote(b1, "refused")
+        assert slots.admit(conns[4], "c") is None  # the refused login is too young
         now[0] = 4.0
-        c1 = slots.admit(conns[4], "c")  # evicts the old ping, never a login
+        c1 = slots.admit(conns[4], "c")  # evicts it; allowed logins never
         assert c1 and b1.evicted and not a2.evicted and not a3.evicted
-        assert slots.admit(conns[0], "d") is None  # pending c1 is too young
-        d1 = slots.admit(conns[0], "d", phase="login")  # a login evicts it anyway
+        assert slots.admit(conns[5], "d") is None  # pending c1 is too young
+        assert slots.admit(conns[5], "d", phase="login") is None  # even for a login
+        assert slots.promote(c1, "status")
+        d1 = slots.admit(conns[5], "d", phase="login")  # a login evicts any ping
         assert d1 and c1.evicted
-        assert slots.admit(conns[1], "e", phase="login") is None  # all logins
+        assert slots.promote(d1, "allowed")
+        assert slots.admit(conns[0], "e", phase="login") is None  # all allowed
         assert slots.in_use == 3
 
     @pytest.mark.parametrize(
@@ -1006,3 +1017,136 @@ class TestMinecraftRequests:
         assert reply["version"]["protocol"] == 47
         assert reply["description"] == {"text": "zzz"} and "favicon" not in reply
         assert MinecraftRequests.busy_reply("legacy", b"\xfe", config) is None
+
+
+# ----------------------------------------------------------------------
+# Refused logins, bursts, triage failures (fix round 3)
+# ----------------------------------------------------------------------
+
+
+class DenyBots:
+    def check(self, name, ip):
+        return not name.startswith("Bot"), "You are not white-listed on this server!"
+
+
+def flood_lane(port, source, line, stop):
+    """Send *line*, never close; reconnect as soon as the listener drops us."""
+    while not stop.is_set():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind((source, 0))
+            sock.settimeout(0.2)
+            sock.connect(("127.0.0.1", port))
+            sock.sendall(line.encode() + b"\n")
+            while not stop.is_set():
+                try:
+                    if sock.recv(256) == b"":
+                        break
+                except TimeoutError:
+                    continue
+        except OSError:
+            pass
+        finally:
+            sock.close()
+
+
+class TestRefusedLogins:
+    def test_refused_logins_cannot_block_a_wake(self, make_manager, port):
+        """The verifier's scenario, scaled down: lanes that send a complete
+        login with an invalid or non-whitelisted name and never close, from
+        the joining player's own address and from others."""
+        options = ListenerOptions(
+            accept_timeout=0.02,
+            connection_timeout=5.0,  # refused logins would drain this long
+            eviction_grace=0.05,
+            max_connections=8,
+            release_timeout=3.0,
+        )
+        manager, controller = make_manager(policy=DenyBots(), options=options)
+        manager.listen()
+        wait_until(lambda: manager.is_listening)
+        stop = threading.Event()
+        lanes = [("127.0.0.1", "LOGIN a b")] * 4  # the shared (tunnel) address
+        lanes += [(f"127.0.4.{n}", f"LOGIN Bot{n}") for n in (1, 2) for _ in range(4)]
+        threads = [
+            threading.Thread(
+                target=flood_lane, args=(port, source, line, stop), daemon=True
+            )
+            for source, line in lanes
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            wait_until(lambda: manager.active_connections == 8)
+            time.sleep(0.2)
+            for _ in range(3):
+                if talk(port, "LOGIN Steve").startswith("KICK "):
+                    break
+            assert controller.started.wait(3)
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join(2)
+
+    def test_refusals_are_logged_without_flooding(self, make_manager, port, caplog):
+        manager, _ = make_manager(policy=DenyBots())
+        with caplog.at_level(logging.INFO, logger="src.auto_start"):
+            for n in range(5):
+                manager.is_allowed(f"Bot{n}", "127.0.0.1")
+        lines = [r for r in caplog.records if "Not starting the server" in r.message]
+        assert len(lines) == 1
+
+
+class TestBurstsAndTriage:
+    def test_a_burst_from_one_address_all_get_a_message(self, make_manager, port):
+        """12 players behind one address join at once (all connected before
+        any request): each gets "starting" or "busy", never EOF or a reset."""
+        options = ListenerOptions(accept_timeout=0.05, release_timeout=3.0)
+        manager, controller = make_manager(options=options)
+        manager.listen()
+        wait_until(lambda: manager.is_listening)
+        socks = [
+            socket.create_connection(("127.0.0.1", port), timeout=3) for _ in range(12)
+        ]
+        try:
+            for n, sock in enumerate(socks):
+                sock.sendall(f"LOGIN Player{n}\n".encode())
+            replies = []
+            for sock in socks:
+                reply = b""
+                try:
+                    while not reply.endswith(b"\n"):
+                        chunk = sock.recv(256)
+                        if not chunk:
+                            break
+                        reply += chunk
+                except OSError as e:
+                    reply = repr(e).encode()
+                replies.append(reply.decode().strip())
+        finally:
+            for sock in socks:
+                sock.close()
+        assert controller.started.wait(3)
+        assert all(r.startswith(("KICK ", "DENY ")) for r in replies), replies
+
+    def test_a_triage_that_cannot_start_is_retried_like_a_busy_port(
+        self, make_manager, port, monkeypatch
+    ):
+        from src import auto_start
+
+        real = auto_start._Triage
+        calls = []
+
+        def flaky(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(auto_start, "_Triage", flaky)
+        manager, controller = make_manager()
+        manager.listen()
+        wait_until(lambda: manager.is_listening)
+        assert len(calls) == 2
+        assert talk(port, "LOGIN Steve").startswith("KICK ")
+        assert controller.started.wait(3)
