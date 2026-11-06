@@ -3,8 +3,8 @@
 ## Development setup
 
 ```bash
-git clone https://github.com/Koilparampil/minecraft-monitor.git
-cd minecraft-monitor
+git clone https://github.com/Koilparampil/MinecraftStartStopMonitor.git
+cd MinecraftStartStopMonitor
 uv sync
 ```
 

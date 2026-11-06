@@ -1,6 +1,6 @@
 # Minecraft Monitor
 
-![CI](https://github.com/Koilparampil/minecraft-monitor/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/Koilparampil/MinecraftStartStopMonitor/actions/workflows/ci.yml/badge.svg)
 
 A Python application that manages a **modded Minecraft Java server** (Forge,
 NeoForge, Fabric, Quilt or vanilla) on Windows and Linux. The server **starts
@@ -65,7 +65,7 @@ same user, so it can start, find and stop the server process.
 1. Get the app:
    - **Binary:** download `minecraft-monitor-windows.exe` or
      `minecraft-monitor-linux` from the latest
-     [GitHub Release](https://github.com/Koilparampil/minecraft-monitor/releases).
+     [GitHub Release](https://github.com/Koilparampil/MinecraftStartStopMonitor/releases).
    - **From source** (Python 3.11+ and [uv](https://docs.astral.sh/uv/)):
      ```bash
      uv sync
