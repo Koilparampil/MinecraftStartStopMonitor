@@ -1,6 +1,7 @@
 """Settings: YAML loading/coercion, server.properties resolution, validation."""
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -298,7 +299,7 @@ class TestValidation:
             ("autoStop", "maybe", "features.autoStop must be true or false"),
             ("processName", "", "minecraft.processName"),
             ("serverHost", " ", "minecraft.host"),
-            ("rconPassword", 1234, "minecraft.rconPassword must be a string"),
+            ("rconPassword", 1234, "minecraft.rconPassword must be text"),
         ],
     )
     def test_bad_values(self, valid, key, value, match):
@@ -320,7 +321,7 @@ class TestValidation:
         with caplog.at_level(logging.WARNING):
             warnings = valid.validate_settings()
         assert any("RCON is not configured" in w for w in warnings)
-        assert "kick/ban/unban and console commands are disabled" in caplog.text
+        assert "kick and console commands are unavailable" in caplog.text
 
     def test_no_rcon_warning_with_password(self, valid):
         assert not any("RCON is not configured" in w for w in valid.validate_settings())
@@ -382,3 +383,113 @@ class TestHelpers:
         assert yaml_name("autoStopDelay") == "autoStop.stopDelay"
         assert yaml_name("listenerBindHost") == "autoStart.bindHost"
         assert yaml_name("notASetting") == "notASetting"
+
+
+# ----------------------------------------------------------------------
+# QA fixes
+# ----------------------------------------------------------------------
+
+
+class TestQaFixes:
+    def test_proxy_settings_load_and_default(self, tmp_path):
+        path = write_yaml(
+            tmp_path / "s.yaml",
+            {
+                "web": {
+                    "trustedProxies": "127.0.0.1, 10.0.0.0/8",
+                    "secureCookies": "yes",
+                }
+            },
+        )
+        s = Settings()
+        s.readSettings(path)
+        assert s.trustedProxies == ["127.0.0.1", "10.0.0.0/8"]
+        assert s.secureCookies is True
+        fresh = Settings()
+        assert (fresh.trustedProxies, fresh.secureCookies) == ([], False)
+        assert fresh.trustedProxies is not Settings().trustedProxies
+
+    @pytest.mark.parametrize(
+        ("key", "value", "message"),
+        [
+            ("trustedProxies", ["10.0.0.0/8", "not-an-ip"], "not-an-ip"),
+            ("trustedProxies", "127.0.0.1", "must be a list"),
+            ("secureCookies", "maybe", "true or false"),
+            ("pollingRate", float("nan"), "finite"),
+            ("autoStopDelay", float("inf"), "finite"),
+            ("webUsername", "", "web.username must not be empty"),
+            ("webPassword", 83, "put it in quotes"),
+            ("webPassword", True, "put it in quotes"),
+            ("webPassword", "changeme", "example value"),
+        ],
+    )
+    def test_rejected_values(self, mock_settings, key, value, message):
+        mock_settings[key] = value
+        with pytest.raises(ValueError, match=message):
+            mock_settings.validate_settings()
+
+    def test_unknown_keys_are_warned_about_with_a_hint(self, tmp_path, caplog):
+        path = write_yaml(
+            tmp_path / "s.yaml",
+            {
+                "web": {"controlserver": False},
+                "autoStop": {"stopdelay": 30},
+                "Web": {},
+                "stopDelay": 30,
+                "get": 1,
+            },
+        )
+        s = Settings()
+        with caplog.at_level(logging.WARNING):
+            s.readSettings(path)
+        assert "'web.controlserver'" in caplog.text
+        assert "did you mean 'controlServer'" in caplog.text
+        assert "did you mean 'stopDelay'" in caplog.text
+        assert "did you mean 'web'" in caplog.text
+        assert "did you mean 'autoStop.stopDelay'" in caplog.text
+        assert s.controlServerThroughWeb is True
+        assert callable(s.get)  # unknown top-level keys never become attributes
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+    def test_session_key_file_is_private_and_yaml_key_wins(self, tmp_path):
+        s = Settings()
+        s.readSettings(write_yaml(tmp_path / "s.yaml", {"web": {"password": "pw"}}))
+        key_file = tmp_path / "session_secret.key"
+        assert key_file.stat().st_mode & 0o777 == 0o600
+        assert s.sessionSecretKey == key_file.read_text()
+        rotated = Settings()
+        rotated.readSettings(
+            write_yaml(
+                tmp_path / "s.yaml", {"security": {"sessionSecretKey": "rotated"}}
+            )
+        )
+        assert rotated.sessionSecretKey == "rotated"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+    def test_existing_key_file_is_tightened(self, tmp_path):
+        key_file = tmp_path / "session_secret.key"
+        key_file.write_text("a" * 64)
+        key_file.chmod(0o644)
+        s = Settings()
+        s.readSettings(write_yaml(tmp_path / "s.yaml", {}))
+        assert s.sessionSecretKey == "a" * 64
+        assert key_file.stat().st_mode & 0o777 == 0o600
+
+    def test_rcon_settings_contradicting_server_properties_warn(
+        self, mock_settings, server_dir, caplog
+    ):
+        props(
+            server_dir, "enable-rcon=true\nrcon.port=31002\nrcon.password=fromprops\n"
+        )
+        mock_settings.rconPort = 32002
+        mock_settings.rconPassword = "fromyaml"
+        with caplog.at_level(logging.WARNING):
+            mock_settings.resolve_server_properties()
+        assert "rcon.port=31002" in caplog.text
+        assert "differs from rcon.password" in caplog.text
+        assert "fromyaml" not in caplog.text and "fromprops" not in caplog.text
+
+    def test_no_rcon_warning_says_offline_bans_work(self, mock_settings):
+        mock_settings.rconPassword = None
+        text = " ".join(mock_settings.validation_warnings())
+        assert "bans can only be changed while the server is stopped" in text

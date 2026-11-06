@@ -297,3 +297,25 @@ class TestTrackingDisabled:
         manager.mark_all_offline()
         assert manager.get_all_players() == []
         assert not env.path.exists()
+
+
+class TestUnreadableFile:
+    def test_unreadable_file_is_never_overwritten(self, env, monkeypatch, caplog):
+        env.path.parent.mkdir(parents=True, exist_ok=True)
+        original = '{"version": 1, "players": {"notch": {"name": "Notch"}}}'
+        env.path.write_text(original, encoding="utf-8")
+        real_open = open
+
+        def denying_open(path, *args, **kwargs):
+            if os.fspath(path) == str(env.path):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch, caplog.at_level("ERROR"):
+            patch.setattr("builtins.open", denying_open)
+            manager = env.manager()
+        assert "NOT saved" in caplog.text
+        manager.update_from_roster(roster(STEVE))
+        manager.mark_all_offline()
+        assert manager.get_total_player_count() == 1
+        assert env.path.read_text(encoding="utf-8") == original

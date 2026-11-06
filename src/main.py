@@ -149,10 +149,35 @@ class ShutdownSignals:
 # ----------------------------------------------------------------------
 
 
-def run_first_time_setup(settings_path):
-    """Interactive wizard when there is no settings file. False = exit 1."""
+WIZARD_FLAGS = ("serverDir", "startCommand", "webPassword")
+
+
+def cli_settings_complete(args):
+    """The command line names the server folder, its launch command and
+    (unless --no-web) a dashboard password: no settings file is needed."""
+    web_ok = getattr(args, "useWebServer", None) is False or bool(
+        getattr(args, "webPassword", None)
+    )
+    return bool(getattr(args, "serverDir", None) and args.startCommand and web_ok)
+
+
+def _stdin_is_a_terminal():
     try:
-        interactive_setup(settings_path, detect_server_dir())
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def run_first_time_setup(settings_path, args):
+    """No settings file: the interactive wizard (pre-filled from the command
+    line), or just the command line when it is complete and there is no
+    terminal to ask on. False = exit 1."""
+    if cli_settings_complete(args) and not _stdin_is_a_terminal():
+        logger.info(f"No settings file at {settings_path}: using the command line")
+        return True
+    given = {key: getattr(args, key, None) for key in WIZARD_FLAGS}
+    try:
+        interactive_setup(settings_path, detect_server_dir(), given=given)
         return True
     except EOFError:
         print()  # end the unanswered prompt's line
@@ -160,6 +185,9 @@ def run_first_time_setup(settings_path):
             print(line)
     except KeyboardInterrupt:
         print("\nSetup cancelled; nothing was saved.")
+    except OSError as e:
+        print(f"error: cannot write the settings file {settings_path}: {e}")
+        print("Choose a writable location with --settings PATH.")
     return False
 
 
@@ -250,7 +278,10 @@ class MonitorApp:
         if use_web:
             from src.web_server import WebServer
 
-            self.web_server = WebServer(self.controller, self.bus)
+            status = self.auto_start.status if self.auto_start is not None else None
+            self.web_server = WebServer(
+                self.controller, self.bus, auto_start_status=status
+            )
             print_web_link(settings.webServerPort, settings.webBindHost)
             self.web_server.run()
             return
@@ -288,7 +319,9 @@ def main(argv=None):
     settings_path = determine_settings_path(args)
     configure_logging(log_file_path(settings_path))
 
-    if not os.path.exists(settings_path) and not run_first_time_setup(settings_path):
+    if not os.path.exists(settings_path) and not run_first_time_setup(
+        settings_path, args
+    ):
         return 1
     if not load_settings(settings_path, args):
         return 1

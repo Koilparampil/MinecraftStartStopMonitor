@@ -23,9 +23,12 @@ Modules read settings through the module-level singleton
 at import time, so tests can monkeypatch attributes on the singleton.
 """
 
+import difflib
 import ipaddress
 import logging
+import math
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -73,6 +76,8 @@ DEFAULTS = {
     "showServerIPAddress": False,
     "webConsole": True,  # log tail + RCON console in the dashboard
     "playerAvatars": True,  # player heads from an external avatar service
+    "trustedProxies": [],  # reverse proxies whose X-Forwarded-For is trusted (IPs/CIDRs)
+    "secureCookies": False,  # session cookies only over HTTPS
     # --- features -----------------------------------------------------
     "enablePlayerTracking": True,
     "autoStart": True,
@@ -114,6 +119,8 @@ YAML_MAPPING = {
         "showServerIP": "showServerIPAddress",
         "console": "webConsole",
         "playerAvatars": "playerAvatars",
+        "trustedProxies": "trustedProxies",
+        "secureCookies": "secureCookies",
     },
     "features": {
         "playerTracking": "enablePlayerTracking",
@@ -137,6 +144,8 @@ YAML_MAPPING = {
 }
 
 SENSITIVE_SETTINGS = {"webPassword", "rconPassword", "sessionSecretKey"}
+EXAMPLE_WEB_PASSWORD = "changeme"  # the placeholder in settings.yaml.example
+SESSION_KEY_FILE = "session_secret.key"
 
 DEFAULT_GAME_PORT = 25565
 DEFAULT_RCON_PORT = 25575
@@ -154,6 +163,7 @@ BOOLEAN_SETTINGS = (
     "autoStop",
     "respectWhitelist",
     "rateLimitEnabled",
+    "secureCookies",
 )
 PORT_SETTINGS = ("serverPort", "rconPort", "webServerPort")
 POSITIVE_NUMBER_SETTINGS = ("pollingRate", "stopTimeout", "autoStopDelay")
@@ -177,6 +187,56 @@ def yaml_name(flat_key):
     return flat_key
 
 
+def _suggestion(name, candidates):
+    by_case = {candidate.lower(): candidate for candidate in candidates}
+    if name.lower() in by_case:
+        return by_case[name.lower()]
+    matches = difflib.get_close_matches(name, candidates, n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+
+def _unknown_key_warning(path, candidates):
+    hint = _suggestion(path.rpartition(".")[2], candidates)
+    text = f"Unknown setting '{path}' in the settings file was ignored"
+    return f"{text}; did you mean '{hint}'?" if hint else f"{text}."
+
+
+def unknown_setting_warnings(data):
+    """Warnings for YAML keys that no setting uses (a typo would otherwise
+    silently leave the default in place), with a "did you mean" hint."""
+    nested = {
+        key: f"{section}.{key}"
+        for section, mapping in YAML_MAPPING.items()
+        for key in mapping
+    }
+    warnings = []
+    for key, value in data.items():
+        if key in YAML_MAPPING:
+            if isinstance(value, dict):
+                known = list(YAML_MAPPING[key])
+                warnings += [
+                    _unknown_key_warning(f"{key}.{name}", known)
+                    for name in value
+                    if name not in YAML_MAPPING[key]
+                ]
+            elif value is not None:
+                warnings.append(
+                    f"Settings section '{key}' must be a mapping; it was ignored."
+                )
+        elif key not in DEFAULTS:
+            moved = {name.lower(): path for name, path in nested.items()}.get(
+                str(key).lower()
+            )
+            candidates = [*YAML_MAPPING, *DEFAULTS]
+            warnings.append(
+                f"Unknown setting '{key}' in the settings file was ignored; did you mean "
+                f"'{moved}' (indented under its section)?"
+                if moved
+                else _unknown_key_warning(str(key), candidates)
+            )
+    return warnings
+
+
 def mask_setting(key, value):
     """Printable form of a setting value; sensitive values are masked."""
     if key in SENSITIVE_SETTINGS:
@@ -188,7 +248,9 @@ class Settings:
     """Application settings held as attributes; item access mirrors attribute access."""
 
     def __init__(self):
-        vars(self).update(dict(DEFAULTS))
+        vars(self).update(
+            {k: list(v) if isinstance(v, list) else v for k, v in DEFAULTS.items()}
+        )
 
     def __getitem__(self, key):
         return getattr(self, key)
@@ -203,33 +265,31 @@ class Settings:
     # Loading
     # ------------------------------------------------------------------
 
-    def _ensure_session_secret_key(self, settings_file_path):
-        """Load or generate a session secret key next to the settings file."""
+    def _ensure_session_secret_key(self, settings_file_path, configured=None):
+        """A non-empty ``security.sessionSecretKey`` from the YAML wins (so it
+        can be rotated); otherwise the key in session_secret.key next to the
+        settings file is used, created (owner-only, 0600) on the first run."""
+        if configured is not None and str(configured).strip():
+            self.sessionSecretKey = str(configured)
+            return
         key_file = os.path.join(
-            os.path.dirname(os.path.abspath(settings_file_path)), "session_secret.key"
+            os.path.dirname(os.path.abspath(settings_file_path)), SESSION_KEY_FILE
         )
-        try:
-            if os.path.exists(key_file):
-                with open(key_file, "r") as f:
-                    saved = f.read().strip()
-                if saved and len(saved) == 64:
-                    self.sessionSecretKey = saved
-                    return
-        except OSError:
-            pass
-
+        saved = _read_secret_file(key_file)
+        if saved:
+            self.sessionSecretKey = saved
+            return
         if self.sessionSecretKey:
             return
-
         self.sessionSecretKey = secrets.token_hex(32)
         try:
-            with open(key_file, "w") as f:
-                f.write(self.sessionSecretKey)
-            logger.info(
-                "Auto-generated sessionSecretKey and saved to session_secret.key"
+            _write_private_file(key_file, self.sessionSecretKey)
+            logger.info(f"Generated a session secret key in {key_file}")
+        except OSError as e:
+            logger.warning(
+                f"Could not save {key_file} ({e}): dashboard logins end when the "
+                "monitor restarts"
             )
-        except OSError:
-            pass
 
     @staticmethod
     def _load_nested_settings(data):
@@ -242,22 +302,26 @@ class Settings:
                     if nested_key in section:
                         flat_settings[flat_key] = section[nested_key]
 
-        # Flat top-level keys (scalars) are accepted as-is.
+        # Flat top-level keys are accepted for known attributes only (an
+        # arbitrary key could shadow a method such as ``get``).
         for key, value in data.items():
-            if key not in YAML_MAPPING and isinstance(
-                value, (str, int, float, bool, type(None))
-            ):
+            if key not in YAML_MAPPING and key in DEFAULTS:
                 flat_settings[key] = value
         return flat_settings
 
     def readSettings(self, file_path):
+        configured_secret = None
         try:
             with open(file_path, "r", encoding="utf-8") as file:
                 file_data = yaml.safe_load(file) or {}
             if not isinstance(file_data, dict):
                 raise yaml.YAMLError("the top level must be a mapping")
-            for key, value in self._load_nested_settings(file_data).items():
+            for warning in unknown_setting_warnings(file_data):
+                logger.warning(warning)
+            loaded = self._load_nested_settings(file_data)
+            for key, value in loaded.items():
                 self[key] = value
+            configured_secret = loaded.get("sessionSecretKey")
             self.coerce_types()
             print("Settings loaded successfully.")
         except FileNotFoundError:
@@ -267,7 +331,7 @@ class Settings:
         except Exception:
             logger.exception("Error from readSettings")
 
-        self._ensure_session_secret_key(file_path)
+        self._ensure_session_secret_key(file_path, configured_secret)
         self.resolve_paths(os.path.dirname(os.path.abspath(file_path)))
 
     def resolve_paths(self, base_dir):
@@ -297,6 +361,7 @@ class Settings:
             self[key] = _coerce_number(self.get(key), integer=True)
         for key in POSITIVE_NUMBER_SETTINGS:
             self[key] = _coerce_number(self.get(key), integer=False)
+        self.trustedProxies = _coerce_list(self.get("trustedProxies"))
 
     def data_path(self, *parts):
         """Path inside the monitor's data directory (created on demand)."""
@@ -340,6 +405,7 @@ class Settings:
         props = self.read_server_properties()
         explicit_password = _blank_to_none(self.rconPassword)
         explicit_port = _blank_to_none(self.serverPort)
+        explicit_rcon_port = _blank_to_none(self.rconPort)
 
         self.serverPort = _resolved_port(
             self.serverPort, props.get("server-port"), DEFAULT_GAME_PORT
@@ -354,7 +420,31 @@ class Settings:
             self.listenerBindHost = props.get("server-ip", "") or ""
 
         self._warn_about_properties(props, explicit_password, explicit_port)
+        self._warn_about_rcon(props, explicit_password, explicit_rcon_port)
         return props
+
+    def _warn_about_rcon(self, props, explicit_password, explicit_rcon_port):
+        """Explicit RCON settings that contradict server.properties (values of
+        passwords are never logged)."""
+        file_port = _int_or(props.get("rcon.port"), None)
+        if explicit_rcon_port is not None and file_port not in (None, self.rconPort):
+            logger.warning(
+                f"minecraft.rconPort is {self.rconPort} but server.properties has "
+                f"rcon.port={file_port}: RCON will not connect. Make them match "
+                "(or set minecraft.rconPort to null)."
+            )
+        file_password = props.get("rcon.password") or None
+        if (
+            explicit_password is not None
+            and file_password is not None
+            and _truthy(props.get("enable-rcon"))
+            and explicit_password != file_password
+        ):
+            logger.warning(
+                "minecraft.rconPassword differs from rcon.password in server.properties:"
+                " RCON logins will fail. Set minecraft.rconPassword to null to use the"
+                " server's own password."
+            )
 
     def _warn_about_properties(self, props, explicit_password, explicit_port):
         if not props:
@@ -403,6 +493,8 @@ class Settings:
         errors += self._port_errors()
         errors += self._number_errors()
         errors += self._type_errors()
+        errors += self._web_login_errors()
+        errors += self._proxy_errors()
 
         if errors:
             raise ValueError(
@@ -421,9 +513,6 @@ class Settings:
             errors.append("minecraft.serverDir is required")
         elif not os.path.isdir(self.serverDir):
             errors.append(f"minecraft.serverDir does not exist: {self.serverDir}")
-
-        if self.get("useWebServer", True) and not self.get("webPassword"):
-            errors.append("web.password is required when the web server is enabled")
 
         process_name = self.get("processName")
         if not isinstance(process_name, str) or not process_name.strip():
@@ -469,6 +558,8 @@ class Settings:
             value = self.get(key)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 errors.append(f"{yaml_name(key)} is not a number: {value!r}")
+            elif not math.isfinite(value):
+                errors.append(f"{yaml_name(key)} must be a finite number (got {value})")
             elif value <= 0:
                 errors.append(f"{yaml_name(key)} must be positive (got {value})")
         return errors
@@ -484,13 +575,48 @@ class Settings:
             "sleepingMotd",
             "startingMessage",
             "sleepingVersionName",
-            "webUsername",
         ):
             if not isinstance(self.get(key), str):
                 errors.append(f"{yaml_name(key)} must be a string")
-        password = self.get("rconPassword")
-        if password is not None and not isinstance(password, str):
-            errors.append("minecraft.rconPassword must be a string")
+        for key in ("rconPassword", "webPassword", "webUsername"):
+            value = self.get(key)
+            if value is not None and not isinstance(value, str):
+                errors.append(
+                    f"{yaml_name(key)} must be text, but YAML read it as "
+                    f"{_yaml_kind(value)}: put it in quotes in the settings file "
+                    '(e.g. password: "0123")'
+                )
+        return errors
+
+    def _web_login_errors(self):
+        if not self.get("useWebServer", True):
+            return []
+        errors = []
+        username, password = self.get("webUsername"), self.get("webPassword")
+        if isinstance(username, str) and not username.strip():
+            errors.append("web.username must not be empty")
+        if password is None or password == "":
+            errors.append("web.password is required when the web server is enabled")
+        elif password == EXAMPLE_WEB_PASSWORD:
+            errors.append(
+                f"web.password is still the example value '{EXAMPLE_WEB_PASSWORD}': "
+                "choose your own password"
+            )
+        return errors
+
+    def _proxy_errors(self):
+        proxies = self.get("trustedProxies")
+        if not isinstance(proxies, list):
+            return ["web.trustedProxies must be a list of IP addresses or networks"]
+        errors = []
+        for entry in proxies:
+            try:
+                ipaddress.ip_network(str(entry).strip(), strict=False)
+            except ValueError:
+                errors.append(
+                    f"web.trustedProxies: {entry!r} is not an IP address or network "
+                    "(e.g. 127.0.0.1 or 10.0.0.0/8)"
+                )
         return errors
 
     def validation_warnings(self):
@@ -500,8 +626,10 @@ class Settings:
             warnings.append(
                 "RCON is not configured (no minecraft.rconPassword and no enable-rcon=true "
                 "in server.properties): the monitor falls back to the status ping. "
-                "Server state and auto-stop still work, but kick/ban/unban and console "
-                "commands are disabled, and an adopted server cannot be stopped gracefully."
+                "Server state and auto-stop still work, but kick and console commands "
+                "are unavailable, bans can only be changed while the server is stopped, "
+                "and a server the monitor did not launch is stopped with a termination "
+                "signal instead of `stop`."
             )
         warnings += self._server_dir_warnings()
         warnings += start_command_warnings(
@@ -652,6 +780,55 @@ def _resolved_port(explicit, from_properties, default):
     if explicit is None:
         return _int_or(from_properties, default)
     return _coerce_number(explicit, integer=True)
+
+
+def _coerce_list(value):
+    """A list from YAML/CLI: None -> [], "a, b" -> ["a", "b"]."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part for part in re.split(r"[\s,]+", value.strip()) if part]
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value]
+    return value
+
+
+def _yaml_kind(value):
+    if isinstance(value, bool):
+        return "true/false"
+    if isinstance(value, (int, float)):
+        return "a number"
+    return f"a {type(value).__name__}"
+
+
+def _read_secret_file(path):
+    """The 64-character key stored in *path* (tightened to 0600), or None."""
+    try:
+        with open(path, encoding="utf-8") as file:
+            saved = file.read().strip()
+    except OSError:
+        return None
+    if len(saved) != 64:
+        return None
+    _make_private(path)
+    return saved
+
+
+def _make_private(path):
+    if os.name == "nt":
+        return
+    try:
+        if os.stat(path).st_mode & 0o077:
+            os.chmod(path, 0o600)
+    except OSError as e:
+        logger.warning(f"Could not restrict the permissions of {path}: {e}")
+
+
+def _write_private_file(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as file:
+        file.write(text)
+    _make_private(path)  # an existing file keeps its mode despite O_CREAT
 
 
 def _coerce_bool(value):

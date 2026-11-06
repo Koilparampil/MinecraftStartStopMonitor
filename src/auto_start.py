@@ -694,8 +694,13 @@ class _ListenCycle:
 
     def _serve_refusal(self, conn, ip, config):
         try:
+            conn.settimeout(self._options.request_timeout)
             self._manager.serve_connection(
-                conn, ip, config, is_allowed=_busy, timeout=self._options.request_timeout
+                conn,
+                ip,
+                config,
+                is_allowed=_busy,
+                timeout=self._options.request_timeout,
             )
         except Exception:
             logger.debug(f"Busy reply to {ip} failed", exc_info=True)
@@ -707,7 +712,9 @@ class _ListenCycle:
         outcome = None
         try:
             request = read_request(
-                entry.conn, self._options.request_timeout, self._manager.request_complete
+                entry.conn,
+                self._options.request_timeout,
+                self._manager.request_complete,
             )
             if request is None or not self._slots.promote(entry):
                 logger.debug(f"Incomplete sleeping-server request from {ip} dropped")

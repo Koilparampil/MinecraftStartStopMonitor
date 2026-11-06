@@ -2,7 +2,10 @@
 identity bookkeeping. No server process is started here (see
 test/integration/test_process_manager.py for real processes)."""
 
+import errno
+import ntpath
 import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -14,11 +17,15 @@ from src.process_manager import (
     OSProcessManager,
     PosixProcessManager,
     WindowsProcessManager,
+    _is_alive,
+    _probe_linux,
     build_launch_command,
     create_process_manager,
     match_rank,
     normalized_dir,
+    ProcessStateUnknown,
     popen_platform_kwargs,
+    process_start_key,
     scan_for_server,
 )
 
@@ -215,7 +222,25 @@ def fake_proc(pid, name, cmdline, cwd, create_time=100.0, status="running"):
         "create_time": create_time,
         "status": status,
     }
-    return SimpleNamespace(pid=pid, info=info, cwd=read_cwd)
+
+    def as_dict(attrs=None, ad_value=None):
+        return {key: info[key] for key in (attrs or info)}
+
+    return SimpleNamespace(pid=pid, info=info, cwd=read_cwd, as_dict=as_dict)
+
+
+def install_fake_processes(monkeypatch, procs):
+    """Make discovery see only ``procs`` (fresh objects, probes, pids)."""
+    table = {proc.pid: proc for proc in procs}
+    monkeypatch.setattr(psutil, "pids", lambda: list(table))
+    monkeypatch.setattr("src.process_manager.psutil.Process", lambda pid: table[pid])
+    monkeypatch.setattr("src.process_manager._may_match_linux", lambda *_args: True)
+
+    def probe(pid):
+        info = table[pid].info
+        return info["create_time"], info["status"] == psutil.STATUS_ZOMBIE
+
+    monkeypatch.setattr("src.process_manager._probe", probe)
 
 
 class TestScan:
@@ -224,7 +249,7 @@ class TestScan:
         server = str(tmp_path)
 
         def run(*procs, target="java"):
-            monkeypatch.setattr(psutil, "process_iter", lambda **_kwargs: iter(procs))
+            install_fake_processes(monkeypatch, procs)
             return scan_for_server(normalized_dir(server), target)
 
         return SimpleNamespace(run=run, server=server, other=str(tmp_path / "other"))
@@ -296,7 +321,7 @@ class TestIdentityBookkeeping:
 
         identity = OSProcessManager().tracked_identity
 
-        assert identity == ProcessIdentity(os.getpid(), psutil.Process().create_time())
+        assert identity == ProcessIdentity(os.getpid(), process_start_key(os.getpid()))
 
     @pytest.mark.parametrize("content", ["", "not-a-pid\n", "12\nnot-a-time\n"])
     def test_malformed_pid_file_is_ignored(self, mock_settings, content):
@@ -344,9 +369,7 @@ class TestTerminateBookkeeping:
         identity = ProcessIdentity(4242, 10.0)
         manager.set_known_identity(identity)
 
-        with patch(
-            "src.process_manager.psutil.Process", side_effect=psutil.NoSuchProcess(4242)
-        ):
+        with patch("src.process_manager._probe", return_value=None):
             assert manager.terminate_process(identity) is True
 
         assert manager.tracked_identity is None
@@ -385,13 +408,10 @@ class TestLauncherOutlivingTheServer:
 
     def scan(self, manager, monkeypatch, tree_has_server):
         manager.set_known_identity(ProcessIdentity(4242, 10.0))
-        answers = iter(tree_has_server)
-        monkeypatch.setattr(
-            "src.process_manager._tree_has_server", lambda _pid, _target: next(answers)
-        )
-        monkeypatch.setattr(manager, "identity_is_running", lambda _identity: True)
+        monkeypatch.setattr(manager, "_root_alive", lambda _identity: True)
+        monkeypatch.setattr(manager, "_remember_descendants", lambda _identity: None)
         monkeypatch.setattr(manager, "find_process_identity", lambda: None)
-        return [manager.observe().tracked_running for _ in tree_has_server]
+        return self.scan_again(manager, monkeypatch, tree_has_server)
 
     def test_two_scans_without_the_server_end_it(self, manager, monkeypatch):
         assert self.scan(manager, monkeypatch, [True, False, False]) == [
@@ -424,6 +444,196 @@ class TestLauncherOutlivingTheServer:
     def scan_again(manager, monkeypatch, tree_has_server):
         answers = iter(tree_has_server)
         monkeypatch.setattr(
-            "src.process_manager._tree_has_server", lambda _pid, _target: next(answers)
+            manager, "_tree_has_server", lambda _tracked, _target: next(answers)
         )
         return [manager.observe().tracked_running for _ in tree_has_server]
+
+
+LINUX_ONLY = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="/proc start times"
+)
+
+
+def emfile(*_args, **_kwargs):
+    raise OSError(errno.EMFILE, "Too many open files")
+
+
+def unknown(*_args, **_kwargs):
+    raise ProcessStateUnknown("cannot inspect processes: EMFILE")
+
+
+class TestUnknownIsNotGone:
+    """EMFILE and other OS errors mean "unknown, keep the last state"."""
+
+    def test_liveness_observation_and_discovery_report_unknown(
+        self, manager, monkeypatch
+    ):
+        identity = ProcessIdentity(4242, 10.0)
+        manager.set_known_identity(identity)
+        monkeypatch.setattr("src.process_manager._probe", unknown)
+
+        with pytest.raises(ProcessStateUnknown):
+            manager.identity_is_running(identity)
+        with pytest.raises(ProcessStateUnknown):
+            manager.observe()
+        assert manager.tracked_identity == identity
+
+    def test_a_stop_never_declares_an_unknown_server_gone(
+        self, manager, mock_settings, monkeypatch
+    ):
+        identity = ProcessIdentity(4242, 10.0)
+        manager.set_known_identity(identity)
+        monkeypatch.setattr("src.process_manager._probe", unknown)
+
+        assert manager.terminate_process(identity) is False
+
+        assert manager.tracked_identity == identity
+        assert os.path.exists(mock_settings.data_path("server.pid"))
+
+    def test_an_unreadable_process_table_is_unknown(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(psutil, "pids", emfile)
+
+        with pytest.raises(ProcessStateUnknown):
+            scan_for_server(normalized_dir(tmp_path), "java")
+
+    def test_an_unreadable_candidate_is_unknown(self, tmp_path, monkeypatch):
+        jvm = fake_proc(11, "java", ["java"], OSError(errno.EMFILE, "Too many"))
+        install_fake_processes(monkeypatch, [jvm])
+
+        with pytest.raises(ProcessStateUnknown):
+            scan_for_server(normalized_dir(tmp_path), "java")
+
+    def test_a_tree_member_that_cannot_be_read_counts_as_alive(self):
+        member = SimpleNamespace(is_running=emfile, status=emfile)
+
+        assert _is_alive(member) is True
+
+    @LINUX_ONLY
+    def test_proc_read_errors_become_unknown(self, monkeypatch):
+        monkeypatch.setattr("src.process_manager.open", emfile, raising=False)
+
+        with pytest.raises(ProcessStateUnknown):
+            _probe_linux(os.getpid())
+
+
+@LINUX_ONLY
+class TestClockStepProofIdentity:
+    def test_start_key_is_boot_relative(self):
+        process = psutil.Process()
+        expected = process.create_time() - psutil.boot_time()
+
+        assert process_start_key(os.getpid()) == pytest.approx(expected, abs=0.02)
+
+    def test_a_clock_step_changes_nothing(self, manager, monkeypatch):
+        identity = ProcessIdentity(os.getpid(), process_start_key(os.getpid()))
+        before = psutil.Process().create_time()
+        boot_time = psutil._pslinux.boot_time
+        # A wall-clock step moves /proc/stat btime and so psutil's create_time.
+        monkeypatch.setattr(psutil._pslinux, "boot_time", lambda: boot_time() + 3600)
+
+        assert psutil.Process().create_time() == pytest.approx(before + 3600)
+        assert process_start_key(os.getpid()) == identity.create_time
+        assert manager.identity_is_running(identity) is True
+
+
+class TestWindowsCommandLine:
+    @pytest.mark.parametrize(
+        "command",
+        [
+            ["C:\\Servers\\R&D\\run.bat", "nogui"],
+            ["run.bat", "-Dmotd=Tom&Jerry", "nogui"],
+            ["run.bat", "say %PATH%"],
+            ["run.cmd", 'say "hi there"'],
+            ["run.bat", "a^b|c"],
+            ["run.bat", "<input"],
+        ],
+    )
+    def test_batch_list_with_cmd_metacharacters_is_refused(self, command):
+        with pytest.raises(ValueError, match="as one string"):
+            build_launch_command(command, windows=True)
+
+    def test_relative_program_is_resolved_against_the_server_dir(self):
+        server = r"C:\Servers\mc"
+
+        assert build_launch_command(
+            ["jre/bin/java.exe", "-jar", "server.jar"], windows=True, server_dir=server
+        ) == [r"C:\Servers\mc\jre\bin\java.exe", "-jar", "server.jar"]
+        assert (
+            build_launch_command(
+                r"jre\bin\java.exe -jar server.jar nogui",
+                windows=True,
+                server_dir=server,
+            )
+            == r"C:\Servers\mc\jre\bin\java.exe -jar server.jar nogui"
+        )
+        assert (
+            build_launch_command(
+                r'"my jre\java.exe" -jar s.jar', windows=True, server_dir=server
+            )
+            == r'"C:\Servers\mc\my jre\java.exe" -jar s.jar'
+        )
+
+    def test_programs_on_the_path_and_absolute_ones_are_kept(self):
+        server = r"C:\mc"
+
+        assert (
+            build_launch_command("java -jar s.jar", windows=True, server_dir=server)
+            == "java -jar s.jar"
+        )
+        absolute = [r"C:\Java\bin\java.exe", "-jar", "s.jar"]
+        assert build_launch_command(absolute, windows=True, server_dir=server) == (
+            absolute
+        )
+
+    def test_a_bare_program_found_in_the_server_dir_is_resolved(self, tmp_path):
+        (tmp_path / "java.exe").write_text("", encoding="utf-8")
+
+        args = build_launch_command(
+            ["java.exe", "-jar", "s.jar"], windows=True, server_dir=str(tmp_path)
+        )
+
+        assert args[0] == ntpath.normpath(ntpath.join(str(tmp_path), "java.exe"))
+
+    def test_posix_keeps_relative_programs(self):
+        assert build_launch_command(
+            ["jre/bin/java", "-jar"], windows=False, server_dir="/srv/mc"
+        ) == ["jre/bin/java", "-jar"]
+
+
+class TestLaunchHints:
+    @pytest.fixture
+    def posix(self, mock_settings):
+        mock_settings.startCommand = "./run.sh nogui"
+        return PosixProcessManager()
+
+    def test_an_inaccessible_server_folder_is_named(self, posix, monkeypatch, caplog):
+        monkeypatch.setattr("src.process_manager.os.access", lambda *_args: False)
+
+        assert posix.launch_process() is None
+
+        assert "not accessible to the monitor's user" in caplog.text
+        assert "chmod" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "folder,hint",
+        [
+            (True, "the server folder is not accessible to the monitor's user"),
+            (False, "is the start script executable? try chmod +x"),
+        ],
+    )
+    def test_permission_errors_point_at_the_right_culprit(
+        self, posix, mock_settings, monkeypatch, caplog, folder, hint
+    ):
+        culprit = mock_settings.serverDir if folder else "./run.sh"
+
+        def deny(*_args, **_kwargs):
+            raise PermissionError(errno.EACCES, "Permission denied", culprit)
+
+        monkeypatch.setattr("src.process_manager.subprocess.Popen", deny)
+
+        assert posix.launch_process() is None
+
+        assert hint in caplog.text
+        log = open(mock_settings.data_path("server-console.log"), encoding="utf-8")
+        with log:
+            assert hint in log.read()

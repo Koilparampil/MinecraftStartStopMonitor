@@ -33,6 +33,7 @@
         {%- elif status == 'STARTING' %}{% if snapshot.restartPending %}Restarting — starting again…{% else %}Launching the server…{% endif %}
         {%- elif status == 'STOPPING' %}Saving worlds and shutting down…
         {%- elif status == 'ONLINE' %}Accepting players
+        {%- elif auto_start_blocked %}Stopped — auto-start can't use the game port
         {%- else %}{% if config.autoStart %}Sleeping — a join attempt wakes it{% else %}Stopped{% endif %}{% endif -%}
       </p>
     </div>
@@ -162,8 +163,9 @@
           <span class="chip {{ 'chip--on' if config.autoStart else 'chip--off' }}" id="autoStartChip">{{ 'On' if config.autoStart else 'Off' }}</span>
         </div>
         <p class="auto-text" id="autoStartText">
-          {% if config.autoStart %}While the server is stopped, the monitor answers on the game port as a sleeping server. The first player who tries to join wakes it up.{% else %}Disabled — start the server from this dashboard.{% endif %}
+          {% if config.autoStart %}While the server is stopped, the monitor answers on the game port as a sleeping server. The first player who tries to join wakes it up.{% elif config.controlServer %}Disabled — start the server from this dashboard.{% else %}Disabled — the server is started outside the monitor (dashboard control is off too).{% endif %}
         </p>
+        <div class="notice" id="autoStartWarning" role="status" hidden></div>
       </div>
       <div class="auto-row">
         <div class="auto-head">
@@ -226,6 +228,11 @@
   </span>
   <span>Last update <time id="lastUpdated">—</time></span>
   <span class="footer-version">minecraft-monitor{% if git_hash %} · <code id="gitHash">{{ git_hash }}</code>{% endif %}</span>
+  <form method="post" action="{{ url_for('logout') }}" class="logout-all">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="scope" value="all">
+    <button type="submit" class="btn btn--ghost btn--xs" title="End every session and remembered login, on every device">Log out everywhere</button>
+  </form>
 </footer>
 
 <div class="toasts" id="toasts" aria-live="polite" aria-relevant="additions"></div>

@@ -18,8 +18,10 @@ Workers perform blocking I/O and submit messages. Only the single lifecycle
 thread calls the supervisor; this module never mutates lifecycle state itself.
 
 Threads: ``minecraft-lifecycle`` (the supervisor), ``minecraft-detection``
-(process scans every ``pollingRate``), ``minecraft-poll`` (roster polls over
-RCON / status ping) and ``minecraft-process`` (launch and stop, serialized).
+(process scans every ``pollingRate``; about every second while STOPPED, so a
+server started by hand is adopted, and the sleeping listener releases the
+game port, before it binds), ``minecraft-poll`` (roster polls over RCON /
+status ping) and ``minecraft-process`` (launch and stop, serialized).
 """
 
 import logging
@@ -30,6 +32,7 @@ from src.lifecycle.messages import (
     ActionResult,
     LaunchRequest,
     LaunchResult,
+    LifecycleState,
     PollRequest,
     ProcessObservation,
     RosterSample,
@@ -37,6 +40,7 @@ from src.lifecycle.messages import (
     StopResult,
 )
 from src.lifecycle.supervisor import AutoStopRequest, Supervisor
+from src.process_manager import ProcessStateUnknown
 from src.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -55,6 +59,7 @@ _COMMAND_TIMEOUT = 5
 # or it would act on a server the monitor no longer supervises.
 _PROCESS_WORKER_JOIN_MARGIN = 60
 _MIN_TERMINATE_WAIT = 30.0
+STOPPED_DETECTION_INTERVAL = 1.0  # seconds between scans while STOPPED
 NOT_RUNNING_MESSAGE = "The monitor's lifecycle controller is not running."
 TIMED_OUT_MESSAGE = (
     "The lifecycle controller did not answer in time; see the monitor log."
@@ -214,14 +219,30 @@ class LifecycleRuntime:
     # ------------------------------------------------------------------
 
     def _detection_worker(self):
+        unknown = False
         while not self._closing.is_set():
             try:
                 generation = self.supervisor.generation
                 snapshot = self.process_manager.observe()
-                self._observations.put(ProcessObservation(generation, snapshot))
+            except ProcessStateUnknown as e:
+                # Unknown is not "exited": post nothing, keep the last state.
+                if not unknown:
+                    logger.warning(f"Keeping the last known server state: {e}")
+                unknown = True
             except Exception:
                 logger.exception("Process detection failed")
-            self._closing.wait(_polling_rate())
+            else:
+                if unknown:
+                    logger.info("Process detection works again")
+                unknown = False
+                self._observations.put(ProcessObservation(generation, snapshot))
+            self._closing.wait(self._detection_interval())
+
+    def _detection_interval(self) -> float:
+        rate = _polling_rate()
+        if self.supervisor.state == LifecycleState.STOPPED:
+            return min(rate, STOPPED_DETECTION_INTERVAL)
+        return rate
 
     def _poll_worker(self):
         while not self._closing.is_set():

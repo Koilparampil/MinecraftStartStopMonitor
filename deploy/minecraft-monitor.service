@@ -54,18 +54,23 @@ User=<your-minecraft-user>
 # and built with `uv run poe build-exe` (which outputs to dist/) -- adjust if yours differs.
 WorkingDirectory=/home/<your-minecraft-user>/minecraft-monitor/dist
 ExecStart=/home/<your-minecraft-user>/minecraft-monitor/dist/minecraft-monitor
-# Running from source instead of the executable:
+# Running from source instead of the executable. Use uv's absolute path:
+# systemd's PATH does not include ~/.local/bin, where uv's installer puts it
+# (find yours with `which uv`).
 # WorkingDirectory=/home/<your-minecraft-user>/minecraft-monitor
-# ExecStart=/usr/bin/env uv run --frozen python -m src.main
+# ExecStart=/home/<your-minecraft-user>/.local/bin/uv run --frozen python -m src.main
 # Environment=MINECRAFT_MONITOR_SETTINGS=/home/<your-minecraft-user>/minecraft-monitor/src/settings.yaml
 
 # Only stop the monitor, never the Minecraft server it launched (see above).
 KillMode=process
 # SIGTERM makes the monitor shut down cleanly: it releases the game port and
-# waits for an in-flight server start/stop to finish, which can take a few
-# minutes with a big modpack (minecraft.stopTimeout + margin).
+# waits for an in-flight server start/stop to finish. A stop waits up to
+# minecraft.stopTimeout for the save, then up to stopTimeout (at least 30 s)
+# more after terminating the server, so allow at least
+# 2 x stopTimeout + 90 s: 330 for the default stopTimeout of 120. Raise this
+# together with minecraft.stopTimeout.
 KillSignal=SIGTERM
-TimeoutStopSec=240
+TimeoutStopSec=330
 Restart=on-failure
 RestartSec=5
 Environment=LOG_LEVEL=INFO

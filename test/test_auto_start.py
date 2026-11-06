@@ -72,6 +72,11 @@ def fake_handler(conn, ip, config, is_allowed, timeout=5.0):
     return ConnectionOutcome(ConnectionKind.LOGIN, player_name=name, wake=allowed)
 
 
+def line_complete(data):
+    """The fake protocol's request is one line."""
+    return data.endswith(b"\n")
+
+
 def talk(port, line, host="127.0.0.1"):
     with socket.create_connection((host, port), timeout=3) as sock:
         sock.sendall(line.encode() + b"\n")
@@ -130,6 +135,7 @@ def make_manager(port):
             options=options,
             connection_handler=fake_handler,
             access_policy=policy or AllowAll(),
+            request_complete=line_complete,
         )
         managers.append(manager)
         return manager, controller
@@ -573,7 +579,7 @@ def talk_from(port, line, source):
 SLOTS = ListenerOptions(
     accept_timeout=0.05,
     connection_timeout=2.0,
-    first_byte_timeout=5.0,  # longer than the tests: idle sockets stay held
+    request_timeout=5.0,  # longer than the tests: idle sockets stay held
     release_timeout=3.0,
 )
 
@@ -605,10 +611,10 @@ class TestAdmission:
             for sock in idle:
                 sock.close()
 
-    def test_silent_sockets_are_dropped_after_the_first_byte_timeout(
+    def test_silent_sockets_are_dropped_after_the_request_timeout(
         self, make_manager, port
     ):
-        options = ListenerOptions(accept_timeout=0.05, first_byte_timeout=0.2)
+        options = ListenerOptions(accept_timeout=0.05, request_timeout=0.2)
         manager, controller = make_manager(options=options)
         manager.listen()
         wait_until(lambda: manager.is_listening)
@@ -624,22 +630,130 @@ class TestAdmission:
             for sock in idle:
                 sock.close()
 
+    def test_a_trickled_request_is_dropped_at_the_request_deadline(
+        self, make_manager, port
+    ):
+        options = ListenerOptions(accept_timeout=0.05, request_timeout=0.3)
+        manager, controller = make_manager(options=options)
+        manager.listen()
+        wait_until(lambda: manager.is_listening)
+        with idle_socket(port) as sock:
+            sock.sendall(b"LOGIN Ste")  # never finished
+            started = time.monotonic()
+            assert sock.recv(16) == b""
+            assert time.monotonic() - started < 1.5
+        assert not controller.started.is_set()
+
+    def test_a_join_evicts_the_oldest_idle_socket_when_full(self, make_manager, port):
+        options = ListenerOptions(
+            accept_timeout=0.05,
+            request_timeout=5.0,
+            eviction_grace=0.05,
+            max_connections=4,
+            release_timeout=3.0,
+        )
+        manager, controller = make_manager(options=options)
+        manager.listen()
+        wait_until(lambda: manager.is_listening)
+        idle = [idle_socket(port, f"127.0.0.{10 + i}") for i in range(4)]
+        try:
+            wait_until(lambda: manager.active_connections == 4)
+            time.sleep(0.1)  # older than the eviction grace
+            assert talk_from(port, "LOGIN Steve", "127.0.0.2").startswith("KICK ")
+            assert controller.started.wait(3)
+            assert idle[0].recv(16) == b""  # the oldest idle socket was evicted
+        finally:
+            for sock in idle:
+                sock.close()
+
+    def test_a_join_evicts_an_idle_socket_of_its_own_address(self, make_manager, port):
+        options = ListenerOptions(
+            accept_timeout=0.05,
+            request_timeout=5.0,
+            eviction_grace=0.05,
+            max_connections_per_client=2,
+            release_timeout=3.0,
+        )
+        manager, controller = make_manager(options=options)
+        manager.listen()
+        wait_until(lambda: manager.is_listening)
+        idle = [idle_socket(port) for _ in range(2)]
+        try:
+            wait_until(lambda: manager.active_connections == 2)
+            time.sleep(0.1)
+            assert talk(port, "LOGIN Steve").startswith("KICK ")
+            assert controller.started.wait(3)
+        finally:
+            for sock in idle:
+                sock.close()
+
+    def test_when_every_slot_is_busy_a_join_is_told_to_retry(self, port):
+        gate = threading.Event()
+        calls = []
+
+        def handler(conn, ip, config, is_allowed, timeout=5.0):
+            outcome = fake_handler(conn, ip, config, is_allowed, timeout)
+            calls.append(outcome)
+            if len(calls) == 1:
+                gate.wait(3)  # holds the only slot after its request arrived
+            return outcome
+
+        controller = FakeController(port)
+        options = ListenerOptions(accept_timeout=0.05, max_connections=1)
+        manager = AutoStartManager(
+            controller,
+            EventBus(),
+            options=options,
+            connection_handler=handler,
+            access_policy=AllowAll(),
+            request_complete=line_complete,
+        )
+        try:
+            manager.listen()
+            wait_until(lambda: manager.is_listening)
+            assert talk(port, "STATUS").startswith("MOTD ")
+            reply = talk(port, "LOGIN Steve")
+            assert reply == "DENY Too many connections, try again in a moment."
+            assert not controller.started.is_set()
+        finally:
+            gate.set()
+            manager.close()
+
     def test_connection_slots(self):
-        slots = ConnectionSlots(total=3, per_client=2)
-        assert slots.acquire("a") and slots.acquire("a")
-        assert not slots.acquire("a")  # per-client cap
-        assert slots.acquire("b")
-        assert not slots.acquire("c")  # global cap
-        slots.release("a")
-        assert slots.acquire("c")
+        class Conn:
+            shut_down = closed = False
+
+            def shutdown(self, _how):
+                self.shut_down = True
+
+            def close(self):
+                self.closed = True
+
+        now = [0.0]
+        slots = ConnectionSlots(total=3, per_client=2, grace=1.0, clock=lambda: now[0])
+        conns = [Conn() for _ in range(5)]
+        a1, a2 = slots.admit(conns[0], "a"), slots.admit(conns[1], "a")
+        assert a1 and a2
+        assert slots.admit(conns[2], "a") is None  # per-client cap; too young to evict
+        now[0] = 2.0
+        a3 = slots.admit(conns[2], "a")  # evicts the oldest pending one of "a"
+        assert a3 and a1.evicted and conns[0].shut_down
+        assert not slots.promote(a1)
+        assert slots.promote(a2) and slots.promote(a3)
+        b1 = slots.admit(conns[3], "b")
+        assert slots.promote(b1)
+        assert slots.admit(conns[4], "c") is None  # global cap; all established
+        slots.release(a2)
+        assert slots.admit(conns[4], "c") is not None
         assert slots.in_use == 3
 
     @pytest.mark.parametrize(
         ("ip", "key"),
         [
             ("10.0.0.7", "10.0.0.7"),
-            ("2001:db8:1:2:3:4:5:6", "2001:db8:1:2::/64"),
-            ("2001:db8:1:2::ff", "2001:db8:1:2::/64"),
+            ("2001:db8:1:2:3:4:5:6", "2001:db8:1::/56"),
+            ("2001:db8:1:2::ff", "2001:db8:1::/56"),  # same home, other /64
+            ("2001:db8:1:ff00::1", "2001:db8:1:ff00::/56"),
             ("garbage", "garbage"),
         ],
     )
@@ -706,3 +820,33 @@ class TestAcceptErrors:
             manager, [OSError(errno.EBADF, "bad file descriptor"), OSError(1, "unused")]
         )
         assert len(left) == 1  # returned after the first error: _run re-binds
+
+
+# ----------------------------------------------------------------------
+# status() for the dashboard
+# ----------------------------------------------------------------------
+
+
+class TestStatus:
+    def test_reports_a_busy_port_and_recovers(self, make_manager, port):
+        manager, _ = make_manager()
+        idle = {"armed": False, "listening": False, "error": None}
+        assert manager.status() == idle
+        hog = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            hog.bind(("127.0.0.1", port))
+            hog.listen(1)
+            manager.listen()
+            wait_until(lambda: manager.status()["error"] is not None)
+            status = manager.status()
+            assert status["armed"] and not status["listening"]
+            assert str(port) in status["error"]
+        finally:
+            hog.close()
+        wait_until(
+            lambda: (
+                manager.status() == {"armed": True, "listening": True, "error": None}
+            )
+        )
+        manager.stop_listening()
+        assert manager.status() == idle

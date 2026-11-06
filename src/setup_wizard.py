@@ -52,14 +52,22 @@ _SERVER_MARKERS = (
     "user_jvm_args.txt",
 )
 _SCRIPT_SUFFIXES = (".sh", ".bat", ".cmd", ".command", ".ps1")
-_SH_LOOP = re.compile(
-    r"^\s*(while\s+(true|:|\[\s*1\s*\]|\(\(\s*1\s*\)\))|until\s+false)\b",
+# Endless loops in shell / PowerShell start scripts, anywhere on a line
+# (``cd .. && while true; do``): while true / : / [ 1 ] / [ true ] / ((1)),
+# until false, for (( ; ; )), PowerShell while ($true) and for (;;).
+_LOOP = re.compile(
+    r"(?<![\w$.-])(?:"
+    r"while\s+(?:true|:|\[\[?\s*(?:1|true)\s*\]\]?|\(\(\s*1\s*\)\))(?=[\s;]|$)"
+    r"|until\s+(?:false|\[\[?\s*0\s*\]\]?|\(\(\s*0\s*\)\))(?=[\s;]|$)"
+    r"|for\s*\(\(\s*;\s*;\s*\)\)"
+    r"|for\s*\(\s*;\s*;\s*\)"
+    r"|while\s*\(\s*(?:\$true|1)\s*\)"
+    r")",
     re.IGNORECASE | re.MULTILINE,
 )
+_COMMENT_LINE = re.compile(r"^\s*(?:#|::|rem\b).*$", re.IGNORECASE | re.MULTILINE)
 _BAT_LABEL = re.compile(r"^\s*:(\w+)", re.MULTILINE)
-_BAT_GOTO = re.compile(
-    r"^\s*(?:if\b.*?\s)?goto\s+:?(\w+)", re.IGNORECASE | re.MULTILINE
-)
+_BAT_GOTO = re.compile(r"(?<![\w-])goto\s*:?\s*(\w+)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -202,9 +210,26 @@ def restart_loop_scripts(server_dir):
                 text = f.read(65536)
         except OSError:
             continue
-        if _SH_LOOP.search(text) or _has_backward_goto(text):
+        text = _COMMENT_LINE.sub("", text)
+        if _LOOP.search(text) or _has_backward_goto(text):
             found.append(name)
     return found
+
+
+def clean_path_answer(answer, os_name=None):
+    """A pasted folder path without surrounding quotes (Windows "Copy as
+    path") and, on POSIX, without backslash escapes (drag and drop)."""
+    text = answer.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    if (os_name or os.name) != "nt" and "\\" in text:
+        try:
+            parts = shlex.split(text)
+        except ValueError:
+            return text
+        if len(parts) == 1:
+            return parts[0]
+    return text
 
 
 def generate_password(length=RCON_PASSWORD_LENGTH):
@@ -300,6 +325,45 @@ def accept_eula(server_dir):
     server_files.write_eula(server_dir, True)
 
 
+def reserved_ports(server_dir):
+    """Ports the server uses or may use after the RCON setup: game, RCON
+    (configured, default, fallback) and query."""
+    props = server_files.read_properties(_properties_path(server_dir))
+    game = _port_or(props.get("server-port"), DEFAULT_GAME_PORT)
+    return {
+        game,
+        _port_or(props.get("rcon.port"), DEFAULT_RCON_PORT),
+        _port_or(props.get("query.port"), game),
+        DEFAULT_RCON_PORT,
+        game + 10,  # configure_rcon's choice when rcon.port equals the game port
+    }
+
+
+def port_is_free(port):
+    """True if nothing listens on *port* right now (all interfaces)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name != "nt":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def choose_dashboard_port(server_dir, is_free=None, start=None):
+    """The first port from 25580 up that the server does not use and is free."""
+    is_free = is_free or port_is_free
+    start = start or DEFAULTS["webServerPort"]
+    taken = reserved_ports(server_dir)
+    for port in range(start, min(start + 200, 65536)):
+        if port not in taken and is_free(port):
+            return port
+    return start
+
+
 # ----------------------------------------------------------------------
 # settings.yaml
 # ----------------------------------------------------------------------
@@ -326,6 +390,15 @@ SETTINGS_HEADER = """\
 # Every key is documented in settings.yaml.example. null ports and RCON
 # password are read from the server's server.properties at startup.
 """
+
+
+def check_settings_writable(path):
+    """Raise OSError now if *path* cannot be written (before any question)."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, probe = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=directory)
+    os.close(fd)
+    os.unlink(probe)
 
 
 def write_settings_file(path, config):
@@ -370,7 +443,8 @@ def no_terminal_help(settings_path):
             example = target
     return [
         "error: no terminal available for interactive setup.",
-        f"copy {example} -> {settings_path} and edit it, then restart.",
+        f"copy {example} -> {settings_path} and edit it (minecraft.serverDir, "
+        "minecraft.startCommand and your own web.password), then restart.",
         "(or run minecraft-monitor once in a terminal to answer the setup questions)",
     ]
 
@@ -402,7 +476,25 @@ class _Prompter:
         return answer in ("y", "yes")
 
 
-def _ask_server_dir(io, detected):
+def _usable_server_dir(io, answer):
+    path = os.path.abspath(os.path.expanduser(clean_path_answer(answer)))
+    if not os.path.isdir(path):
+        io.out(f"  {path} is not a folder.")
+        return None
+    if looks_like_server_dir(path) or io.confirm(
+        "  That folder has no server.properties, launch script or server jar. Use it anyway?",
+        default=False,
+    ):
+        return path
+    return None
+
+
+def _ask_server_dir(io, detected, given=None):
+    if given:
+        path = _usable_server_dir(io, given)
+        if path:
+            io.out(f"  Server folder (from --server-dir): {path}")
+            return path
     answer = ""
     if detected:
         io.out(f"  Found a Minecraft server in: {detected}")
@@ -410,20 +502,13 @@ def _ask_server_dir(io, detected):
         if not answer:
             return detected
     while True:
-        if not answer:
-            answer = io.ask(
-                "  Path to your Minecraft server folder (with server.properties, mods/...): "
-            )
-            continue
-        path = os.path.abspath(os.path.expanduser(answer))
-        if not os.path.isdir(path):
-            io.out(f"  {path} is not a folder.")
-        elif looks_like_server_dir(path) or io.confirm(
-            "  That folder has no server.properties, launch script or server jar. Use it anyway?",
-            default=False,
-        ):
-            return path
-        answer = ""
+        if answer:
+            path = _usable_server_dir(io, answer)
+            if path:
+                return path
+        answer = io.ask(
+            "  Path to your Minecraft server folder (with server.properties, mods/...): "
+        )
 
 
 def _explain_detected_command(io, command, memory):
@@ -439,7 +524,7 @@ def _explain_detected_command(io, command, memory):
         )
 
 
-def _ask_start_command(io, server_dir):
+def _ask_start_command(io, server_dir, given=None):
     memory = suggest_max_memory(detect_total_memory())
     loops = restart_loop_scripts(server_dir)
     for name in loops:
@@ -447,14 +532,28 @@ def _ask_start_command(io, server_dir):
             f"  Warning: {name} looks like it restarts the server in a loop. Do not use it as "
             "the launch command: the monitor stops the server and the loop would start it again."
         )
-    detected = detect_start_command(server_dir, memory=memory)
+    if given:
+        io.out(f"  Launch command (from --start-command): {given}")
+        detected = given
+    else:
+        detected = detect_start_command(server_dir, memory=memory)
+        if detected:
+            _explain_detected_command(io, detected, memory)
     if detected:
-        _explain_detected_command(io, detected, memory)
         answer = io.ask("  Press Enter to accept, or type a different command: ")
         command = answer or detected
     else:
         io.out("  No run.sh/run.bat or server jar found in that folder.")
         command = ""
+    command = _valid_command(io, command)
+    if any(name in command for name in loops):
+        io.out(
+            "  Warning: that script restarts the server in a loop; auto-stop will not work."
+        )
+    return command
+
+
+def _valid_command(io, command):
     while True:
         while not command:
             command = io.ask(
@@ -462,14 +561,9 @@ def _ask_start_command(io, server_dir):
             )
         errors = start_command_errors(command)
         if not errors:
-            break
+            return command
         io.out(f"  {errors[0]}")
         command = ""
-    if any(name in command for name in loops):
-        io.out(
-            "  Warning: that script restarts the server in a loop; auto-stop will not work."
-        )
-    return command
 
 
 def _offer_rcon(io, server_dir):
@@ -527,7 +621,10 @@ def _apply_server_edits(io, server_dir, rcon_action, accept):
         io.out("  EULA accepted (eula=true written to eula.txt).")
 
 
-def _ask_web_password(io):
+def _ask_web_password(io, given=None):
+    if given:
+        io.out("  Web dashboard password: taken from --web-password.")
+        return given
     while True:
         password = io.secret("  Web dashboard password (leave empty to generate one): ")
         if not password:
@@ -541,31 +638,39 @@ def _ask_web_password(io):
 
 
 def interactive_setup(
-    settings_path, detected_dir=None, *, ask=None, ask_secret=None, out=None
+    settings_path, detected_dir=None, *, given=None, ask=None, ask_secret=None, out=None
 ):
     """First-run wizard: prompt for required settings and save settings.yaml.
 
-    Nothing is written (server.properties, eula.txt, settings.yaml) until the
-    last question is answered, so a cancelled setup changes nothing. Raises
+    *given* holds values from the command line (``serverDir``,
+    ``startCommand``, ``webPassword``) used instead of asking. Raises
+    OSError before the first question if settings.yaml cannot be written.
+    Nothing is written until the last question is answered; settings.yaml
+    is saved first, then server.properties / eula.txt are changed. Raises
     EOFError when there is no terminal to read answers from (the caller
     prints help and exits). Returns the saved nested config.
     """
+    given = given or {}
+    check_settings_writable(settings_path)
     io = _Prompter(ask, ask_secret, out)
     io.out("")
     io.out("  Welcome to Minecraft Monitor! A few questions and you are done.")
     io.out("")
-    server_dir = _ask_server_dir(io, detected_dir)
-    start_command = _ask_start_command(io, server_dir)
+    server_dir = _ask_server_dir(io, detected_dir, given.get("serverDir"))
+    start_command = _ask_start_command(io, server_dir, given.get("startCommand"))
     rcon_action = _offer_rcon(io, server_dir)
     accept = _ask_eula(io, server_dir)
-    web_password = _ask_web_password(io)
+    web_password = _ask_web_password(io, given.get("webPassword"))
 
-    # Every answer is in: only now touch the server's files, then save.
-    io.out("")
-    _apply_server_edits(io, server_dir, rcon_action, accept)
-    config = default_config(server_dir, start_command, web_password)
+    port = choose_dashboard_port(server_dir)
+    config = default_config(server_dir, start_command, web_password, webServerPort=port)
     write_settings_file(settings_path, config)
     io.out("")
+    try:
+        _apply_server_edits(io, server_dir, rcon_action, accept)
+    except OSError as e:
+        io.out(f"  Warning: could not update the server's files: {e}")
+    io.out(f"  Dashboard port: {port}")
     io.out(f"  Configuration saved to {settings_path}")
     io.out("")
     return config

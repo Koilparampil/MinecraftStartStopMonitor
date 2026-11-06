@@ -33,7 +33,7 @@
     </div>
     {% endif %}
 
-    <form class="login-form" method="post" action="{{ url_for('login') }}">
+    <form class="login-form" method="post" action="{{ url_for('login') }}"{% if locked_out %} data-lockout-seconds="{{ lockout_seconds or 0 }}"{% endif %}>
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="next" value="{{ next_url }}">
 
@@ -64,4 +64,5 @@
 </main>
 
 <div class="ground" aria-hidden="true"></div>
+<script src="{{ static_url('login.js') }}" defer></script>
 {% endblock %}

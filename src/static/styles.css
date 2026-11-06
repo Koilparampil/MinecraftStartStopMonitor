@@ -915,7 +915,7 @@ svg.server-icon {
 .player-name {
   display: block;
   font-weight: 650;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .player-uuid {
@@ -1903,6 +1903,20 @@ details:not([open]) .chevron {
   .players td.cell-status { grid-area: status; text-align: right; }
   .players td.cell-actions { grid-area: actions; }
 
+  /* A ban reason can be long: give it a row of its own instead of letting
+     it squeeze the name. */
+  .players tr.is-banned {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "player"
+      "status"
+      "actions";
+  }
+
+  .players tr.is-banned td.cell-status {
+    text-align: left;
+  }
+
   .players td.cell-actions:empty {
     display: none;
   }
@@ -2026,4 +2040,13 @@ details:not([open]) .chevron {
   text-decoration: underline;
   text-underline-offset: 2px;
   cursor: pointer;
+}
+
+/* Footer "log out everywhere" and the auto-start warning. */
+.logout-all {
+  margin: 0;
+}
+
+.auto-row .notice {
+  margin: 8px 0 0;
 }

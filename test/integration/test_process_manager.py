@@ -12,15 +12,28 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from types import SimpleNamespace
 
 import psutil
 import pytest
 
-from src.lifecycle.messages import ProcessIdentity
-from src.process_manager import OSProcessManager
+from src.events import EventBus
+from src.lifecycle.messages import (
+    LaunchRequest,
+    LaunchResult,
+    LifecycleState,
+    ProcessIdentity,
+    ProcessObservation,
+    RestartCommand,
+    StartCommand,
+    StopResult,
+)
+from src.lifecycle.supervisor import Supervisor
+from src.process_manager import OSProcessManager, process_start_key
 from test.support import wait_until
+from test.support.fakes import FakeBanlistManager, FakePlayerManager
 
 PROCESS_NAME = "fake_mc_server"
 POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX signals, sh wrapper")
@@ -175,7 +188,7 @@ def gone(identity):
     try:
         process = psutil.Process(identity.pid)
         return process.status() == psutil.STATUS_ZOMBIE or not identity.matches(
-            ProcessIdentity(process.pid, process.create_time())
+            ProcessIdentity(process.pid, process_start_key(process.pid))
         )
     except psutil.NoSuchProcess:
         return True
@@ -386,7 +399,9 @@ class TestGracefulStop:
         assert pm.terminate_process(identity) is True
 
         assert env.marker("saved-stdin")
-        assert all(gone(ProcessIdentity(c.pid, c.create_time())) for c in children)
+        assert all(
+            gone(ProcessIdentity(c.pid, process_start_key(c.pid))) for c in children
+        )
 
 
 @POSIX_ONLY
@@ -448,7 +463,7 @@ class TestWrapperTree:
 
     def stop_server_by_itself(self, env, child):
         """The server exits on its own (crash, in-game /stop)."""
-        child_identity = ProcessIdentity(child.pid, child.create_time())
+        child_identity = ProcessIdentity(child.pid, process_start_key(child.pid))
         env.stop_file.write_text("stop", encoding="utf-8")
         wait_until(lambda: gone(child_identity), timeout=15)
 
@@ -503,9 +518,7 @@ class TestProcessIdentity:
             # Observe exit without reaping so the backend sees a real zombie.
             os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
             assert psutil.Process(process.pid).status() == psutil.STATUS_ZOMBIE
-            identity = ProcessIdentity(
-                process.pid, psutil.Process(process.pid).create_time()
-            )
+            identity = ProcessIdentity(process.pid, process_start_key(process.pid))
 
             assert pm.identity_is_running(identity) is False
 
@@ -525,9 +538,7 @@ class TestProcessIdentity:
         process = env.spawn()
         wait_ready(env)
         pm = env.manager()
-        stale = ProcessIdentity(
-            process.pid, psutil.Process(process.pid).create_time() - 50
-        )
+        stale = ProcessIdentity(process.pid, process_start_key(process.pid) - 50)
         pm.set_known_identity(stale)
 
         assert pm.identity_is_running(stale) is False
@@ -556,3 +567,132 @@ class TestWindowsBatchWrapper:
         assert pm.terminate_process(identity) is True
         assert env.marker("saved-stdin")
         assert gone(identity)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="/proc/stat btime")
+class TestClockStep:
+    """A wall-clock step moves /proc/stat btime, so psutil's create_time();
+    the identity must not notice (robustness-1)."""
+
+    @pytest.fixture
+    def step_clock(self, monkeypatch):
+        boot_time = psutil._pslinux.boot_time
+
+        def step(seconds):
+            monkeypatch.setattr(
+                psutil._pslinux, "boot_time", lambda: boot_time() + seconds
+            )
+
+        return step
+
+    def test_launched_server_survives_a_clock_step(self, env, step_clock):
+        pm = env.manager()
+        identity = env.launch(pm)
+        wait_ready(env)
+
+        step_clock(3600)
+        snapshot = pm.observe()
+
+        assert snapshot.tracked_running is True
+        assert snapshot.found == identity
+        assert pm.terminate_process(identity) is True
+        assert env.marker("saved-stdin")  # really asked to stop, not "gone"
+
+    def test_adopted_server_survives_repeated_clock_steps(self, env, step_clock):
+        env.spawn()
+        wait_ready(env)
+        pm = env.manager()
+        found = pm.find_process_identity()
+        pm.set_known_identity(found)
+
+        for seconds in (5, -30, 3600):
+            step_clock(seconds)
+            snapshot = pm.observe()
+            assert snapshot.tracked_running is True
+            assert snapshot.found == found
+
+
+@POSIX_ONLY
+class TestLauncherDiesBeforeItsServer:
+    """run.sh (sh) dies at SIGTERM while its JVM child still saves
+    (lifecycle-1): the tree is one server until all of it is gone."""
+
+    @pytest.fixture
+    def slow_save(self, env, monkeypatch):
+        write_launcher(env)
+        monkeypatch.setenv("FAKE_IGNORE_STOP", "1")  # escalate to SIGTERM
+        monkeypatch.setenv("FAKE_STOP_DELAY", "2.0")  # saving after SIGTERM
+        env.settings.stopTimeout = 0.3
+        return env
+
+    def launch_tree(self, env, pm):
+        wrapper = env.launch(pm)
+        wait_ready(env)
+        root = psutil.Process(wrapper.pid)
+        wait_until(lambda: root.children(recursive=True), message="no server child")
+        [child] = root.children(recursive=True)
+        env.own(child.pid)
+        return wrapper, child
+
+    def test_detection_never_reports_the_saving_child_as_another_server(
+        self, slow_save
+    ):
+        env = slow_save
+        pm = env.manager()
+        wrapper, child = self.launch_tree(env, pm)
+        pm.observe()  # remembers the child, as the detection worker does
+        result = []
+        stopper = threading.Thread(target=lambda: result.append(pm.terminate_process()))
+        stopper.start()
+
+        wait_until(lambda: gone(wrapper), message="the launcher survived SIGTERM")
+        seen = []
+        while stopper.is_alive():
+            snapshot = pm.observe()
+            seen.append(snapshot)
+            assert snapshot.found in (None, wrapper)
+            assert snapshot.tracked_running or gone(ProcessIdentity(child.pid))
+            time.sleep(0.1)
+        stopper.join()
+
+        assert any(s.tracked_running and gone(wrapper) for s in seen)
+        assert result == [True]
+        assert env.marker("saved-sigterm")
+        assert pm.tracked_identity is None
+
+    def test_restart_waits_for_the_child_then_launches_again(self, slow_save):
+        env = slow_save
+        pm = env.manager()
+        bus = EventBus()
+        supervisor = Supervisor(
+            pm, FakePlayerManager(bus), FakeBanlistManager(bus), bus
+        )
+        supervisor.server_stopping_cooldown = 0
+        [launch_request] = supervisor.handle(StartCommand())
+        wrapper, child = self.launch_tree(env, pm)
+        supervisor.handle(LaunchResult(launch_request.generation, wrapper))
+        supervisor.handle(ProcessObservation(supervisor.generation, pm.observe()))
+        assert supervisor.state == LifecycleState.RUNNING
+
+        [stop_request] = supervisor.handle(RestartCommand())
+        result = []
+        stopper = threading.Thread(
+            target=lambda: result.append(pm.terminate_process(stop_request.identity))
+        )
+        stopper.start()
+        while stopper.is_alive():  # the detection worker keeps scanning
+            requests = supervisor.handle(
+                ProcessObservation(supervisor.generation, pm.observe())
+            )
+            assert requests == []
+            assert supervisor.state == LifecycleState.STOPPING
+            assert supervisor.restart_pending is True
+            time.sleep(0.1)
+        stopper.join()
+
+        [relaunch] = supervisor.handle(
+            StopResult(stop_request.generation, stop_request.identity, result[0])
+        )
+        assert isinstance(relaunch, LaunchRequest)
+        assert supervisor.state == LifecycleState.STARTING
+        assert env.marker("saved-sigterm") and gone(ProcessIdentity(child.pid))

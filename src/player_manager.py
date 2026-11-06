@@ -100,6 +100,7 @@ class PlayerManager:
         self._players: dict[str, dict[str, Any]] = {}
         self._last_save: float | None = None
         self._unsaved = False
+        self._persist = True  # False after a read error: never overwrite that file
         if self._tracking():
             self._players = self._load()
 
@@ -116,14 +117,20 @@ class PlayerManager:
         return bool(settings.enablePlayerTracking)
 
     def _load(self):
-        path = self.data_file
-        if not os.path.exists(path):
-            return {}
         try:
+            path = self.data_file
             with open(path, encoding="utf-8") as file:
                 data = json.load(file)
+        except FileNotFoundError:
+            return {}
         except OSError as e:
-            logger.warning(f"Could not read player data from {path}: {e}")
+            # Unreadable is not empty: saving now would destroy the history.
+            self._persist = False
+            logger.error(
+                f"Cannot read player data ({e}). Player history is kept in memory "
+                "only and NOT saved, so the existing file is never overwritten; fix "
+                "its permissions and restart the monitor."
+            )
             return {}
         except ValueError as e:
             self._quarantine(path, f"not valid JSON ({e})")
@@ -154,7 +161,7 @@ class PlayerManager:
     def _save_locked(self, force=False):
         """Persist now when forced; otherwise flush pending timestamp-only
         changes at most once per SAVE_INTERVAL."""
-        if not self._tracking():
+        if not self._tracking() or not self._persist:
             return
         now = self._monotonic()
         if not force:

@@ -22,10 +22,19 @@ reports into lifecycle state.
   pipe (kept for a graceful ``stop``) and stdout/stderr in
   ``data/server-console.log``. The server gets its own session (POSIX) or
   process group (Windows), so stopping the monitor never stops the server.
+- Identity: PID plus a start key that does not move when the wall clock is
+  stepped (Linux: the boot-relative start time from ``/proc/<pid>/stat``;
+  elsewhere the absolute creation time). Scans, liveness checks and stops
+  read it fresh from the same source.
+- Unknown is not gone: when the OS cannot be asked (EMFILE, ENFILE, ...),
+  ``observe()``, ``identity_is_running()`` and ``find_process_identity()``
+  raise ``ProcessStateUnknown`` and the caller keeps its last state.
 - Discovery: a live process whose cwd is ``serverDir`` and whose name, exe or
   command line contains ``settings.processName``. Launch wrappers are normal
-  (Forge's ``run.sh`` is ``sh`` running ``java`` as a child), so a process
-  counts together with its descendants.
+  (Forge's ``run.sh`` is ``sh`` running ``java`` as a child), so the server is
+  the tracked process *and its descendants*: they are remembered, the tracked
+  server runs while any of them lives (a launcher can die before its JVM has
+  saved), and none of them is ever reported as another server.
 - A launcher that outlives its server (Forge's ``run.bat`` ends with
   ``pause``, scripts may ``read``) does not keep the server "running": once
   the tree has had a server process, two scans without one count as an exit
@@ -40,9 +49,11 @@ reports into lifecycle state.
 
 import contextlib
 import logging
+import ntpath
 import os
 import shlex
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -61,8 +72,9 @@ CONSOLE_LOG_NAME = "server-console.log"
 STOP_COMMAND = b"stop\n"
 DEFAULT_STOP_TIMEOUT = 120.0
 
-_SCAN_ATTRS = ["pid", "name", "exe", "cmdline", "create_time", "status"]
 _INFO_ATTRS = ["name", "exe", "cmdline"]
+# cmd.exe would misread these in a list-form .bat/.cmd command line.
+_CMD_METACHARACTERS = frozenset('&|<>^%"\r\n')
 
 # Programs that can mention the server in their command line while never being
 # the server (``tail -f logs/latest.log | grep java`` run in the server
@@ -119,23 +131,26 @@ _NEVER_SERVER = frozenset(
 # ----------------------------------------------------------------------
 
 
-def build_launch_command(command, windows: bool = IS_WINDOWS):
+def build_launch_command(command, windows: bool = IS_WINDOWS, server_dir=None):
     """Popen ``args`` for ``settings.startCommand``.
 
     A list is used as-is. A string is split with ``shlex`` on POSIX and passed
-    through unchanged on Windows (CreateProcess parses it). On Windows a
-    ``.bat``/``.cmd`` program runs through ``cmd.exe /d /s /c``.
+    through unchanged on Windows (CreateProcess parses it). On Windows:
+
+    - a ``.bat``/``.cmd`` program runs through ``cmd.exe /d /s /c``. A list
+      whose elements contain cmd.exe metacharacters (``& | < > ^ % "``) is
+      refused: cmd.exe would misread it, while a string is written in cmd.exe
+      quoting by the admin;
+    - a relative program with a path separator, or one that exists in
+      ``server_dir``, is resolved against ``server_dir``: CreateProcess
+      searches the monitor's directory, not the child's cwd (POSIX resolves
+      it after changing into ``server_dir`` anyway).
 
     Raises:
         ValueError: the command is empty or cannot be parsed.
     """
     if isinstance(command, (list, tuple)):
-        args = [str(part) for part in command]
-        if not args or not args[0].strip():
-            raise ValueError("minecraft.startCommand is empty")
-        if windows and _is_batch_file(args[0]):
-            return _cmd_wrapper(subprocess.list2cmdline(args))
-        return args
+        return _list_command([str(part) for part in command], windows, server_dir)
     if not isinstance(command, str) or not command.strip():
         raise ValueError("minecraft.startCommand is empty")
     command = command.strip()
@@ -144,9 +159,30 @@ def build_launch_command(command, windows: bool = IS_WINDOWS):
         if not args:
             raise ValueError("minecraft.startCommand is empty")
         return args
-    if _is_batch_file(_first_windows_token(command)):
+    program, rest = _split_windows_program(command)
+    if _is_batch_file(program):
         return _cmd_wrapper(command)
-    return command
+    resolved = _resolve_windows_program(program, server_dir)
+    if resolved == program:
+        return command
+    return _quote_windows(resolved) + rest
+
+
+def _list_command(args: list, windows: bool, server_dir):
+    if not args or not args[0].strip():
+        raise ValueError("minecraft.startCommand is empty")
+    if not windows:
+        return args
+    if _is_batch_file(args[0]):
+        unsafe = [arg for arg in args if _CMD_METACHARACTERS.intersection(arg)]
+        if unsafe:
+            raise ValueError(
+                f"minecraft.startCommand: cmd.exe would misread {unsafe[0]!r} "
+                '(it contains one of & | < > ^ % "). Write the command as one '
+                "string, quoted for cmd.exe, instead of a list."
+            )
+        return _cmd_wrapper(subprocess.list2cmdline(args))
+    return [_resolve_windows_program(args[0], server_dir), *args[1:]]
 
 
 def popen_platform_kwargs(windows: bool = IS_WINDOWS) -> dict:
@@ -169,11 +205,28 @@ def _is_batch_file(program: str) -> bool:
     return program.strip().strip('"').lower().endswith((".bat", ".cmd"))
 
 
-def _first_windows_token(command: str) -> str:
+def _split_windows_program(command: str) -> tuple[str, str]:
+    """The program of a Windows command line, and the rest (separator kept)."""
     if command.startswith('"'):
         end = command.find('"', 1)
-        return command[1:end] if end > 0 else command[1:]
-    return command.split(None, 1)[0]
+        if end < 0:
+            return command[1:], ""
+        return command[1:end], command[end + 1 :]
+    program = command.split(None, 1)[0]
+    return program, command[len(program) :]
+
+
+def _resolve_windows_program(program: str, server_dir) -> str:
+    if not server_dir or not program or ntpath.isabs(program):
+        return program
+    has_separator = "/" in program or "\\" in program
+    if has_separator or os.path.isfile(os.path.join(server_dir, program)):
+        return ntpath.normpath(ntpath.join(server_dir, program))
+    return program
+
+
+def _quote_windows(path: str) -> str:
+    return f'"{path}"' if any(c in path for c in " \t") else path
 
 
 def _cmd_wrapper(command_line: str) -> str:
@@ -229,72 +282,130 @@ def _seconds(value, default: float) -> float:
 
 
 # ----------------------------------------------------------------------
-# psutil helpers
+# Process probes: identity, liveness and discovery
 # ----------------------------------------------------------------------
 
 
-def _identity_of(process: psutil.Process) -> ProcessIdentity:
-    """Identity of a process, with create time left unknown if unreadable."""
+class ProcessStateUnknown(Exception):
+    """The OS could not be asked about a process (EMFILE, ENFILE, EIO, ...).
+
+    It means "unknown, keep the last state": never "exited", never "absent".
+    """
+
+
+_LINUX = sys.platform.startswith("linux")
+_CLOCK_TICKS = os.sysconf("SC_CLK_TCK") if _LINUX else 100
+
+
+def _unknown(error: Exception) -> ProcessStateUnknown:
+    return ProcessStateUnknown(f"cannot inspect processes: {error}")
+
+
+def _probe_linux(pid: int):
+    """(start key, zombie) from /proc/<pid>/stat; None: no such process.
+
+    The key is the start time in seconds since boot. Unlike psutil's
+    create_time() it does not move when the wall clock is stepped (NTP,
+    resume, WSL, a manual date change)."""
+    path = f"{getattr(psutil, 'PROCFS_PATH', '/proc')}/{pid}/stat"
     try:
-        return ProcessIdentity(process.pid, process.create_time())
-    except psutil.Error:
-        return ProcessIdentity(process.pid, None)
+        with open(path, "rb") as file:
+            data = file.read()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except PermissionError:
+        return None, False  # it exists; its start time is unknown
+    except OSError as e:
+        raise _unknown(e) from e
+    fields = data[data.rfind(b")") + 2 :].split()
+    try:
+        return int(fields[19]) / _CLOCK_TICKS, fields[0] in (b"Z", b"X", b"x")
+    except (IndexError, ValueError):
+        return None, False
+
+
+def _probe_psutil(pid: int):
+    """(creation time, zombie): absolute, and stable off Linux."""
+    try:
+        process = psutil.Process(pid)
+        return process.create_time(), process.status() == psutil.STATUS_ZOMBIE
+    except psutil.ZombieProcess:
+        return None, True
+    except (psutil.NoSuchProcess, ValueError):
+        return None
+    except psutil.AccessDenied:
+        return None, False
+    except (psutil.Error, OSError) as e:
+        raise _unknown(e) from e
+
+
+def _probe(pid: int):
+    """(start key or None, zombie), or None when the PID does not exist.
+    Raises ProcessStateUnknown when the OS cannot be asked."""
+    return _probe_linux(pid) if _LINUX else _probe_psutil(pid)
+
+
+def process_start_key(pid: int) -> float | None:
+    """The identity key of a live PID (see the module docstring)."""
+    probe = _probe(int(pid))
+    return probe[0] if probe is not None else None
 
 
 def _identity_for_pid(pid: int) -> ProcessIdentity:
     try:
-        return _identity_of(psutil.Process(int(pid)))
-    except (psutil.Error, ValueError):
-        return ProcessIdentity(int(pid), None)
+        key = process_start_key(pid)
+    except ProcessStateUnknown:
+        key = None
+    return ProcessIdentity(int(pid), key)
 
 
-def _identity_is_live(identity: ProcessIdentity) -> bool:
-    """The identity's process exists, is the same process and is no zombie."""
-    try:
-        process = psutil.Process(identity.pid)
-    except psutil.NoSuchProcess:
+def _liveness(identity: ProcessIdentity) -> bool:
+    """The identity's process exists, is the same process and is no zombie.
+    Raises ProcessStateUnknown when the OS cannot be asked."""
+    probe = _probe(identity.pid)
+    if probe is None or probe[1]:
         return False
-    except psutil.AccessDenied:
-        return psutil.pid_exists(identity.pid)
-    except (psutil.Error, ValueError, OSError):
-        return False
-    try:
-        if identity.create_time is not None and not identity.matches(
-            _identity_of(process)
-        ):
-            return False  # the PID now belongs to another process
-        return process.status() != psutil.STATUS_ZOMBIE
-    except psutil.NoSuchProcess:  # includes ZombieProcess
-        return False
-    except psutil.AccessDenied:
-        return True
-    except (psutil.Error, OSError):
-        return False
+    return identity.matches(ProcessIdentity(identity.pid, probe[0]))
 
 
 def _is_alive(process: psutil.Process) -> bool:
+    """For psutil objects (tree members): psutil's own identity check is
+    clock-step-proof. An OS error counts as alive: unknown is never exited."""
     try:
         return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
         return False
-    except psutil.AccessDenied:
+    except (psutil.AccessDenied, OSError):
         return True
-    except (psutil.Error, OSError):
+    except psutil.Error:
         return False
 
 
-def _info_of(process: psutil.Process) -> dict:
+def _info_of(process) -> dict:
+    """name/exe/cmdline ({} once gone). Raises ProcessStateUnknown on OS errors."""
     try:
         return process.as_dict(attrs=_INFO_ATTRS, ad_value=None)
-    except (psutil.Error, OSError):
+    except psutil.Error:
         return {}
+    except OSError as e:
+        raise _unknown(e) from e
 
 
-def _cwd_matches(process: psutil.Process, server_dir: str) -> bool:
+def _any_server(processes, target: str) -> bool:
+    """Whether a process matches processName (assumed when unknown)."""
+    try:
+        return any(match_rank(_info_of(process), target) for process in processes)
+    except ProcessStateUnknown:
+        return True
+
+
+def _cwd_matches(process, server_dir: str) -> bool:
     try:
         cwd = process.cwd()
-    except (psutil.Error, OSError):
+    except psutil.Error:
         return False
+    except OSError as e:
+        raise _unknown(e) from e
     return bool(cwd) and normalized_dir(cwd) == server_dir
 
 
@@ -308,61 +419,87 @@ def _with_descendants(processes) -> set:
     return tree
 
 
-def _tree_has_server(pid: int, target: str) -> bool | None:
-    """Whether the process or a live descendant matches processName (None: unknown)."""
+def _start_order(process) -> float:
     try:
-        root = psutil.Process(pid)
-        tree = [root, *root.children(recursive=True)]
-    except (psutil.Error, OSError):
-        return None
-    return any(match_rank(_info_of(p), target) and _is_alive(p) for p in tree)
-
-
-def _oldest_first(processes) -> list:
-    def created(process):
-        try:
-            return process.create_time()
-        except (psutil.Error, OSError):
-            return float("inf")
-
-    return sorted(processes, key=created)
+        probe = _probe(process.pid)
+    except ProcessStateUnknown:
+        probe = None
+    key = probe[0] if probe is not None else None
+    return key if key is not None else float("inf")
 
 
 def _signal_all(processes, method: str):
     # Oldest first: a wrapper with a restart loop dies before it can respawn.
-    for process in _oldest_first(processes):
+    for process in sorted(processes, key=_start_order):
         with contextlib.suppress(psutil.Error, OSError):
             getattr(process, method)()
 
 
-def _scan_candidate(proc, server_dir: str, target: str, own_pid: int):
-    """(rank, create_time, identity) for a matching process, else None."""
+def _fresh_process(pid: int):
+    """A new psutil.Process (nothing cached from a reused PID), or None."""
     try:
-        info = proc.info
-        if info.get("pid") == own_pid or info.get("status") == psutil.STATUS_ZOMBIE:
-            return None
-        rank = match_rank(info, target)
-        if not rank or not _cwd_matches(proc, server_dir):
-            return None
-        created = info.get("create_time")
-        order = created if created is not None else float("inf")
-        return rank, order, ProcessIdentity(info["pid"], created)
-    except (psutil.Error, OSError, KeyError):
+        return psutil.Process(pid)
+    except (psutil.Error, ValueError):
         return None
+    except OSError as e:
+        raise _unknown(e) from e
+
+
+def _may_match_linux(pid: int, target: str) -> bool:
+    """Cheap prefilter: does processName appear in comm, cmdline or exe?"""
+    base = f"{getattr(psutil, 'PROCFS_PATH', '/proc')}/{pid}"
+    text = b""
+    for name in ("comm", "cmdline"):
+        try:
+            with open(f"{base}/{name}", "rb") as file:
+                text += file.read()
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            return False
+        except OSError as e:
+            raise _unknown(e) from e
+    with contextlib.suppress(OSError):  # other users' exe links are unreadable
+        text += os.fsencode(os.readlink(f"{base}/exe"))
+    return target.encode() in text.lower()
+
+
+def _scan_candidate(pid: int, server_dir: str, target: str):
+    """(rank, start key, identity) for a matching process, else None.
+    Raises ProcessStateUnknown when the OS cannot be asked."""
+    if _LINUX and not _may_match_linux(pid, target):
+        return None
+    process = _fresh_process(pid)
+    if process is None:
+        return None
+    rank = match_rank(_info_of(process), target)
+    if not rank:
+        return None
+    probe = _probe(pid)
+    if probe is None or probe[1] or not _cwd_matches(process, server_dir):
+        return None
+    key = probe[0]
+    return rank, key if key is not None else float("inf"), ProcessIdentity(pid, key)
 
 
 def scan_for_server(server_dir: str, target: str) -> ProcessIdentity | None:
     """Best match in ``server_dir``: program matches before argument matches,
-    then the oldest process (a launcher before the JVM it spawned)."""
+    then the oldest process (a launcher before the JVM it spawned).
+
+    Reads fresh process objects and start keys every time (psutil's
+    process_iter() cache keeps creation times from before a clock step).
+    Raises ProcessStateUnknown when the process table cannot be read.
+    """
     own_pid = os.getpid()
-    best = None
     try:
-        for proc in psutil.process_iter(attrs=_SCAN_ATTRS, ad_value=None):
-            candidate = _scan_candidate(proc, server_dir, target, own_pid)
-            if candidate is not None and (best is None or candidate[:2] < best[:2]):
-                best = candidate
-    except Exception:
-        logger.exception("Process scan failed")
+        pids = psutil.pids()
+    except OSError as e:
+        raise _unknown(e) from e
+    best = None
+    for pid in pids:
+        if pid == own_pid:
+            continue
+        candidate = _scan_candidate(pid, server_dir, target)
+        if candidate is not None and (best is None or candidate[:2] < best[:2]):
+            best = candidate
     return best[2] if best is not None else None
 
 
@@ -397,6 +534,8 @@ class OSProcessManager:
         self._popen: subprocess.Popen | None = None
         self._server_seen = False  # the tracked tree has had a server process
         self._missing_scans = 0  # consecutive scans without one since then
+        self._members: set = set()  # descendants of the tracked process seen
+        self._stopping: ProcessIdentity | None = None  # identity being stopped
         self._load_identity_from_file()
 
     # ------------------------------------------------------------------
@@ -436,19 +575,52 @@ class OSProcessManager:
             return True
 
     def identity_is_running(self, identity: ProcessIdentity | None) -> bool:
+        """True while the process lives, or (for the tracked identity) a
+        remembered descendant does. Raises ProcessStateUnknown."""
         if identity is None:
             return False
+        return self._root_alive(identity) or self._members_alive(identity)
+
+    def _root_alive(self, identity: ProcessIdentity) -> bool:
         popen = self._popen_for(identity)
         self._reap(popen)
-        live = _identity_is_live(identity)
-        if not live:
-            self._reap(popen)  # it may have exited between the two checks
-        return live
+        if _liveness(identity):
+            return True
+        self._reap(popen)  # it may have exited between the two checks
+        return False
+
+    def _members_of(self, identity: ProcessIdentity | None) -> list:
+        with self._lock:
+            if identity is None or not identity.matches(self._identity):
+                return []
+            return list(self._members)
+
+    def _members_alive(self, identity: ProcessIdentity) -> bool:
+        return any(_is_alive(member) for member in self._members_of(identity))
+
+    def _remember(self, processes, identity: ProcessIdentity | None = None):
+        """Record descendants of the tracked process (the root excluded)."""
+        with self._lock:
+            current = self._identity
+            if current is None or (
+                identity is not None and not identity.matches(current)
+            ):
+                return
+            self._members.update(p for p in processes if p.pid != current.pid)
+
+    def started_at(self, identity: ProcessIdentity) -> float | None:
+        """Wall-clock creation time, for the dashboard's startedAt only."""
+        try:
+            return psutil.Process(identity.pid).create_time()
+        except (psutil.Error, OSError, ValueError):
+            return None
 
     def find_process_identity(self) -> ProcessIdentity | None:
         """A live (non-zombie) process whose cwd is settings.serverDir and whose
-        name/cmdline contains settings.processName; prefers the tracked one;
-        never this monitor process."""
+        name/cmdline contains settings.processName; prefers the tracked one
+        and never reports a descendant of it as another server; never this
+        monitor process. Raises ProcessStateUnknown when the OS cannot be
+        asked."""
         server_dir = normalized_dir(settings.serverDir)
         target = str(settings.processName or "").strip().lower()
         if not server_dir or not target:
@@ -456,35 +628,68 @@ class OSProcessManager:
         tracked = self.tracked_identity
         if tracked is not None and self._is_tracked_server(tracked, server_dir, target):
             return tracked
-        return scan_for_server(server_dir, target)
+        found = scan_for_server(server_dir, target)
+        if found is not None and any(
+            member.pid == found.pid and _is_alive(member)
+            for member in self._members_of(tracked)
+        ):
+            return tracked  # part of the tracked server, not a replacement
+        return found
 
     def _is_tracked_server(
         self, tracked: ProcessIdentity, server_dir: str, target: str
     ) -> bool:
         # The tracked process may be a wrapper (sh run.sh, cmd /c run.bat)
         # whose child is the JVM; the tree is the server.
-        if tracked.pid == os.getpid() or not self.identity_is_running(tracked):
+        if tracked.pid == os.getpid() or not self._root_alive(tracked):
             return False
         try:
             process = psutil.Process(tracked.pid)
-            if not _cwd_matches(process, server_dir):
-                return False
             tree = [process, *process.children(recursive=True)]
-        except (psutil.Error, OSError):
+        except psutil.Error:
+            return False
+        except OSError as e:
+            raise _unknown(e) from e
+        if not _cwd_matches(process, server_dir):
             return False
         return any(match_rank(_info_of(member), target) for member in tree)
 
     def observe(self) -> ProcessSnapshot:
-        """I/O-only observation for the lifecycle supervisor (one per scan)."""
+        """I/O-only observation for the lifecycle supervisor (one per scan).
+
+        Raises ProcessStateUnknown when the OS cannot be asked; the runtime
+        then keeps the last state."""
         tracked = self.tracked_identity
-        running = self.identity_is_running(tracked)
-        if running and self._launcher_outlived_server(tracked):
-            running = False
+        running = False
+        if tracked is not None:
+            root_alive = self._root_alive(tracked)
+            if root_alive:
+                self._remember_descendants(tracked)
+            running = root_alive or self._members_alive(tracked)
+            if root_alive and self._launcher_outlived_server(tracked):
+                running = False
         return ProcessSnapshot(
             tracked=tracked,
             tracked_running=running,
             found=self.find_process_identity(),
         )
+
+    def _remember_descendants(self, tracked: ProcessIdentity):
+        try:
+            children = psutil.Process(tracked.pid).children(recursive=True)
+        except (psutil.Error, OSError):
+            return
+        self._remember(children, tracked)
+
+    def _tree_has_server(self, tracked: ProcessIdentity, target: str) -> bool | None:
+        """Whether the tracked process or a live descendant matches
+        processName (None: unknown)."""
+        try:
+            root = psutil.Process(tracked.pid)
+            tree = [root, *root.children(recursive=True), *self._members_of(tracked)]
+            return any(match_rank(_info_of(p), target) and _is_alive(p) for p in tree)
+        except (psutil.Error, OSError, ProcessStateUnknown):
+            return None
 
     def _launcher_outlived_server(self, tracked: ProcessIdentity) -> bool:
         """True once the server has been missing from the tracked tree for
@@ -494,7 +699,7 @@ class OSProcessManager:
         moment to start the JVM). The first such scan closes our stdin pipe,
         so a launcher waiting in ``pause``/``read`` returns by itself.
         """
-        has_server = _tree_has_server(tracked.pid, str(settings.processName or ""))
+        has_server = self._tree_has_server(tracked, str(settings.processName or ""))
         with self._lock:
             if has_server is None or not tracked.matches(self._identity):
                 return False
@@ -523,6 +728,7 @@ class OSProcessManager:
     def _reset_tree_watch_locked(self):
         self._server_seen = False
         self._missing_scans = 0
+        self._members = set()
 
     # ------------------------------------------------------------------
     # Launch
@@ -536,15 +742,14 @@ class OSProcessManager:
         except OSError as e:
             logger.error(f"Cannot create the monitor data directory: {e}")
             return None
+        problem = self._server_dir_problem(server_dir)
+        if problem is not None:
+            logger.error(f"Cannot launch the Minecraft server: {problem}")
+            return None
         try:
-            args = build_launch_command(settings.startCommand, self.windows)
+            args = build_launch_command(settings.startCommand, self.windows, server_dir)
         except ValueError as e:
             logger.error(f"Cannot launch the Minecraft server: {e}")
-            return None
-        if not server_dir or not os.path.isdir(server_dir):
-            logger.error(
-                f"Cannot launch the Minecraft server: no directory {server_dir!r}"
-            )
             return None
 
         popen = self._spawn(args, server_dir, log_path)
@@ -562,6 +767,16 @@ class OSProcessManager:
             f"{describe_command(args)}"
         )
         return identity
+
+    def _server_dir_problem(self, server_dir) -> str | None:
+        if not server_dir or not os.path.isdir(server_dir):
+            return f"no directory {server_dir!r}"
+        if not self.windows and not os.access(server_dir, os.R_OK | os.X_OK):
+            return (
+                f"the server folder {server_dir} is not accessible to the "
+                "monitor's user (it needs read and execute permission)"
+            )
+        return None
 
     def _spawn(self, args, cwd: str, log_path: str) -> subprocess.Popen | None:
         with contextlib.ExitStack() as stack:
@@ -585,9 +800,7 @@ class OSProcessManager:
                 **popen_platform_kwargs(self.windows),
             )
         except (OSError, ValueError, subprocess.SubprocessError) as e:
-            hint = ""
-            if isinstance(e, PermissionError) and not self.windows:
-                hint = " (is the start script executable? try chmod +x)"
+            hint = _launch_failure_hint(e, cwd, self.windows)
             logger.error(f"Failed to launch the Minecraft server: {e}{hint}")
             _write_log_line(log_file, f"launch failed: {e}{hint}")
             return None
@@ -607,6 +820,9 @@ class OSProcessManager:
         process tree; terminate the tree and wait ``max(30, stopTimeout)``;
         kill. ``force=False`` (an unattended auto-stop) never force-kills a
         server that could not be asked to stop (Windows: no graceful signal).
+        The tree is the tracked process plus its remembered descendants, so a
+        launcher that dies first does not end the stop while its JVM saves.
+        False when the process state cannot be read (never "gone").
         """
         with self._lock:
             current = self._identity
@@ -616,35 +832,39 @@ class OSProcessManager:
             return False
 
         popen = self._popen_for(current)
-        root = self._live_process(current, popen)
-        if root is None:
-            self.clear_identity(current)
-            return True
-        if not self._stop_tree(root, popen, force):
+        self._stopping = current
+        try:
+            tree = self._live_tree(current, popen)
+            if tree and not self._stop_tree(tree, current.pid, popen, force):
+                return False
+        except ProcessStateUnknown as e:
+            logger.warning(f"Not stopping the server now: {e}")
             return False
+        finally:
+            self._stopping = None
         self.clear_identity(current)
         return True
 
-    def _live_process(
-        self, identity: ProcessIdentity, popen: subprocess.Popen | None
-    ) -> psutil.Process | None:
-        self._reap(popen)
-        try:
-            process = psutil.Process(identity.pid)
-        except (psutil.Error, ValueError, OSError):
-            return None
-        if not identity.matches(_identity_of(process)):
-            return None  # the PID now belongs to another process: ours is gone
-        return process if _is_alive(process) else None
+    def _live_tree(self, identity: ProcessIdentity, popen) -> set:
+        """The tracked process (if it is still that process), its descendants
+        and remembered descendants that outlived it, alive ones only.
+        Raises ProcessStateUnknown."""
+        tree = {member for member in self._members_of(identity) if _is_alive(member)}
+        if self._root_alive(identity):
+            root = _fresh_process(identity.pid)
+            if root is not None:
+                tree.add(root)
+        tree = _with_descendants(tree)
+        self._remember(tree, identity)
+        return {process for process in tree if _is_alive(process)}
 
-    def _stop_tree(self, root: psutil.Process, popen, force: bool) -> bool:
-        tree = _with_descendants({root})
+    def _stop_tree(self, tree: set, pid: int, popen, force: bool) -> bool:
         timeout = _seconds(settings.stopTimeout, DEFAULT_STOP_TIMEOUT)
         term_wait = max(self.TERMINATE_TIMEOUT, timeout)  # never kill mid-save
-        channel = self._request_graceful_stop(root.pid, popen)
+        channel = self._request_graceful_stop(pid, popen)
         if channel is None:
-            return self._stop_unrequested(tree, popen, root.pid, force)
-        if not self._wait_graceful(tree, popen, channel, timeout, root.pid):
+            return self._stop_unrequested(tree, popen, pid, force)
+        if not self._wait_graceful(tree, popen, channel, timeout, pid):
             return True
         logger.warning(f"The server did not stop within {timeout:g}s; terminating it")
         return self._force_stop(tree, popen, term_wait)
@@ -758,9 +978,11 @@ class OSProcessManager:
     def _wait_for_exit(self, tree: set, timeout: float, popen) -> list:
         """Wait until every process of the tree is gone; returns the survivors.
 
-        Descendants started meanwhile join the tree. Once only launch wrappers
-        are left (no process matching processName), our stdin pipe is closed:
-        Forge's run.bat ends with ``pause``, which waits for input.
+        Descendants started meanwhile join the tree and are remembered, so
+        detection reports the server running until all of them are gone. A
+        process whose state cannot be read counts as alive. Once only launch
+        wrappers are left (no process matching processName), our stdin pipe
+        is closed: Forge's run.bat ends with ``pause``, which waits for input.
         """
         target = str(settings.processName or "")
         deadline = time.monotonic() + max(0.0, timeout)
@@ -768,13 +990,15 @@ class OSProcessManager:
         while True:
             self._reap(popen)
             tree.update(_with_descendants(tree))
+            if self._stopping is not None:
+                self._remember(tree, self._stopping)
             alive = [process for process in tree if _is_alive(process)]
             if not alive:
                 return []
             if (
                 popen is not None
                 and not stdin_closed
-                and not any(match_rank(_info_of(p), target) for p in alive)
+                and not _any_server(alive, target)
             ):
                 self._close_stdin(popen)
                 stdin_closed = True
@@ -883,3 +1107,13 @@ def _write_log_line(log_file, message: str):
             f"[minecraft-monitor {stamp}] {message}\n".encode("utf-8", "replace")
         )
         log_file.flush()
+
+
+def _launch_failure_hint(error: Exception, cwd: str, windows: bool) -> str:
+    if windows or not isinstance(error, PermissionError):
+        return ""
+    if error.filename is not None and normalized_dir(error.filename) == normalized_dir(
+        cwd
+    ):
+        return " (the server folder is not accessible to the monitor's user)"
+    return " (is the start script executable? try chmod +x)"

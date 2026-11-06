@@ -5,7 +5,8 @@
 # --settings PATH / $MINECRAFT_MONITOR_SETTINGS) and edit it. On the first run
 # without a settings file, an interactive setup writes one for you.
 #
-# Every setting can be overridden on the command line (run with --help).
+# The main settings can also be given on the command line, which wins over
+# this file (run with --help for the list).
 # `null` means "not set": ports, the RCON password and the auto-start bind
 # address are then read from the server's own server.properties.
 
@@ -50,8 +51,9 @@ minecraft:
   port: null
   # RCON port and password. null = rcon.port / rcon.password from
   # server.properties (the password is only used when enable-rcon=true).
-  # Without RCON the monitor still works using the status ping, but kick,
-  # ban and console commands are disabled.
+  # Without RCON the monitor still works using the status ping, but kick and
+  # console commands are unavailable and bans can only be changed while the
+  # server is stopped.
   rconPort: null
   rconPassword: null
   # Seconds between status / player-list polls.
@@ -75,7 +77,9 @@ web:
   host: "0.0.0.0"
   # Dashboard port (must differ from the game and RCON ports).
   port: 25580
-  # Dashboard login (the password is required) -- change it on first use.
+  # Dashboard login. The password is required, and the monitor refuses to
+  # start while it is still the example value below: choose your own. Quote
+  # it, so YAML keeps it as text ("0123" unquoted would become 83).
   username: "admin"
   password: "changeme"
   # Allow start / stop / restart and console commands from the dashboard.
@@ -86,6 +90,15 @@ web:
   console: true
   # Show player heads (loaded from an external avatar service).
   playerAvatars: true
+  # Behind a reverse proxy (nginx, Caddy, Traefik...) that adds HTTPS: set
+  # host above to 127.0.0.1, list the proxy's address here so login lockouts
+  # and rate limits see the real client address from X-Forwarded-For (only
+  # trusted from these addresses), and turn on secureCookies.
+  # IP addresses or networks, e.g. ["127.0.0.1"] or ["10.0.0.0/8"]. [] = none.
+  trustedProxies: []
+  # Send the session cookies over HTTPS only. Turn on only when the dashboard
+  # is reached through HTTPS, or logging in stops working.
+  secureCookies: false
 
 # ============================================================================
 # Feature flags
@@ -138,8 +151,10 @@ monitor:
 # Security & rate limiting (web dashboard)
 # ============================================================================
 security:
-  # Secret key for session cookies (auto-generated into session_secret.key
-  # next to this file when null).
+  # Secret key that signs the session cookies. null (recommended): generated
+  # once into session_secret.key next to this file (owner-only permissions).
+  # A value set here wins over that file; changing it (or deleting the file
+  # while this is null) logs everyone out.
   sessionSecretKey: null
   # Session timeout in seconds (default: 1 hour).
   sessionTimeout: 3600

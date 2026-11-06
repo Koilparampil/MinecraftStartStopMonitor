@@ -55,6 +55,8 @@ class TestParsing:
             "autoStart": False,
             "autoStop": False,
             "autoStopDelay": 300,
+            "trustedProxies": None,
+            "secureCookies": None,
         }
 
     def test_no_flags_means_no_overrides(self):
@@ -139,3 +141,32 @@ class TestSettingsPath:
         assert default_settings_path(frozen=True, executable=exe) == str(
             tmp_path / "dist" / "settings.yaml"
         )
+
+
+class TestQaFixes:
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--polling-rate", "nan"],
+            ["--auto-stop-delay", "inf"],
+            ["--trusted-proxies", "10.0.0.0/8,bogus"],
+        ],
+    )
+    def test_more_invalid_values(self, argv, capsys):
+        with pytest.raises(SystemExit):
+            parse_args(argv)
+
+    def test_proxy_flags(self):
+        args = parse_args(
+            ["--trusted-proxies", "127.0.0.1, 10.0.0.0/8", "--secure-cookies"]
+        )
+        assert args.trustedProxies == ["127.0.0.1", "10.0.0.0/8"]
+        assert args.secureCookies is True
+
+    def test_a_complete_command_line_needs_no_settings_file(self):
+        from src.main import cli_settings_complete
+
+        base = ["--server-dir", "/srv/mc", "--start-command", "./run.sh nogui"]
+        assert cli_settings_complete(parse_args([*base, "--web-password", "pw"]))
+        assert cli_settings_complete(parse_args([*base, "--no-web"]))
+        assert not cli_settings_complete(parse_args(base))
