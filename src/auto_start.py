@@ -38,10 +38,13 @@ reset by hand at the start of every cycle):
 """
 
 import contextlib
+import dataclasses
 import errno
 import ipaddress
+import json
 import logging
 import os
+import selectors
 import socket
 import threading
 import time
@@ -52,6 +55,7 @@ from datetime import datetime
 from src.events import Event, EventBus
 from src.lifecycle.messages import LifecycleState
 from src.minecraft import server_files, sleeping
+from src.minecraft.protocol import PacketReader, encode_string, frame_packet
 from src.settings import DEFAULT_GAME_PORT, settings
 
 logger = logging.getLogger(__name__)
@@ -114,10 +118,12 @@ class ListenerOptions:
     accept_timeout: float = 0.2  # how quickly a cancel/wake is noticed
     connection_timeout: float = 5.0  # per client connection, overall
     request_timeout: float = 2.0  # the first request must have arrived by then
-    eviction_grace: float = 0.25  # younger pending connections are not evicted
+    status_timeout: float = 1.0  # a server-list ping, its Ping/Pong included
+    eviction_grace: float = 0.25  # younger connections are not evicted by newcomers
     max_connections: int = 64  # concurrent connections being served
     max_connections_per_client: int = 4  # per IPv4 address / IPv6 /56
-    max_refusals: int = 8  # concurrent "too many connections" replies
+    triage_capacity: int = 256  # sockets waiting in the no-slot triage
+    triage_timeout: float = 1.0  # their request must arrive by then
     release_timeout: float = 5.0  # stop_listening() wait for the port release
 
 
@@ -219,14 +225,14 @@ def client_key(ip):
 
 
 class _Admission:
-    """One admitted connection. It is pending until its first request has
-    arrived; only pending connections can be evicted."""
+    """One admitted connection. Its phase is "pending" until the first request
+    arrived, then "status" (server-list ping, legacy ping) or "login"."""
 
-    def __init__(self, conn, key, admitted_at):
+    def __init__(self, conn, key, admitted_at, phase="pending"):
         self.conn = conn
         self.key = key
         self.admitted_at = admitted_at
-        self.established = False
+        self.phase = phase
         self.evicted = False
         self._lock = threading.Lock()
         self._closed = False
@@ -247,10 +253,12 @@ class _Admission:
 class ConnectionSlots:
     """Admission control: a global cap and a per-client cap.
 
-    When a cap is reached, the oldest connection that has not sent its first
-    request yet (and is older than *grace*) is evicted to make room, so idle
-    or trickling sockets cannot lock players out. Connections whose request
-    arrived are never evicted; when only those remain, admit() returns None.
+    Logins are never evicted. When a cap is reached, a new connection evicts
+    the oldest one that is still waiting for its request or is only a ping
+    (once older than *grace*), and a complete login evicts the oldest
+    non-login connection of any age. So idle, trickling or stalled-ping
+    sockets cannot keep a player from waking the server; admit() returns
+    None only when no connection may be evicted.
     """
 
     def __init__(self, total, per_client, grace=0.0, clock=time.monotonic):
@@ -266,41 +274,46 @@ class ConnectionSlots:
         with self._lock:
             return len(self._entries)
 
-    def admit(self, conn, key):
-        """A slot for *conn* (evicting a pending one if needed), or None."""
+    def admit(self, conn, key, phase="pending"):
+        """A slot for *conn* (evicting if needed), or None."""
         now = self._clock()
+        grace = 0.0 if phase == "login" else self._grace
+        victim = None
         with self._lock:
-            same_client = [entry for entry in self._entries if entry.key == key]
-            if len(same_client) >= self._per_client:
-                full = same_client
-            elif len(self._entries) >= self._total:
-                full = self._entries
-            else:
-                full = None
-            victim = self._oldest_pending(full, now) if full is not None else None
-            if full is not None and victim is None:
-                return None  # everyone has sent a request: no one to evict
-            if victim is not None:
+            full = self._full(key)
+            if full is not None:
+                victim = self._oldest_evictable(full, now, grace)
+                if victim is None:
+                    return None
                 victim.evicted = True
                 self._entries.remove(victim)
-            entry = _Admission(conn, key, now)
+            entry = _Admission(conn, key, now, phase)
             self._entries.append(entry)
         if victim is not None:
             victim.abort()
         return entry
 
-    def _oldest_pending(self, entries, now):
+    def _full(self, key):
+        same_client = [entry for entry in self._entries if entry.key == key]
+        if len(same_client) >= self._per_client:
+            return same_client
+        if len(self._entries) >= self._total:
+            return self._entries
+        return None
+
+    @staticmethod
+    def _oldest_evictable(entries, now, grace):
         for entry in entries:
-            if not entry.established and now - entry.admitted_at >= self._grace:
+            if entry.phase != "login" and now - entry.admitted_at >= grace:
                 return entry
         return None
 
-    def promote(self, entry):
-        """The request arrived: never evict it. False if it already was."""
+    def promote(self, entry, phase):
+        """Its request arrived (``"status"`` or ``"login"``). False if evicted."""
         with self._lock:
             if entry.evicted:
                 return False
-            entry.established = True
+            entry.phase = phase
             return True
 
     def release(self, entry):
@@ -323,54 +336,100 @@ def _varint_at(data, offset):
     raise ValueError("frame length too long")
 
 
-def minecraft_request_complete(data):
-    """True once *data* holds a whole first request: a legacy ping (0xFE), or
-    the handshake frame plus the frame after it (Status Request or Login
-    Start), which every client sends right away. ValueError for garbage."""
-    if not data:
-        return False
-    if data[0] == 0xFE:
-        return True
-    offset = 0
-    for _ in range(2):
+def _frames(data, count):
+    """Payloads of the first *count* frames of *data*, None if incomplete."""
+    payloads, offset = [], 0
+    for _ in range(count):
         found = _varint_at(data, offset)
         if found is None:
-            return False
+            return None
         length, offset = found
         if length > sleeping.FRAME_LIMIT:
             raise ValueError("frame too long")
+        if offset + length > len(data):
+            return None
+        payloads.append(data[offset : offset + length])
         offset += length
-        if offset > len(data):
-            return False
-    return True
+    return payloads
 
 
-def read_request(conn, timeout, is_complete):
+def _handshake(payload):
+    """(protocol, next_state) of a handshake packet; ValueError otherwise."""
+    reader = PacketReader(payload)
+    if reader.read_varint() != 0x00:
+        raise ValueError("not a handshake")
+    protocol = reader.read_varint()
+    reader.read_string(sleeping.MAX_ADDRESS_LENGTH)
+    reader.read_ushort()
+    return protocol, reader.read_varint()
+
+
+class MinecraftRequests:
+    """Recognises a client's first request -- the handshake plus the packet
+    after it (Status Request or Login Start), which every client sends right
+    away, or a legacy 0xFE ping -- and builds the short replies for
+    connections that get no slot."""
+
+    @staticmethod
+    def classify(data):
+        """None while incomplete, then "legacy", "status" or "login";
+        ValueError for anything that is not a request."""
+        if not data:
+            return None
+        if data[0] == 0xFE:
+            return "legacy"
+        frames = _frames(data, 2)
+        if frames is None:
+            return None
+        _protocol, next_state = _handshake(frames[0])
+        if next_state == 1:
+            return "status"
+        if next_state in (2, 3):
+            return "login"
+        raise ValueError(f"unknown next state {next_state}")
+
+    @staticmethod
+    def busy_reply(kind, data, config):
+        """ "Too many connections" for a login, the sleeping status (without
+        the icon) for a ping; None to just close."""
+        if kind == "login":
+            text = json.dumps({"text": BUSY_MESSAGE})
+            return frame_packet(0x00, encode_string(text, None))
+        if kind == "status":
+            protocol, _next_state = _handshake(_frames(data, 1)[0])
+            plain = dataclasses.replace(config, favicon=None)
+            text = sleeping.status_json(plain, protocol)
+            return frame_packet(0x00, encode_string(text, sleeping.MAX_STATUS_JSON))
+        return None
+
+
+def read_request(conn, timeout, classify):
     """Read the client's first request within *timeout* seconds in total.
 
-    Returns the bytes read (they are replayed to the protocol handler), or
-    None if the request did not arrive complete in time, the client closed,
-    or it is not a valid request."""
+    Returns (bytes read, kind); the bytes are replayed to the protocol
+    handler. (None, None) if the request did not arrive complete in time,
+    the client closed, or it is not a valid request."""
     deadline = time.monotonic() + timeout
     data = b""
     while len(data) <= _REQUEST_LIMIT:
         try:
-            if is_complete(data):
-                return data
+            kind = classify(data)
         except ValueError:
-            return None
+            return None, None
+        if kind is not None:
+            return data, kind
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return None
+            return None, None
         try:
             conn.settimeout(remaining)
             chunk = conn.recv(4096)
         except OSError:  # timeout, reset, or shut down by an eviction
-            return None
+            return None, None
         if not chunk:
-            return None
+            return None, None
         data += chunk
-    return None
+    return None, None
 
 
 class _ReplaySocket:
@@ -392,8 +451,146 @@ class _ReplaySocket:
         return getattr(self._sock, name)
 
 
-def _busy(_name, _ip):
-    return False, BUSY_MESSAGE
+class _Triage:
+    """Connections that got no slot, all on one thread with non-blocking
+    reads, so it never holds up the accept loop. Once a request is complete,
+    a login takes a slot by evicting a non-login connection and is served
+    normally; anything else (or a login when every slot holds a login) gets
+    a short reply and is closed. Bounded: past *capacity* waiting sockets
+    the oldest is dropped, and each one waits at most *timeout*."""
+
+    def __init__(self, cycle, capacity, timeout):
+        self._cycle = cycle
+        self._capacity = capacity
+        self._timeout = timeout
+        self._lock = threading.Lock()
+        self._incoming = []
+        self._waiting = {}  # socket -> [ip, key, config, deadline, data]
+        self._closed = False
+        self._selector = selectors.DefaultSelector()
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_r.setblocking(False)
+        self._wake_w.setblocking(False)
+        self._selector.register(self._wake_r, selectors.EVENT_READ)
+        self.thread = threading.Thread(
+            target=self._run, name="minecraft-autostart-triage", daemon=True
+        )
+        self.thread.start()
+
+    def add(self, conn, ip, key, config):
+        with self._lock:
+            if self._closed:
+                _close_quietly(conn)
+                return
+            self._incoming.append((conn, ip, key, config))
+        self._poke()
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+        self._poke()
+
+    def _poke(self):
+        with contextlib.suppress(OSError):
+            self._wake_w.send(b"\0")
+
+    def _run(self):
+        try:
+            while True:
+                with self._lock:
+                    if self._closed:
+                        break
+                    incoming, self._incoming = self._incoming, []
+                for item in incoming:
+                    self._register(*item)
+                for key, _events in self._selector.select(self._next_timeout()):
+                    if key.fileobj is self._wake_r:
+                        with contextlib.suppress(OSError):
+                            self._wake_r.recv(4096)
+                    else:
+                        self._read(key.fileobj)
+                self._expire()
+        except Exception:
+            logger.exception("Auto-start triage failed")
+        finally:
+            self._shutdown()
+
+    def _register(self, conn, ip, key, config):
+        if len(self._waiting) >= self._capacity:
+            self._drop(next(iter(self._waiting)))  # the oldest
+        try:
+            conn.setblocking(False)
+            self._selector.register(conn, selectors.EVENT_READ)
+        except (OSError, ValueError):
+            _close_quietly(conn)
+            return
+        deadline = time.monotonic() + self._timeout
+        self._waiting[conn] = [ip, key, config, deadline, b""]
+
+    def _next_timeout(self):
+        if not self._waiting:
+            return None
+        soonest = min(state[3] for state in self._waiting.values())
+        return max(0.0, soonest - time.monotonic())
+
+    def _read(self, conn):
+        state = self._waiting.get(conn)
+        if state is None:
+            return
+        try:
+            chunk = conn.recv(4096)
+        except BlockingIOError:
+            return
+        except OSError:
+            chunk = b""
+        if not chunk or len(state[4]) + len(chunk) > _REQUEST_LIMIT:
+            self._drop(conn)
+            return
+        state[4] += chunk
+        try:
+            kind = self._cycle.requests.classify(state[4])
+        except ValueError:
+            self._drop(conn)
+            return
+        if kind is not None:
+            self._forget(conn)
+            self._resolve(conn, kind, *state)
+
+    def _resolve(self, conn, kind, ip, key, config, _deadline, data):
+        if kind == "login" and self._cycle.admit_login(conn, ip, key, config, data):
+            return
+        try:
+            reply = self._cycle.requests.busy_reply(kind, data, config)
+            if reply:
+                conn.send(reply)  # small: fits the socket buffer, never blocks
+        except (OSError, ValueError):
+            pass
+        _close_quietly(conn)
+
+    def _expire(self):
+        now = time.monotonic()
+        for conn in [c for c, state in self._waiting.items() if state[3] <= now]:
+            self._drop(conn)
+
+    def _forget(self, conn):
+        self._waiting.pop(conn, None)
+        with contextlib.suppress(KeyError, ValueError, OSError):
+            self._selector.unregister(conn)
+
+    def _drop(self, conn):
+        self._forget(conn)
+        _close_quietly(conn)
+
+    def _shutdown(self):
+        for conn in list(self._waiting):
+            self._drop(conn)
+        with self._lock:
+            leftover, self._incoming = self._incoming, []
+        for item in leftover:
+            _close_quietly(item[0])
+        self._selector.close()
+        _close_quietly(self._wake_r)
+        _close_quietly(self._wake_w)
 
 
 def _close_quietly(sock):
@@ -493,7 +690,8 @@ class _ListenCycle:
             self._options.max_connections_per_client,
             grace=self._options.eviction_grace,
         )
-        self._refusals = threading.BoundedSemaphore(max(1, self._options.max_refusals))
+        self.requests = manager.requests
+        self._triage = None
         self.bind_failures = 0
         self.bind_error = None  # why the last bind failed, until one succeeds
         self.thread = threading.Thread(
@@ -544,6 +742,9 @@ class _ListenCycle:
     # --- the cycle thread --------------------------------------------
 
     def _run(self):
+        self._triage = _Triage(
+            self, self._options.triage_capacity, self._options.triage_timeout
+        )
         try:
             while not self._done():
                 sock = self._bind()
@@ -555,6 +756,7 @@ class _ListenCycle:
             logger.exception("Auto-start listener failed")
         finally:
             self._close_socket()
+            self._triage.close()
             self.released.set()
         # The port is released before the start request: the real server binds
         # the same port seconds later.
@@ -657,13 +859,27 @@ class _ListenCycle:
             _close_quietly(conn)
             return
         ip = normalize_client_ip(address[0])
-        entry = self._slots.admit(conn, client_key(ip))
+        key = client_key(ip)
+        entry = self._slots.admit(conn, key)
         if entry is None:
-            self._refuse(conn, ip, config)
+            self._triage.add(conn, ip, key, config)  # never blocks
             return
+        self._start_handler(entry, ip, config)
+
+    def admit_login(self, conn, ip, key, config, request):
+        """Called by the triage for a complete login with no slot: evict a
+        non-login connection for it. False when every slot holds a login."""
+        entry = self._slots.admit(conn, key, phase="login")
+        if entry is None:
+            return False
+        conn.setblocking(True)
+        self._start_handler(entry, ip, config, request, "login")
+        return True
+
+    def _start_handler(self, entry, ip, config, request=None, kind=None):
         worker = threading.Thread(
             target=self._handle,
-            args=(entry, ip, config),
+            args=(entry, ip, config, request, kind),
             name="minecraft-autostart-conn",
             daemon=True,
         )
@@ -673,55 +889,17 @@ class _ListenCycle:
             entry.close()
             self._slots.release(entry)
 
-    def _refuse(self, conn, ip, config):
-        """Every slot holds a request in progress: tell a joining player to
-        retry (a few at a time), or just drop the connection."""
-        if not self._refusals.acquire(blocking=False):
-            logger.debug(f"Connection limit reached ({ip}); dropping a connection")
-            _close_quietly(conn)
-            return
-        worker = threading.Thread(
-            target=self._serve_refusal,
-            args=(conn, ip, config),
-            name="minecraft-autostart-busy",
-            daemon=True,
-        )
-        try:
-            worker.start()
-        except RuntimeError:
-            self._refusals.release()
-            _close_quietly(conn)
-
-    def _serve_refusal(self, conn, ip, config):
-        try:
-            conn.settimeout(self._options.request_timeout)
-            self._manager.serve_connection(
-                conn,
-                ip,
-                config,
-                is_allowed=_busy,
-                timeout=self._options.request_timeout,
-            )
-        except Exception:
-            logger.debug(f"Busy reply to {ip} failed", exc_info=True)
-        finally:
-            _close_quietly(conn)
-            self._refusals.release()
-
-    def _handle(self, entry, ip, config):
+    def _handle(self, entry, ip, config, request=None, kind=None):
         outcome = None
         try:
-            request = read_request(
-                entry.conn,
-                self._options.request_timeout,
-                self._manager.request_complete,
-            )
-            if request is None or not self._slots.promote(entry):
+            if request is None:
+                request, kind = read_request(
+                    entry.conn, self._options.request_timeout, self.requests.classify
+                )
+            if kind is None or not self._slots.promote(entry, kind):
                 logger.debug(f"Incomplete sleeping-server request from {ip} dropped")
             else:
-                entry.conn.settimeout(self._options.connection_timeout)
-                replay = _ReplaySocket(entry.conn, request)
-                outcome = self._manager.serve_connection(replay, ip, config)
+                outcome = self._serve_request(entry.conn, ip, config, request, kind)
         except Exception:
             logger.exception(f"Sleeping-server connection from {ip} failed")
         finally:
@@ -734,6 +912,17 @@ class _ListenCycle:
             logger.debug(
                 f"{outcome.player_name} ({ip}) joined while the server is already starting"
             )
+
+    def _serve_request(self, conn, ip, config, request, kind):
+        # A ping gets little time (a client that never sends the Ping must
+        # not hold its slot); a login gets the full connection timeout.
+        if kind == "login":
+            timeout = self._options.connection_timeout
+        else:
+            timeout = self._options.status_timeout
+        conn.settimeout(timeout)
+        replay = _ReplaySocket(conn, request)
+        return self._manager.serve_connection(replay, ip, config, timeout=timeout)
 
     def _close_socket(self):
         sock, self._sock = self._sock, None
@@ -762,15 +951,15 @@ class AutoStartManager:
         options: ListenerOptions | None = None,
         connection_handler: Callable | None = None,
         access_policy: AccessPolicy | None = None,
-        request_complete: Callable[[bytes], bool] | None = None,
+        requests=None,
     ):
         self.controller = controller
         self.bus = bus
         self.options = options or ListenerOptions()
         self._connection_handler = connection_handler
         self._access_policy = access_policy or AccessPolicy()
-        # When a connection's first request is complete (tests use lines).
-        self.request_complete = request_complete or minecraft_request_complete
+        # Recognises first requests and builds busy replies (tests use lines).
+        self.requests = requests or MinecraftRequests()
         self._lock = threading.Lock()
         self._cycle: _ListenCycle | None = None
         self._last_cycle: _ListenCycle | None = None

@@ -420,7 +420,7 @@ class TestQaFixes:
             ("webUsername", "", "web.username must not be empty"),
             ("webPassword", 83, "put it in quotes"),
             ("webPassword", True, "put it in quotes"),
-            ("webPassword", "changeme", "example value"),
+            ("webPassword", "changeme", "example password"),
         ],
     )
     def test_rejected_values(self, mock_settings, key, value, message):
@@ -493,3 +493,20 @@ class TestQaFixes:
         mock_settings.rconPassword = None
         text = " ".join(mock_settings.validation_warnings())
         assert "bans can only be changed while the server is stopped" in text
+
+
+class TestStartupLoopCheck:
+    def test_a_start_command_running_a_loop_script_warns(
+        self, mock_settings, server_dir
+    ):
+        (server_dir / "startserver.sh").write_text(
+            "while true; do ./run.sh nogui; done\n"
+        )
+        mock_settings.startCommand = "./startserver.sh"
+        text = " ".join(mock_settings.validation_warnings())
+        assert (
+            "startserver.sh, which looks like it restarts the server in a loop" in text
+        )
+        mock_settings.startCommand = ["sh", "./run.sh", "nogui"]
+        text = " ".join(mock_settings.validation_warnings())
+        assert "restarts the server in a loop" not in text

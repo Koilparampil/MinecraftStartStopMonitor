@@ -54,7 +54,6 @@ from flask import (
     url_for,
 )
 from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 from flask_login import (
     LoginManager,
     current_user,
@@ -96,7 +95,7 @@ AVATAR_ORIGIN = "https://mc-heads.net"
 SESSION_STORE_FILE = "web-sessions.json"  # remember-me token hashes (0600)
 ABSOLUTE_SESSION_SECONDS = 12 * 3600  # however active, a session ends after this
 REMEMBER_SECONDS = 7 * 86400
-MAX_REQUEST_BYTES = 64 * 1024  # dashboard requests are small forms
+MAX_REQUEST_BYTES = 16 * 1024  # dashboard requests are small forms
 SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 RCON_STATUSES = ("disabled", "ok", "auth_failed", "unreachable", "unknown")
 
@@ -317,8 +316,14 @@ class _DeadlineSocketIO(socket.SocketIO):
         super().__init__(sock, "rb")
         self._deadline = deadline
         self._io_timeout = io_timeout
+        self.responding = False  # set once the response has started
 
     def readinto(self, buffer):
+        if self.responding:
+            # Only werkzeug's post-response drain reads now. End it cleanly
+            # (EOF) so it closes its selector and the response iterator at
+            # once instead of leaking them until a garbage collection.
+            return 0
         remaining = self._deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("the request was not received in time")
@@ -342,11 +347,13 @@ class _GuardedRequestHandler(WSGIRequestHandler):
             _DeadlineSocketIO(self.connection, deadline, limits.io_timeout)
         )
 
-    def parse_request(self):
-        parsed = super().parse_request()
-        if parsed:
-            self.server.mark_busy(self.request)  # headers complete
-        return parsed
+    def send_response(self, code, message=None):
+        # From here on nothing more is read from the client, and the
+        # connection is no longer a candidate for eviction.
+        if isinstance(getattr(self.rfile, "raw", None), _DeadlineSocketIO):
+            self.rfile.raw.responding = True
+        self.server.mark_responding(self.request)
+        super().send_response(code, message)
 
     def log_error(self, format, *args):  # noqa: A002 - stdlib signature
         if format.startswith("Request timed out"):
@@ -359,17 +366,17 @@ class _GuardedRequestHandler(WSGIRequestHandler):
 class _Connection:
     peer: str  # per-address key (see _peer_key)
     accepted_at: float
-    waiting: bool = True  # still receiving its request headers
+    waiting: bool = True  # no response started yet (still reading or working)
 
 
 class _GuardedWSGIServer(ThreadedWSGIServer):
     """Caps open connections globally and per client address.
 
     Excess connections are closed as soon as they are accepted, except that
-    at the global cap the oldest connection still waiting for its request
-    headers is dropped to make room: a slowloris flood from many addresses
-    cannot keep a real request (which arrives in milliseconds) out. Live
-    streams and requests being handled are never dropped.
+    at the global cap the oldest connection that has not started its response
+    is dropped to make room: a flood of slow headers or slow bodies, from many
+    addresses or through a trusted proxy, cannot keep a real request (which
+    completes in milliseconds) out. Live streams are never dropped.
     """
 
     daemon_threads = True
@@ -411,7 +418,7 @@ class _GuardedWSGIServer(ThreadedWSGIServer):
         return True
 
     def _evict(self) -> bool:
-        """Drop the oldest connection still waiting for its request."""
+        """Drop the oldest connection whose response has not started."""
         waiting = [
             (c.accepted_at, s) for s, c in self._connections.items() if c.waiting
         ]
@@ -423,7 +430,7 @@ class _GuardedWSGIServer(ThreadedWSGIServer):
             victim.shutdown(socket.SHUT_RDWR)  # its blocked read returns at once
         return True
 
-    def mark_busy(self, request) -> None:
+    def mark_responding(self, request) -> None:
         with self._connections_lock:
             connection = self._connections.get(request)
             if connection is not None:
@@ -544,6 +551,7 @@ def _apply_forwarded_headers(environ, networks) -> None:
         client = hop  # the nearest address that is not one of our proxies
         if not _in_networks(hop, networks):
             break
+    environ["mcmonitor.proxied"] = True
     if client:
         environ["REMOTE_ADDR"] = client
     proto = _last_value(environ.get("HTTP_X_FORWARDED_PROTO")).lower()
@@ -571,6 +579,12 @@ def _origin_of(url):
     if scheme not in ("http", "https") or not parts.hostname:
         return None
     return scheme, parts.hostname.lower(), port or (443 if scheme == "https" else 80)
+
+
+def _client_key() -> str:
+    """Lockout and rate-limit key: the client address (after trusted-proxy
+    resolution), or its /64 for IPv6."""
+    return _peer_key(request.remote_addr or "unknown")
 
 
 def _secure_cookies() -> bool:
@@ -656,6 +670,9 @@ class WebServer:
             # The token lives in the session, which expires server-side; a
             # dashboard left open for hours must still be able to act.
             WTF_CSRF_TIME_LIMIT=None,
+            # Same-origin is enforced by _check_origin from Origin or Referer;
+            # Flask-WTF's HTTPS-only check would demand a Referer as well.
+            WTF_CSRF_SSL_STRICT=False,
             MAX_CONTENT_LENGTH=MAX_REQUEST_BYTES,
         )
         app.wsgi_app = _TrustedProxyMiddleware(app.wsgi_app)
@@ -668,7 +685,7 @@ class WebServer:
         # counters on one request would lock out at an unpredictable count),
         # as are /stream, /healthz, /console and static files.
         return Limiter(
-            get_remote_address,
+            _client_key,
             app=self.app,
             storage_uri="memory://",
             default_limits=[_default_rate_limit],
@@ -769,7 +786,8 @@ class WebServer:
         if claimed is None:
             return None
         expected = _origin_of(request.host_url)
-        if expected is not None and _origin_of(claimed) == expected:
+        actual = _origin_of(claimed)
+        if expected is not None and actual == expected:
             return None
         logger.warning(
             "Refused a cross-origin %s %s from %s (origin %r, expected %s)",
@@ -783,6 +801,13 @@ class WebServer:
             "Request blocked: it did not come from this dashboard's own page. "
             "Behind a reverse proxy, list it in web.trustedProxies."
         )
+        proxied = request.environ.get("mcmonitor.proxied")
+        if proxied and expected and actual and actual[:2] == expected[:2]:
+            message = (
+                "Request blocked: the reverse proxy did not pass on the public "
+                "port. Forward the browser's Host header with its port (nginx: "
+                "proxy_set_header Host $http_host;) or send X-Forwarded-Port."
+            )
         if request.endpoint == "login":
             return self._render_login(error=message, status=403)
         return jsonify(success=False, message=message), 403
@@ -864,6 +889,11 @@ class WebServer:
         def info():
             return self._handle_info()
 
+        @app.route("/csrf")
+        @login_required
+        def csrf_token():
+            return jsonify(success=True, csrfToken=generate_csrf())
+
         @app.route("/healthz")
         @limiter.exempt
         def healthz():
@@ -917,12 +947,17 @@ class WebServer:
             return self._render_login(
                 error="Your login form expired. Please try again.", status=400
             )
+        if request.endpoint == "logout":
+            # Same-origin was already checked; a stale token must never keep
+            # anyone from logging out.
+            return self._handle_logout()
         if not current_user.is_authenticated:
             return self._unauthorized()
         logger.warning("CSRF check failed for %s: %s", request.path, error.description)
         return (
             jsonify(
                 success=False,
+                csrfError=True,  # the page fetches /csrf and retries once
                 message="Security token missing or expired. Reload the page and try again.",
             ),
             400,
@@ -1003,12 +1038,14 @@ class WebServer:
             self.snapshot = snapshot
             self._streams.broadcast(self._sse_message(self._payload(snapshot)))
 
-    @staticmethod
-    def _payload(snapshot: dict) -> dict:
+    def _payload(self, snapshot: dict) -> dict:
         return {
             "data": dict(snapshot),
             "autoStopDelay": _auto_stop_delay(),
             "serverTime": time.time(),
+            # A quick read under the client's small state lock; arrives with
+            # every committed snapshot so the page never acts on a stale one.
+            "rconStatus": self._rcon_status(),
         }
 
     def _json_state(self, status: int = 200, **extra):
@@ -1060,13 +1097,22 @@ class WebServer:
     # ------------------------------------------------------------------
 
     def _handle_login(self):
-        ip = request.remote_addr or "unknown"
+        ip = _client_key()  # IPv6 clients by /64: rotating addresses is free
         next_url = self._next_url()
         if request.method == "GET" and current_user.is_authenticated:
             return redirect(next_url)
         if self.login_tracker.is_locked_out(ip):
             return self._render_locked_out(ip)
         if request.method == "POST":
+            wait = self.login_tracker.global_wait(ip)
+            if wait:
+                return self._render_login(
+                    error="Too many failed logins on this dashboard. "
+                    f"Try again in {wait} seconds.",
+                    locked_out=True,
+                    lockout_seconds=wait,
+                    status=429,
+                )
             return self._attempt_login(ip, next_url)
         return self._render_login()
 
@@ -1092,14 +1138,16 @@ class WebServer:
                 )
             self._establish_session(user, token_id)
             self.login_tracker.record_successful_login(ip)
-            logger.info("Web login from %s", ip)
+            logger.info("Web login from %s", request.remote_addr)
             response = redirect(next_url)
             if token:
                 self._set_remember_cookie(response, token)
             return response
 
         self.login_tracker.record_failed_attempt(ip)
-        logger.warning("Failed login attempt from %s for user %r", ip, username)
+        logger.warning(
+            "Failed login attempt from %s for user %r", request.remote_addr, username
+        )
         remaining = self.login_tracker.get_remaining_attempts(ip)
         if remaining == 0:
             return self._render_locked_out(ip)
@@ -1380,7 +1428,11 @@ class WebServer:
             # broadcast lock, so no committed update can slip in between.
             snapshot = self._cache_snapshot(self._read_snapshot())
             client = self._streams.add(grant.owner)
-            initial = self._sse_message(self._payload(snapshot), retry=SSE_RETRY_MS)
+            first = self._payload(snapshot)
+            # This request may have restored a remembered login into a new
+            # session: hand the page that session's token (only to this client).
+            first["csrfToken"] = generate_csrf()
+            initial = self._sse_message(first, retry=SSE_RETRY_MS)
         if client is None:
             return jsonify(success=False, message="Live updates unavailable."), 503
         response = Response(

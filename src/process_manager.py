@@ -73,8 +73,8 @@ STOP_COMMAND = b"stop\n"
 DEFAULT_STOP_TIMEOUT = 120.0
 
 _INFO_ATTRS = ["name", "exe", "cmdline"]
-# cmd.exe would misread these in a list-form .bat/.cmd command line.
-_CMD_METACHARACTERS = frozenset('&|<>^%"\r\n')
+# cmd.exe cannot pass these through a quoted list-form .bat/.cmd element.
+_CMD_UNQUOTABLE = frozenset('"%')
 
 # Programs that can mention the server in their command line while never being
 # the server (``tail -f logs/latest.log | grep java`` run in the server
@@ -138,9 +138,9 @@ def build_launch_command(command, windows: bool = IS_WINDOWS, server_dir=None):
     through unchanged on Windows (CreateProcess parses it). On Windows:
 
     - a ``.bat``/``.cmd`` program runs through ``cmd.exe /d /s /c``. A list
-      whose elements contain cmd.exe metacharacters (``& | < > ^ % "``) is
-      refused: cmd.exe would misread it, while a string is written in cmd.exe
-      quoting by the admin;
+      is double-quoted element by element, so ``& | < > ^`` stay literal;
+      elements with ``"`` or ``%`` are refused (cmd.exe cannot pass them),
+      while a string is written in cmd.exe quoting by the admin;
     - a relative program with a path separator, or one that exists in
       ``server_dir``, is resolved against ``server_dir``: CreateProcess
       searches the monitor's directory, not the child's cwd (POSIX resolves
@@ -174,15 +174,23 @@ def _list_command(args: list, windows: bool, server_dir):
     if not windows:
         return args
     if _is_batch_file(args[0]):
-        unsafe = [arg for arg in args if _CMD_METACHARACTERS.intersection(arg)]
-        if unsafe:
-            raise ValueError(
-                f"minecraft.startCommand: cmd.exe would misread {unsafe[0]!r} "
-                '(it contains one of & | < > ^ % "). Write the command as one '
-                "string, quoted for cmd.exe, instead of a list."
-            )
-        return _cmd_wrapper(subprocess.list2cmdline(args))
+        return _cmd_wrapper(" ".join(_cmd_quote(arg) for arg in args))
     return [_resolve_windows_program(args[0], server_dir), *args[1:]]
+
+
+def _cmd_quote(arg: str) -> str:
+    """One element of a cmd.exe line, double-quoted so ``& | < > ^`` stay
+    literal. cmd.exe expands ``%`` even inside quotes and cannot escape a
+    quote there, so such elements are refused."""
+    if _CMD_UNQUOTABLE.intersection(arg) or any(ord(c) < 32 for c in arg):
+        raise ValueError(
+            f"minecraft.startCommand: cmd.exe cannot pass {arg!r} (it contains "
+            '" or %, or a control character). Write the command as one string, '
+            "quoted for cmd.exe, instead of a list."
+        )
+    # Backslashes before the closing quote would escape it for the program.
+    trailing = len(arg) - len(arg.rstrip("\\"))
+    return '"' + arg + "\\" * trailing + '"'
 
 
 def popen_platform_kwargs(windows: bool = IS_WINDOWS) -> dict:
@@ -391,12 +399,12 @@ def _info_of(process) -> dict:
         raise _unknown(e) from e
 
 
-def _any_server(processes, target: str) -> bool:
-    """Whether a process matches processName (assumed when unknown)."""
+def _servers_among(processes, target: str) -> list:
+    """The processes that match processName (all of them when unknown)."""
     try:
-        return any(match_rank(_info_of(process), target) for process in processes)
+        return [p for p in processes if match_rank(_info_of(p), target)]
     except ProcessStateUnknown:
-        return True
+        return list(processes)
 
 
 def _cwd_matches(process, server_dir: str) -> bool:
@@ -521,6 +529,7 @@ class OSProcessManager:
     WAIT_INTERVAL = 0.2
     STDIN_STOP_GRACE = 15.0  # then also send `stop` over RCON
     SERVER_GONE_SCANS = 2  # scans without the server before its launcher is ignored
+    LEFTOVER_GRACE = 1.0  # for leftovers of a stopped server, before/after SIGTERM
 
     def __init__(
         self,
@@ -576,7 +585,9 @@ class OSProcessManager:
 
     def identity_is_running(self, identity: ProcessIdentity | None) -> bool:
         """True while the process lives, or (for the tracked identity) a
-        remembered descendant does. Raises ProcessStateUnknown."""
+        remembered descendant matching processName does: a JVM whose launcher
+        is gone. Other leftovers (a tunnel or backup helper the launch script
+        started) never count. Raises ProcessStateUnknown."""
         if identity is None:
             return False
         return self._root_alive(identity) or self._members_alive(identity)
@@ -596,7 +607,12 @@ class OSProcessManager:
             return list(self._members)
 
     def _members_alive(self, identity: ProcessIdentity) -> bool:
-        return any(_is_alive(member) for member in self._members_of(identity))
+        """A remembered descendant matching processName still lives."""
+        target = str(settings.processName or "")
+        return bool(_servers_among(self._live_members(identity), target))
+
+    def _live_members(self, identity: ProcessIdentity | None) -> list:
+        return [member for member in self._members_of(identity) if _is_alive(member)]
 
     def _remember(self, processes, identity: ProcessIdentity | None = None):
         """Record descendants of the tracked process (the root excluded)."""
@@ -660,19 +676,21 @@ class OSProcessManager:
         Raises ProcessStateUnknown when the OS cannot be asked; the runtime
         then keeps the last state."""
         tracked = self.tracked_identity
-        running = False
-        if tracked is not None:
-            root_alive = self._root_alive(tracked)
-            if root_alive:
-                self._remember_descendants(tracked)
-            running = root_alive or self._members_alive(tracked)
-            if root_alive and self._launcher_outlived_server(tracked):
-                running = False
+        running = tracked is not None and self._tracked_running(tracked)
         return ProcessSnapshot(
             tracked=tracked,
             tracked_running=running,
             found=self.find_process_identity(),
         )
+
+    def _tracked_running(self, tracked: ProcessIdentity) -> bool:
+        root_alive = self._root_alive(tracked)
+        if root_alive:
+            self._remember_descendants(tracked)
+        members = self._live_members(tracked)
+        if not root_alive and not members:
+            return False
+        return not self._launcher_outlived_server(tracked, root_alive, members)
 
     def _remember_descendants(self, tracked: ProcessIdentity):
         try:
@@ -681,47 +699,58 @@ class OSProcessManager:
             return
         self._remember(children, tracked)
 
-    def _tree_has_server(self, tracked: ProcessIdentity, target: str) -> bool | None:
-        """Whether the tracked process or a live descendant matches
-        processName (None: unknown)."""
+    def _tree_has_server(
+        self, tracked: ProcessIdentity, root_alive: bool, members: list, target: str
+    ) -> bool | None:
+        """Whether the tracked process, a live descendant or a remembered one
+        matches processName (None: unknown)."""
         try:
-            root = psutil.Process(tracked.pid)
-            tree = [root, *root.children(recursive=True), *self._members_of(tracked)]
-            return any(match_rank(_info_of(p), target) and _is_alive(p) for p in tree)
+            tree = list(members)
+            if root_alive:
+                root = psutil.Process(tracked.pid)
+                tree += [root, *root.children(recursive=True)]
+            return any(_is_alive(p) and match_rank(_info_of(p), target) for p in tree)
         except (psutil.Error, OSError, ProcessStateUnknown):
             return None
 
-    def _launcher_outlived_server(self, tracked: ProcessIdentity) -> bool:
-        """True once the server has been missing from the tracked tree for
-        SERVER_GONE_SCANS scans in a row while its launcher lingers.
+    def _launcher_outlived_server(
+        self, tracked: ProcessIdentity, root_alive: bool, members: list
+    ) -> bool:
+        """True once no process matching processName has been left in the
+        tracked tree for SERVER_GONE_SCANS scans in a row while other
+        processes of it linger: a launcher in ``pause``/``read``, or a helper
+        the launch script started in the background (a tunnel, a backup
+        loop), still a child or orphaned after the launcher exited.
 
-        Only after the tree has had a server process (a launcher may take a
-        moment to start the JVM). The first such scan closes our stdin pipe,
-        so a launcher waiting in ``pause``/``read`` returns by itself.
+        While the launcher lives, only after the tree has had a server
+        process (it may take a moment to start the JVM). The first such scan
+        closes our stdin pipe, so a launcher waiting for input returns.
         """
-        has_server = self._tree_has_server(tracked, str(settings.processName or ""))
+        has_server = self._tree_has_server(
+            tracked, root_alive, members, str(settings.processName or "")
+        )
         with self._lock:
             if has_server is None or not tracked.matches(self._identity):
                 return False
             if has_server:
                 self._server_seen, self._missing_scans = True, 0
                 return False
-            if not self._server_seen:
+            if root_alive and not self._server_seen:
                 return False
             self._missing_scans += 1
             missing = self._missing_scans
         if missing == 1:
             logger.info(
-                f"The server exited but its launcher (pid {tracked.pid}) is still "
-                "running; closing its console input"
+                "The server process is gone but processes started with it remain "
+                f"(pid {tracked.pid} and its descendants); closing its console input"
             )
             popen = self._popen_for(tracked)
             if popen is not None:
                 self._close_stdin(popen)
         elif missing == self.SERVER_GONE_SCANS:
             logger.warning(
-                f"The launcher (pid {tracked.pid}) outlived the server; treating "
-                "the server as stopped"
+                "Only non-server processes remain from the server's launch (pid "
+                f"{tracked.pid} and its descendants); treating the server as stopped"
             )
         return missing >= self.SERVER_GONE_SCANS
 
@@ -976,36 +1005,59 @@ class OSProcessManager:
         return not alive
 
     def _wait_for_exit(self, tree: set, timeout: float, popen) -> list:
-        """Wait until every process of the tree is gone; returns the survivors.
+        """Wait until the server is gone; returns what still keeps it alive.
 
         Descendants started meanwhile join the tree and are remembered, so
-        detection reports the server running until all of them are gone. A
-        process whose state cannot be read counts as alive. Once only launch
-        wrappers are left (no process matching processName), our stdin pipe
-        is closed: Forge's run.bat ends with ``pause``, which waits for input.
+        detection reports the server running until it is gone. The server is
+        gone once no tree process matching processName is alive (if the tree
+        ever had one; otherwise once the whole tree is gone). What it leaves
+        behind (a launcher in ``pause``, a tunnel or backup helper) is then
+        ended best-effort, without waiting ``stopTimeout`` for it. A process
+        whose state cannot be read counts as alive.
         """
         target = str(settings.processName or "")
         deadline = time.monotonic() + max(0.0, timeout)
-        stdin_closed = False
+        seen_server = self._server_seen
         while True:
             self._reap(popen)
             tree.update(_with_descendants(tree))
             if self._stopping is not None:
                 self._remember(tree, self._stopping)
             alive = [process for process in tree if _is_alive(process)]
+            servers = _servers_among(alive, target)
+            seen_server = seen_server or bool(servers)
             if not alive:
                 return []
-            if (
-                popen is not None
-                and not stdin_closed
-                and not _any_server(alive, target)
-            ):
-                self._close_stdin(popen)
-                stdin_closed = True
+            if not servers and popen is not None:
+                self._close_stdin(popen)  # Forge's run.bat ends with `pause`
+            if seen_server and not servers:
+                self._dismiss_leftovers(alive, popen)
+                return []
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return alive
+                return servers if seen_server else alive
             time.sleep(min(self.WAIT_INTERVAL, remaining))
+
+    def _dismiss_leftovers(self, leftovers: list, popen):
+        """The server is gone: end what it left behind without waiting
+        ``stopTimeout`` for it. Best-effort; the stop has succeeded anyway."""
+        leftovers = self._await_exit(leftovers, self.LEFTOVER_GRACE, popen)
+        if not leftovers:
+            return
+        pids = sorted(process.pid for process in leftovers)
+        logger.info(f"The server stopped; ending leftover processes {pids}")
+        _signal_all(leftovers, "terminate")
+        leftovers = self._await_exit(leftovers, self.LEFTOVER_GRACE, popen)
+        _signal_all(leftovers, "kill")
+
+    def _await_exit(self, processes: list, timeout: float, popen) -> list:
+        deadline = time.monotonic() + timeout
+        while True:
+            self._reap(popen)
+            processes = [process for process in processes if _is_alive(process)]
+            if not processes or time.monotonic() >= deadline:
+                return processes
+            time.sleep(self.WAIT_INTERVAL)
 
     # ------------------------------------------------------------------
     # Popen and PID file bookkeeping

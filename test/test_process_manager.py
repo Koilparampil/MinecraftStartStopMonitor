@@ -75,7 +75,7 @@ class TestBuildLaunchCommand:
             r'"C:\My Server\start.CMD" nogui', windows=True
         ) == (f'"{CMD}" /d /s /c ""C:\\My Server\\start.CMD" nogui"')
         assert build_launch_command(["run.bat", "nogui"], windows=True) == (
-            f'"{CMD}" /d /s /c "run.bat nogui"'
+            f'"{CMD}" /d /s /c ""run.bat" "nogui""'
         )
 
     def test_batch_name_is_not_special_on_posix(self):
@@ -443,9 +443,7 @@ class TestLauncherOutlivingTheServer:
     @staticmethod
     def scan_again(manager, monkeypatch, tree_has_server):
         answers = iter(tree_has_server)
-        monkeypatch.setattr(
-            manager, "_tree_has_server", lambda _tracked, _target: next(answers)
-        )
+        monkeypatch.setattr(manager, "_tree_has_server", lambda *_args: next(answers))
         return [manager.observe().tracked_running for _ in tree_has_server]
 
 
@@ -540,17 +538,31 @@ class TestWindowsCommandLine:
     @pytest.mark.parametrize(
         "command",
         [
-            ["C:\\Servers\\R&D\\run.bat", "nogui"],
-            ["run.bat", "-Dmotd=Tom&Jerry", "nogui"],
             ["run.bat", "say %PATH%"],
+            ["C:\\100%\\run.bat", "nogui"],
             ["run.cmd", 'say "hi there"'],
-            ["run.bat", "a^b|c"],
-            ["run.bat", "<input"],
+            ["run.bat", "line\nbreak"],
         ],
     )
-    def test_batch_list_with_cmd_metacharacters_is_refused(self, command):
+    def test_batch_list_with_unquotable_elements_is_refused(self, command):
         with pytest.raises(ValueError, match="as one string"):
             build_launch_command(command, windows=True)
+
+    def test_batch_list_elements_are_quoted_so_metacharacters_are_literal(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("COMSPEC", CMD)
+        command = [r"C:\Servers\R&D Server\run.bat", "-Dmotd=Tom&Jerry", "a^b|<c>"]
+
+        assert build_launch_command(command, windows=True) == (
+            f'"{CMD}" /d /s /c ""C:\\Servers\\R&D Server\\run.bat" '
+            '"-Dmotd=Tom&Jerry" "a^b|<c>""'
+        )
+
+    def test_a_trailing_backslash_cannot_escape_the_closing_quote(self):
+        line = build_launch_command(["run.bat", "C:\\worlds\\"], windows=True)
+
+        assert line.endswith('"C:\\worlds\\\\""')
 
     def test_relative_program_is_resolved_against_the_server_dir(self):
         server = r"C:\Servers\mc"
@@ -637,3 +649,59 @@ class TestLaunchHints:
         log = open(mock_settings.data_path("server-console.log"), encoding="utf-8")
         with log:
             assert hint in log.read()
+
+
+class FakeMember:
+    """A remembered descendant (psutil.Process stand-in)."""
+
+    def __init__(self, pid, cmdline, alive=True):
+        self.pid = pid
+        self.cmdline = cmdline
+        self.alive = alive
+
+    def is_running(self):
+        return self.alive
+
+    def status(self):
+        return psutil.STATUS_RUNNING
+
+    def as_dict(self, attrs=None, ad_value=None):
+        name = os.path.basename(self.cmdline[0])
+        return {"name": name, "exe": "", "cmdline": self.cmdline}
+
+
+class TestLeftoversAfterTheLauncherExited:
+    """The launcher is gone; only processes it started remain (R2, R14)."""
+
+    @pytest.fixture
+    def tracked(self, manager, mock_settings, monkeypatch):
+        mock_settings.processName = "java"
+        identity = ProcessIdentity(4242, 10.0)
+        manager.set_known_identity(identity)
+        monkeypatch.setattr(manager, "_root_alive", lambda _identity: False)
+        monkeypatch.setattr(manager, "find_process_identity", lambda: None)
+        return identity
+
+    def test_a_background_helper_does_not_keep_the_server_running(
+        self, manager, tracked
+    ):
+        manager._remember([FakeMember(5001, ["sleep", "600"])], tracked)
+
+        assert manager.identity_is_running(tracked) is False  # start guard
+        scans = [manager.observe().tracked_running for _ in range(3)]
+        assert scans == [True, False, False]
+
+    def test_the_jvm_outliving_its_launcher_keeps_it_running(self, manager, tracked):
+        jvm = FakeMember(5002, ["java", "-jar", "server.jar"])
+        manager._remember([jvm, FakeMember(5001, ["sleep", "600"])], tracked)
+
+        assert manager.identity_is_running(tracked) is True
+        assert [manager.observe().tracked_running for _ in range(3)] == [True] * 3
+
+        jvm.alive = False  # it saved and exited; the helper lingers
+        assert [manager.observe().tracked_running for _ in range(2)] == [True, False]
+
+    def test_nothing_left_is_an_exit_at_once(self, manager, tracked):
+        manager._remember([FakeMember(5001, ["sleep", "600"], alive=False)], tracked)
+
+        assert manager.observe().tracked_running is False

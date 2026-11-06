@@ -6,6 +6,7 @@ Real sockets on free ports, a line-based fake of sleeping.handle_connection
 and a fake controller.
 """
 
+import contextlib
 import errno
 import json
 import socket
@@ -17,6 +18,7 @@ import pytest
 from src.auto_start import (
     AccessPolicy,
     _ListenCycle,
+    BUSY_MESSAGE,
     AutoStartManager,
     ConnectionSlots,
     ListenerOptions,
@@ -65,6 +67,9 @@ def fake_handler(conn, ip, config, is_allowed, timeout=5.0):
     kind, _, name = data.decode().strip().partition(" ")
     if kind != "LOGIN":
         conn.sendall(f"MOTD {config.motd}\n".encode())
+        conn.settimeout(timeout)  # like the real exchange: wait for the PING
+        with contextlib.suppress(OSError):
+            conn.recv(64)
         return ConnectionOutcome(ConnectionKind.STATUS)
     allowed, message = is_allowed(name, ip)
     reply = config.kick_message if allowed else message
@@ -72,9 +77,20 @@ def fake_handler(conn, ip, config, is_allowed, timeout=5.0):
     return ConnectionOutcome(ConnectionKind.LOGIN, player_name=name, wake=allowed)
 
 
-def line_complete(data):
+class LineRequests:
     """The fake protocol's request is one line."""
-    return data.endswith(b"\n")
+
+    @staticmethod
+    def classify(data):
+        if not data.endswith(b"\n"):
+            return None
+        return "login" if data.startswith(b"LOGIN") else "status"
+
+    @staticmethod
+    def busy_reply(kind, data, config):
+        if kind == "login":
+            return f"DENY {BUSY_MESSAGE}\n".encode()
+        return f"MOTD {config.motd}\n".encode()
 
 
 def talk(port, line, host="127.0.0.1"):
@@ -135,7 +151,7 @@ def make_manager(port):
             options=options,
             connection_handler=fake_handler,
             access_policy=policy or AllowAll(),
-            request_complete=line_complete,
+            requests=LineRequests(),
         )
         managers.append(manager)
         return manager, controller
@@ -687,37 +703,116 @@ class TestAdmission:
             for sock in idle:
                 sock.close()
 
-    def test_when_every_slot_is_busy_a_join_is_told_to_retry(self, port):
+    def test_when_every_slot_holds_a_login_a_join_is_told_to_retry(self, port):
         gate = threading.Event()
-        calls = []
+
+        class DenySlow:
+            def check(self, name, ip):
+                return name != "Slow", "go away"
 
         def handler(conn, ip, config, is_allowed, timeout=5.0):
             outcome = fake_handler(conn, ip, config, is_allowed, timeout)
-            calls.append(outcome)
-            if len(calls) == 1:
-                gate.wait(3)  # holds the only slot after its request arrived
+            if outcome.player_name == "Slow":
+                gate.wait(3)  # a login holding the only slot
             return outcome
 
         controller = FakeController(port)
-        options = ListenerOptions(accept_timeout=0.05, max_connections=1)
         manager = AutoStartManager(
             controller,
             EventBus(),
-            options=options,
+            options=ListenerOptions(accept_timeout=0.05, max_connections=1),
             connection_handler=handler,
-            access_policy=AllowAll(),
-            request_complete=line_complete,
+            access_policy=DenySlow(),
+            requests=LineRequests(),
         )
         try:
             manager.listen()
             wait_until(lambda: manager.is_listening)
-            assert talk(port, "STATUS").startswith("MOTD ")
-            reply = talk(port, "LOGIN Steve")
-            assert reply == "DENY Too many connections, try again in a moment."
+            assert talk(port, "LOGIN Slow") == "DENY go away"
+            wait_until(lambda: manager.active_connections == 1)
+            assert talk(port, "LOGIN Steve") == f"DENY {BUSY_MESSAGE}"
+            assert talk(port, "STATUS").startswith("MOTD ")  # pings still answered
             assert not controller.started.is_set()
         finally:
             gate.set()
             manager.close()
+
+    def test_a_ping_without_the_ping_packet_is_dropped_quickly(
+        self, make_manager, port
+    ):
+        options = ListenerOptions(accept_timeout=0.05, status_timeout=0.3)
+        manager, _ = make_manager(options=options)
+        manager.listen()
+        wait_until(lambda: manager.is_listening)
+        with idle_socket(port) as sock:
+            sock.sendall(b"STATUS\n")
+            started = time.monotonic()
+            reply = b""
+            while not reply.endswith(b"\n"):
+                reply += sock.recv(256)
+            assert reply.startswith(b"MOTD ")
+            assert sock.recv(16) == b""  # never sent the PING: dropped
+            assert time.monotonic() - started < 1.5
+
+    def test_stalled_pings_and_idle_sockets_cannot_block_a_wake(
+        self, make_manager, port
+    ):
+        """The verifier's sustained attack, scaled down: lanes from 6
+        addresses (4 each, so more than the slots) that send a ping and never
+        the PING packet, or nothing at all, and reconnect when dropped."""
+        options = ListenerOptions(
+            accept_timeout=0.02,
+            request_timeout=5.0,
+            status_timeout=5.0,  # eviction alone has to make room
+            eviction_grace=0.05,
+            max_connections=8,
+            release_timeout=3.0,
+        )
+        manager, controller = make_manager(options=options)
+        manager.listen()
+        wait_until(lambda: manager.is_listening)
+        stop = threading.Event()
+
+        def lane(source, stalled_ping):
+            while not stop.is_set():
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.bind((source, 0))
+                    sock.settimeout(0.2)
+                    sock.connect(("127.0.0.1", port))
+                    if stalled_ping:
+                        sock.sendall(b"STATUS\n")
+                    while not stop.is_set():
+                        try:
+                            if sock.recv(256) == b"":
+                                break  # dropped by the listener: reconnect
+                        except TimeoutError:
+                            continue
+                except OSError:
+                    pass
+                finally:
+                    sock.close()
+
+        lanes = [
+            threading.Thread(
+                target=lane, args=(f"127.0.3.{n}", n % 2 == 0), daemon=True
+            )
+            for n in range(1, 7)
+            for _ in range(4)
+        ]
+        for thread in lanes:
+            thread.start()
+        try:
+            wait_until(lambda: manager.active_connections == 8)
+            time.sleep(0.2)
+            for _ in range(3):
+                if talk_from(port, "LOGIN Steve", "127.0.0.2").startswith("KICK "):
+                    break
+            assert controller.started.wait(3)
+        finally:
+            stop.set()
+            for thread in lanes:
+                thread.join(2)
 
     def test_connection_slots(self):
         class Conn:
@@ -738,13 +833,18 @@ class TestAdmission:
         now[0] = 2.0
         a3 = slots.admit(conns[2], "a")  # evicts the oldest pending one of "a"
         assert a3 and a1.evicted and conns[0].shut_down
-        assert not slots.promote(a1)
-        assert slots.promote(a2) and slots.promote(a3)
+        assert not slots.promote(a1, "login")
+        assert slots.promote(a2, "login") and slots.promote(a3, "login")
         b1 = slots.admit(conns[3], "b")
-        assert slots.promote(b1)
-        assert slots.admit(conns[4], "c") is None  # global cap; all established
-        slots.release(a2)
-        assert slots.admit(conns[4], "c") is not None
+        assert slots.promote(b1, "status")
+        assert slots.admit(conns[4], "c") is None  # the ping is too young
+        now[0] = 4.0
+        c1 = slots.admit(conns[4], "c")  # evicts the old ping, never a login
+        assert c1 and b1.evicted and not a2.evicted and not a3.evicted
+        assert slots.admit(conns[0], "d") is None  # pending c1 is too young
+        d1 = slots.admit(conns[0], "d", phase="login")  # a login evicts it anyway
+        assert d1 and c1.evicted
+        assert slots.admit(conns[1], "e", phase="login") is None  # all logins
         assert slots.in_use == 3
 
     @pytest.mark.parametrize(
@@ -850,3 +950,59 @@ class TestStatus:
         )
         manager.stop_listening()
         assert manager.status() == idle
+
+
+# ----------------------------------------------------------------------
+# Minecraft request recognition (the real protocol)
+# ----------------------------------------------------------------------
+
+
+def handshake(next_state, protocol=763):
+    from src.minecraft.protocol import encode_string, encode_varint, frame_packet
+
+    body = (
+        encode_varint(protocol)
+        + encode_string("play.example\0FML2\0")
+        + (25565).to_bytes(2, "big")
+        + encode_varint(next_state)
+    )
+    return frame_packet(0x00, body)
+
+
+class TestMinecraftRequests:
+    def test_classify(self):
+        from src.auto_start import MinecraftRequests
+        from src.minecraft.protocol import encode_string, frame_packet
+
+        classify = MinecraftRequests.classify
+        status = handshake(1) + frame_packet(0x00)
+        login = handshake(2) + frame_packet(0x00, encode_string("Steve"))
+        assert classify(b"") is None
+        assert classify(status[:-1]) is None  # incomplete
+        assert classify(status) == "status"
+        assert classify(login) == "login"
+        assert classify(b"\xfe\x01") == "legacy"
+        with pytest.raises(ValueError):
+            classify(b"\xff\xff\xff\xff")
+
+    def test_busy_replies(self, mock_settings):
+        from src.auto_start import MinecraftRequests
+        from src.minecraft.protocol import PacketReader, frame_packet
+        from src.minecraft.sleeping import SleepingServerConfig
+
+        config = SleepingServerConfig("zzz", "Sleeping", None, 20, "data:x", "starting")
+
+        def payload(frame):
+            reader = PacketReader(frame[1:] if frame[0] < 0x80 else frame[2:])
+            assert reader.read_varint() == 0x00
+            return json.loads(reader.read_string(None))
+
+        login = MinecraftRequests.busy_reply("login", b"", config)
+        assert payload(login) == {"text": BUSY_MESSAGE}
+        status = MinecraftRequests.busy_reply(
+            "status", handshake(1, protocol=47) + frame_packet(0x00), config
+        )
+        reply = payload(status)
+        assert reply["version"]["protocol"] == 47
+        assert reply["description"] == {"text": "zzz"} and "favicon" not in reply
+        assert MinecraftRequests.busy_reply("legacy", b"\xfe", config) is None

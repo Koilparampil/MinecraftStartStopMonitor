@@ -188,7 +188,7 @@
     window.location.assign('/login' + query);
   }
 
-  function api(path, fields) {
+  function api(path, fields, retried) {
     var options = {
       method: fields ? 'POST' : 'GET',
       credentials: 'same-origin',
@@ -211,6 +211,14 @@
       }
       return response.json().catch(function () { return null; }).then(function (data) {
         if (!data) throw new Error('Unexpected response from the monitor (HTTP ' + response.status + ').');
+        if (fields && !retried && response.status === 400 && data.csrfError) {
+          // The session was renewed elsewhere (another tab, the live stream):
+          // fetch its token and try once more.
+          return api('/csrf').then(function (result) {
+            if (result.data && result.data.csrfToken) adoptCsrfToken(result.data.csrfToken);
+            return api(path, fields, true);
+          });
+        }
         return { ok: response.ok, status: response.status, data: data };
       });
     }, function () {
@@ -361,6 +369,8 @@
       view.autoStopDelay = payload.autoStopDelay;
     }
     if (payload.monitor && typeof payload.monitor === 'object') view.monitor = payload.monitor;
+    if ('rconStatus' in payload) view.monitor = Object.assign({}, view.monitor, { rconStatus: payload.rconStatus });
+    if (typeof payload.csrfToken === 'string' && payload.csrfToken) adoptCsrfToken(payload.csrfToken);
     return applySnapshot(payload.data);
   }
 
@@ -399,18 +409,18 @@
     return view.monitor ? view.monitor.rconStatus : null;
   }
 
-  var NO_RCON = 'Needs RCON (enable-rcon in server.properties)';
+  var RCON_PROBLEMS = {
+    disabled: 'RCON is off (enable-rcon in server.properties)',
+    auth_failed: 'RCON login failed — check rcon.password',
+    unreachable: 'RCON is not answering'
+  };
 
   // Why RCON features (kick, ban, console) cannot work right now, or null.
+  // "unknown" (not tried yet) is neutral, and a roster read over RCON proves
+  // it works whatever an older status said.
   function rconBlocker(snapshot) {
-    switch (rconStatus()) {
-      case 'ok': return null;
-      case 'auth_failed': return 'RCON login failed — check rcon.password';
-      case 'disabled': return NO_RCON;
-      case 'unreachable': return 'RCON is not answering';
-      default:  // not tried yet or not reported: go by how the roster was read
-        return snapshot.server && snapshot.server.source === 'ping' ? NO_RCON : null;
-    }
+    if (snapshot.server && snapshot.server.source === 'rcon') return null;
+    return RCON_PROBLEMS[rconStatus()] || null;
   }
 
   // STARTING/LOADING -> STOPPED that nobody asked for: the launch failed or
@@ -945,8 +955,12 @@
   // Server facts and info (icon, mods, address)
   // ---------------------------------------------------------------------
 
-  var SOURCES = { rcon: 'RCON', ping: 'Status ping (no RCON)' };
-  var PING_BECAUSE = { auth_failed: 'Status ping (RCON login failed)', unreachable: 'Status ping (RCON not answering)' };
+  var SOURCES = { rcon: 'RCON', ping: 'Status ping' };
+  var PING_BECAUSE = {
+    disabled: 'Status ping (RCON off)',
+    auth_failed: 'Status ping (RCON login failed)',
+    unreachable: 'Status ping (RCON not answering)'
+  };
 
   function sourceLabel(server) {
     if (server.source === 'ping' && PING_BECAUSE[rconStatus()]) return PING_BECAUSE[rconStatus()];
@@ -1275,12 +1289,20 @@
       view.previousStatus = null;
       retryDelay = 2000;
       setConnection('live', 'Live');
+      if (live.role === 'leader') post('reset');
     };
     source.onmessage = function (event) {
+      var payload;
       try {
-        applyPayload(JSON.parse(event.data));
+        payload = JSON.parse(event.data);
       } catch (error) {
         window.console.error('Bad stream message', error);
+        return;
+      }
+      applyPayload(payload);
+      if (live.role === 'leader') {
+        live.lastPayload = payload;
+        post('payload', payload);
       }
     };
     source.onerror = function () {
@@ -1298,29 +1320,120 @@
   }
 
   function reconnectStream() {
-    if (document.hidden) pauseStream();
+    if (document.hidden) stopLive();
     else connectStream();
   }
 
-  // Browsers allow only six HTTP/1.1 connections per host: a hidden tab must
-  // not hold one for its live stream, or a few open tabs freeze them all.
-  var pauseTimer = null;
-
-  function pauseStream() {
+  function closeStream() {
     window.clearTimeout(retryTimer);
     if (stream) stream.close();
     stream = null;
+  }
+
+  // ---------------------------------------------------------------------
+  // One live stream per browser, shared between tabs
+  // ---------------------------------------------------------------------
+  // Browsers allow six HTTP/1.1 connections per host, and every stream holds
+  // one. One visible tab (the leader) streams and relays each message over a
+  // BroadcastChannel; the other tabs follow, and one takes over when the
+  // leader goes quiet. Hidden tabs hold no stream at all. Without
+  // BroadcastChannel every visible tab streams on its own.
+
+  var TAB_ID = Date.now().toString(36) + Math.random().toString(36).slice(2);
+  var HEARTBEAT_MS = 2000;
+  var LEADER_TIMEOUT_MS = 5000;
+  var channel = openChannel();
+  var live = { role: 'paused', leaderSeenAt: 0, lastPayload: null };
+  var pauseTimer = null;
+
+  function openChannel() {
+    try {
+      return window.BroadcastChannel ? new window.BroadcastChannel('mcmonitor-live') : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function post(type, payload) {
+    if (channel) channel.postMessage({ from: TAB_ID, type: type, payload: payload || null });
+  }
+
+  function startLive() {
+    if (!channel) {
+      live.role = 'leader';
+      connectStream();
+      return;
+    }
+    if (live.role === 'leader' || live.role === 'follower') return;
+    live.role = 'candidate';
+    setConnection('connecting', 'Connecting…');
+    post('hello');
+    window.setTimeout(function () {
+      if (live.role !== 'candidate') return;
+      if (Date.now() - live.leaderSeenAt < LEADER_TIMEOUT_MS) becomeFollower();
+      else becomeLeader();
+    }, 400 + Math.random() * 300);
+  }
+
+  function becomeLeader() {
+    live.role = 'leader';
+    connectStream();
+  }
+
+  function becomeFollower() {
+    if (live.role === 'leader') closeStream();
+    live.role = 'follower';
+    view.revision = -1;
+    view.previousStatus = null;
+    setConnection('live', 'Live');
+  }
+
+  function stopLive() {
+    if (live.role === 'leader') post('bye');
+    live.role = 'paused';
+    closeStream();
     setConnection('paused', 'Paused while the tab is hidden');
   }
 
+  function onChannelMessage(event) {
+    var message = event.data || {};
+    if (message.from === TAB_ID) return;
+    if (message.type === 'hello' && live.role === 'leader') {
+      post('leader');
+      // Bring the newcomer up to date, with this session's token.
+      if (live.lastPayload) post('payload', Object.assign({}, live.lastPayload, { csrfToken: csrfToken }));
+    } else if (message.type === 'leader' || message.type === 'payload') {
+      live.leaderSeenAt = Date.now();
+      // Two leaders (a race): the one with the smaller id keeps streaming.
+      if (live.role === 'candidate' || (live.role === 'leader' && message.from < TAB_ID)) becomeFollower();
+      if (message.type === 'payload' && live.role === 'follower') applyPayload(message.payload);
+    } else if (message.type === 'reset' && live.role === 'follower') {
+      view.revision = -1;
+      view.previousStatus = null;
+    } else if (message.type === 'bye' && live.role === 'follower') {
+      live.leaderSeenAt = 0;
+      window.setTimeout(liveTick, Math.random() * 500);  // one follower takes over
+    }
+  }
+
+  function liveTick() {
+    if (live.role === 'leader') post('leader');
+    if (live.role === 'follower' && !document.hidden && Date.now() - live.leaderSeenAt > LEADER_TIMEOUT_MS) {
+      becomeLeader();
+    }
+  }
+
   function wireStreamVisibility() {
+    if (channel) channel.onmessage = onChannelMessage;
+    window.addEventListener('pagehide', function () { if (live.role === 'leader') post('bye'); });
+    window.setInterval(liveTick, HEARTBEAT_MS);
     document.addEventListener('visibilitychange', function () {
       window.clearTimeout(pauseTimer);
       if (document.hidden) {
-        pauseTimer = window.setTimeout(pauseStream, STREAM_PAUSE_MS);
-      } else if (!stream) {
-        connectStream();
-        loadInfo();
+        pauseTimer = window.setTimeout(stopLive, STREAM_PAUSE_MS);
+      } else if (live.role === 'paused') {
+        // One request renews a lapsed session first, then the stream starts.
+        loadInfo().then(startLive);
       }
     });
   }
@@ -1344,7 +1457,9 @@
     wireConsole();
     wireStreamVisibility();
     if (boot.payload) applyPayload(boot.payload);
-    connectStream();
+    // A tab opened in the background holds no stream until it is shown.
+    if (document.hidden) setConnection('paused', 'Paused while the tab is hidden');
+    else startLive();
     loadInfo();
     refreshConsole(true);
     window.setInterval(function () { renderCountdown(); renderUptime(); }, 1000);

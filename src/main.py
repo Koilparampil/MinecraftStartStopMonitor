@@ -30,10 +30,13 @@ from src.player_manager import PlayerManager
 from src.process_manager import ProcessStateUnknown, create_process_manager
 from src.settings import SENSITIVE_SETTINGS, settings
 from src.setup_wizard import (
+    SettingsWriteError,
+    command_line_config,
     detect_server_dir,
     interactive_setup,
     no_terminal_help,
     print_web_link,
+    write_settings_file,
 )
 
 logger = logging.getLogger("src.main")
@@ -168,15 +171,28 @@ def _stdin_is_a_terminal():
         return False
 
 
+def save_command_line_settings(settings_path, args):
+    """No terminal, but the command line has everything: save it as the
+    settings file the wizard would write (0600, atomic). False = exit 1."""
+    values = {k: v for k, v in vars(args).items() if v is not None and k != "settings"}
+    try:
+        config = command_line_config(values)
+    except ValueError as e:
+        print(f"error: {e}")
+        return False
+    write_settings_file(settings_path, config)
+    print(f"No settings file: saved the command-line settings to {settings_path}")
+    return True
+
+
 def run_first_time_setup(settings_path, args):
     """No settings file: the interactive wizard (pre-filled from the command
-    line), or just the command line when it is complete and there is no
-    terminal to ask on. False = exit 1."""
-    if cli_settings_complete(args) and not _stdin_is_a_terminal():
-        logger.info(f"No settings file at {settings_path}: using the command line")
-        return True
-    given = {key: getattr(args, key, None) for key in WIZARD_FLAGS}
+    line), or, without a terminal, a settings file saved from a complete
+    command line. False = exit 1."""
     try:
+        if cli_settings_complete(args) and not _stdin_is_a_terminal():
+            return save_command_line_settings(settings_path, args)
+        given = {key: getattr(args, key, None) for key in WIZARD_FLAGS}
         interactive_setup(settings_path, detect_server_dir(), given=given)
         return True
     except EOFError:
@@ -185,9 +201,15 @@ def run_first_time_setup(settings_path, args):
             print(line)
     except KeyboardInterrupt:
         print("\nSetup cancelled; nothing was saved.")
-    except OSError as e:
-        print(f"error: cannot write the settings file {settings_path}: {e}")
+    except SettingsWriteError as e:
+        print(
+            f"error: cannot write the settings file {settings_path}: {e.strerror or e}"
+        )
         print("Choose a writable location with --settings PATH.")
+    except OSError as e:
+        where = f": {e.filename}" if e.filename else ""
+        print(f"error: setup failed ({e.strerror or e}{where}).")
+        print("Run the monitor as the account that owns the server files.")
     return False
 
 

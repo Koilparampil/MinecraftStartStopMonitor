@@ -351,11 +351,21 @@ class Supervisor:
                 return []
             self._deferred_launch = None
             self._launch_due_at = None
-        reason = self._server_process_reason()
-        if reason is not None:
-            # Someone started a server meanwhile: let detection adopt it.
-            logger.warning(f"Delayed start cancelled: {reason}")
+        try:
+            found = self.process_manager.find_process_identity()
+        except Exception:
+            logger.exception("Process discovery failed")
+            logger.warning(f"Delayed start cancelled: {DISCOVERY_FAILED_MESSAGE}")
             self._commit_down()
+            return []
+        if found is not None:
+            # Someone started a server meanwhile: adopt it right away. A
+            # SERVER_STOPPED now would re-arm the listener on its port.
+            logger.warning(
+                "Delayed start cancelled: a server process was started in the "
+                "server directory meanwhile; adopting it"
+            )
+            self._adopt(found)
             return []
         return [request]
 

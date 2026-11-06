@@ -26,6 +26,7 @@ from src.settings import (
     DEFAULT_GAME_PORT,
     DEFAULT_RCON_PORT,
     DEFAULTS,
+    EXAMPLE_WEB_PASSWORD,
     YAML_MAPPING,
     start_command_errors,
 )
@@ -392,17 +393,55 @@ SETTINGS_HEADER = """\
 """
 
 
+class SettingsWriteError(OSError):
+    """settings.yaml itself could not be written (not a server file)."""
+
+
 def check_settings_writable(path):
-    """Raise OSError now if *path* cannot be written (before any question)."""
-    directory = os.path.dirname(os.path.abspath(path))
-    os.makedirs(directory, exist_ok=True)
-    fd, probe = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=directory)
-    os.close(fd)
-    os.unlink(probe)
+    """Raise SettingsWriteError now if *path* cannot be written."""
+    try:
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        fd, probe = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=directory)
+        os.close(fd)
+        os.unlink(probe)
+    except OSError as e:
+        raise SettingsWriteError(e.errno, e.strerror, e.filename) from e
 
 
 def write_settings_file(path, config):
-    """Write *config* as YAML atomically; owner-only permissions on POSIX."""
+    """Write *config* as YAML atomically; owner-only permissions on POSIX.
+    Raises SettingsWriteError."""
+    try:
+        _write_settings_file(path, config)
+    except OSError as e:
+        raise SettingsWriteError(e.errno, e.strerror, e.filename) from e
+
+
+def command_line_config(values):
+    """The settings file the wizard would write, from a complete command line
+    (flat attribute names: serverDir, startCommand, webPassword and any other
+    given flags). Raises ValueError when a value cannot work."""
+    server_dir = os.path.abspath(os.path.expanduser(values["serverDir"]))
+    if not os.path.isdir(server_dir):
+        raise ValueError(f"--server-dir: {server_dir} is not a folder")
+    errors = start_command_errors(values["startCommand"])
+    if errors:
+        raise ValueError(errors[0])
+    password = values.get("webPassword")
+    if password == EXAMPLE_WEB_PASSWORD:
+        raise ValueError(
+            "--web-password is the example password from settings.yaml.example; "
+            "choose your own"
+        )
+    asked = ("serverDir", "startCommand", "webPassword")
+    overrides = {k: v for k, v in values.items() if k not in asked and v is not None}
+    if "webServerPort" not in overrides:
+        overrides["webServerPort"] = choose_dashboard_port(server_dir)
+    return default_config(server_dir, values["startCommand"], password, **overrides)
+
+
+def _write_settings_file(path, config):
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=directory)
@@ -622,11 +661,18 @@ def _apply_server_edits(io, server_dir, rcon_action, accept):
 
 
 def _ask_web_password(io, given=None):
-    if given:
+    if given and given != EXAMPLE_WEB_PASSWORD:
         io.out("  Web dashboard password: taken from --web-password.")
         return given
+    if given:
+        io.out("  --web-password is the example password; choose your own.")
     while True:
         password = io.secret("  Web dashboard password (leave empty to generate one): ")
+        if password == EXAMPLE_WEB_PASSWORD:
+            io.out(
+                "  That is the example password from settings.yaml.example; choose another."
+            )
+            continue
         if not password:
             password = generate_password(WEB_PASSWORD_LENGTH)
             io.out(f"  Generated web dashboard password: {password}")

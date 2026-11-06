@@ -349,3 +349,41 @@ class TestSessionStore:
         assert store.token_count() == 0
         _, token = store.issue_token("e", lifetime=600)
         assert self.make(tmp_path).redeem_token(token, "e")
+
+
+class TestGlobalBackstop:
+    def make(self, threshold=3):
+        clock = WallClock()
+        tracker = LoginAttemptTracker(max_attempts=5, lockout_duration=300, clock=clock)
+        tracker.global_threshold = threshold
+        return tracker, clock
+
+    def test_failures_from_many_addresses_slow_everyone_down(self):
+        tracker, clock = self.make()
+        for n in range(2):
+            tracker.record_failed_attempt(f"10.0.0.{n}")
+        assert tracker.global_wait("10.9.9.9") == 0
+        tracker.record_failed_attempt("10.0.0.2")  # threshold reached
+        assert tracker.global_wait("10.9.9.9") == 1
+        tracker.record_failed_attempt("10.0.0.3")
+        assert tracker.global_wait("10.9.9.9") == 2  # the delay doubles
+        clock.now += 2
+        assert tracker.global_wait("10.9.9.9") == 0
+
+    def test_delay_is_capped_and_window_expires(self):
+        tracker, clock = self.make()
+        for n in range(40):
+            tracker.record_failed_attempt(f"10.0.{n}.1")
+        assert tracker.global_wait("x") == tracker.global_max_delay
+        clock.now += 301
+        tracker.record_failed_attempt("10.1.1.1")  # old failures left the window
+        clock.now += 61
+        assert tracker.global_wait("x") == 0
+
+    def test_known_good_addresses_are_exempt(self):
+        tracker, _ = self.make()
+        tracker.record_successful_login("192.0.2.1")
+        for n in range(10):
+            tracker.record_failed_attempt(f"10.0.0.{n}")
+        assert tracker.global_wait("192.0.2.1") == 0
+        assert tracker.global_wait("10.0.0.99") > 0

@@ -356,20 +356,38 @@ class TestTransitions:
         # No separate start -> start cooldown under-reporting the wait.
         assert command.outcome == ActionResult(True, "Starting the server in 1 s.")
 
-    def test_server_started_by_hand_during_the_debounce_cancels_the_launch(self, env):
+    def test_server_started_by_hand_during_the_debounce_cancels_the_launch(
+        self, env
+    ):
         env.supervisor.server_stopping_cooldown = 5
         stop(env, launch(env))
         env.supervisor.handle(StartCommand())
-        env.pm.found = ProcessIdentity(4001, 40.0)
-        env.pm.alive.add(4001)
+        stopped = len(events_of(env, Event.SERVER_STOPPED))
+        found = ProcessIdentity(4001, 40.0)
+        env.pm.found = found
+        env.pm.alive.add(found.pid)
 
         env.clock.advance(5)
-        assert env.supervisor.on_tick() == []
+        requests = env.supervisor.on_tick()
 
-        assert env.supervisor.state == STOPPED
-        observe(env)
+        # Adopted at once: no launch, and no SERVER_STOPPED that would re-arm
+        # the sleeping listener on the port the new server is about to bind.
+        assert not any(isinstance(r, LaunchRequest) for r in requests)
         assert env.supervisor.state == RUNNING
-        assert env.pm.tracked_identity == ProcessIdentity(4001, 40.0)
+        assert env.pm.tracked_identity == found
+        assert len(events_of(env, Event.SERVER_STOPPED)) == stopped
+        assert events_of(env, Event.SERVER_STARTED)[-1]["pid"] == found.pid
+
+    def test_discovery_failure_at_the_due_time_cancels_the_launch(self, env):
+        env.supervisor.server_stopping_cooldown = 5
+        stop(env, launch(env))
+        env.supervisor.handle(StartCommand())
+        env.pm.find_error = RuntimeError("scan failed")
+
+        env.clock.advance(5)
+
+        assert env.supervisor.on_tick() == []
+        assert env.supervisor.state == STOPPED
 
     def test_deferred_launch_is_dropped_by_a_newer_generation(self, env):
         env.supervisor.server_stopping_cooldown = 5

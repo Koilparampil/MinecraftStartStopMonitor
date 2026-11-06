@@ -89,6 +89,9 @@ class LifecycleRuntime:
         self._process_requests: queue.Queue = queue.Queue()
 
         self._closing = threading.Event()
+        # Set on every committed state change (and on close): the detection
+        # worker scans at once instead of finishing a RUNNING-cadence wait.
+        self._wake_detection = threading.Event()
         self._started = False
         self._start_lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
@@ -115,6 +118,7 @@ class LifecycleRuntime:
 
             self._started = True
             self._closing.clear()
+            self._wake_detection.clear()
             targets = {
                 LIFECYCLE_THREAD: self._supervisor_loop,
                 DETECTION_THREAD: self._detection_worker,
@@ -138,6 +142,7 @@ class LifecycleRuntime:
                 return
             self._started = False
             self._closing.set()
+            self._wake_detection.set()
             self._observations.put(_SHUTDOWN)
             for requests in (self._poll_requests, self._process_requests):
                 requests.put(_SHUTDOWN)
@@ -185,6 +190,7 @@ class LifecycleRuntime:
     def _supervisor_loop(self):
         while not self._closing.is_set():
             timeout = self.supervisor.next_timeout()
+            state = self.supervisor.state
             try:
                 item = self._observations.get(timeout=timeout)
             except queue.Empty:
@@ -236,7 +242,8 @@ class LifecycleRuntime:
                     logger.info("Process detection works again")
                 unknown = False
                 self._observations.put(ProcessObservation(generation, snapshot))
-            self._closing.wait(self._detection_interval())
+            self._wake_detection.wait(self._detection_interval())
+            self._wake_detection.clear()
 
     def _detection_interval(self) -> float:
         rate = _polling_rate()

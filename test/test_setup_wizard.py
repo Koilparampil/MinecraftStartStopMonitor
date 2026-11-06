@@ -597,3 +597,25 @@ class TestQaFixes:
 
     def test_no_terminal_help_mentions_the_password(self, tmp_path):
         assert "web.password" in no_terminal_help(str(tmp_path / "s.yaml"))[1]
+
+
+class TestExamplePassword:
+    def test_typed_example_password_is_refused(self, tmp_path, forge_server):
+        script = Script(["", "", "n", "yes"], secrets=["changeme", "mine", "mine"])
+        config = run_wizard(tmp_path / "settings.yaml", str(forge_server), script)
+        assert config["web"]["password"] == "mine"
+        assert "example password" in script.text
+
+    def test_example_password_from_the_command_line_is_asked_again(
+        self, tmp_path, forge_server
+    ):
+        script = Script(["", "", "n", "yes"], secrets=["mine", "mine"])
+        config = interactive_setup(
+            str(tmp_path / "settings.yaml"),
+            str(forge_server),
+            given={"webPassword": "changeme"},
+            ask=script.ask,
+            ask_secret=script.ask_secret,
+            out=script.out,
+        )
+        assert config["web"]["password"] == "mine"

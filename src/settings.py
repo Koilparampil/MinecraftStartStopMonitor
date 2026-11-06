@@ -599,8 +599,8 @@ class Settings:
             errors.append("web.password is required when the web server is enabled")
         elif password == EXAMPLE_WEB_PASSWORD:
             errors.append(
-                f"web.password is still the example value '{EXAMPLE_WEB_PASSWORD}': "
-                "choose your own password"
+                "web.password is still the example password from "
+                "settings.yaml.example: choose your own"
             )
         return errors
 
@@ -633,6 +633,9 @@ class Settings:
             )
         warnings += self._server_dir_warnings()
         warnings += start_command_warnings(
+            self.get("startCommand"), self.get("serverDir")
+        )
+        warnings += restart_loop_warnings(
             self.get("startCommand"), self.get("serverDir")
         )
         return warnings
@@ -751,6 +754,29 @@ def start_command_warnings(command, server_dir, os_name=None):
             )
         ]
     return []
+
+
+def restart_loop_warnings(command, server_dir):
+    """Warn when startCommand runs a start script that restarts the server in
+    a loop (checked at every startup, not only by the setup wizard)."""
+    if not server_dir or not os.path.isdir(server_dir) or not command:
+        return []
+    from src.setup_wizard import restart_loop_scripts
+
+    loops = set(restart_loop_scripts(server_dir))
+    if not loops:
+        return []
+    tokens = command if isinstance(command, (list, tuple)) else str(command).split()
+    names = {
+        os.path.basename(str(token).strip("\"'").replace("\\", "/")) for token in tokens
+    }
+    return [
+        f"minecraft.startCommand runs {name}, which looks like it restarts the "
+        "server in a loop: auto-stop cannot work (the script starts the server "
+        "again). Launch the server directly instead (e.g. ./run.sh nogui or "
+        "java -jar ...)."
+        for name in sorted(loops & names)
+    ]
 
 
 # ----------------------------------------------------------------------
