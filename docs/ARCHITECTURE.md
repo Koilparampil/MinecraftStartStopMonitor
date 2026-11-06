@@ -340,8 +340,10 @@ light/dark theme, mobile friendly. Original artwork only — no Mojang assets.
   - With a TTY, the interactive wizard runs. CLI values (`--server-dir`,
     `--start-command`, `--web-password`) prefill or skip their questions.
   - Without a TTY, a complete command line is used instead: `--server-dir`,
-    `--start-command`, and `--web-password` or `--no-web`. Otherwise the monitor
-    prints how to create the settings and exits 1.
+    `--start-command`, and `--web-password` or `--no-web`. Those values are
+    validated and saved to `settings.yaml` (0600, wizard format; server files
+    untouched), so later runs need no flags. Otherwise the monitor prints how
+    to create the settings and exits 1.
   - Before asking anything, the wizard checks that `settings.yaml` is
     writable. It saves `settings.yaml` (0600) *before* editing
     `server.properties` or `eula.txt`, so cancelling anywhere changes nothing.

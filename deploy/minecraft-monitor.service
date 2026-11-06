@@ -1,9 +1,11 @@
 # Example systemd unit for running minecraft-monitor as a service on Linux.
 #
 # Prerequisites:
-#   - Run minecraft-monitor manually once and finish the interactive first-run
-#     setup: settings.yaml must already exist (systemd has no terminal for the
-#     setup questions). Accept the Minecraft EULA there or in eula.txt.
+#   - settings.yaml must already exist. Run minecraft-monitor once in a
+#     terminal (interactive setup), or once with --server-dir, --start-command
+#     and --web-password (it saves settings.yaml, then keeps running; stop it).
+#     Don't leave --web-password in ExecStart: command lines are world-readable.
+#     Accept the Minecraft EULA in the setup or in eula.txt.
 #
 # Install:
 #   1. Copy this file to /etc/systemd/system/minecraft-monitor.service

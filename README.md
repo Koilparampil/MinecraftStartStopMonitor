@@ -86,7 +86,11 @@ same user, so it can start, find and stop the server process.
      `eula.txt`.
 
    Without a terminal (e.g. a service), pass `--server-dir`, `--start-command`
-   and `--web-password` (or `--no-web`) on the first run instead.
+   and `--web-password` (or `--no-web`) once instead. The monitor saves them to
+   `settings.yaml` (owner-only permissions) and later runs need no flags.
+   `server.properties` and `eula.txt` are left untouched, so enable RCON and
+   accept the EULA yourself. Don't keep `--web-password` in a unit file, because
+   command lines are visible to every user.
 3. Open **http://localhost:25580** and log in (username `admin`). The wizard
    picks another free port if 25580 clashes with your game, RCON or query port.
 
@@ -214,8 +218,9 @@ instead of filling the server log.
 
 ## Running as a service (Linux)
 
-Run the monitor under systemd so it survives reboots. Complete the first-run
-setup manually once (systemd has no terminal for the wizard), then:
+Run the monitor under systemd so it survives reboots. Create `settings.yaml`
+first: run the wizard once in a terminal, or run once with the flags shown in
+the quick start. Then:
 
 ```bash
 sudo cp deploy/minecraft-monitor.service /etc/systemd/system/

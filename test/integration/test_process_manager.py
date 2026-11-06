@@ -680,19 +680,95 @@ class TestLauncherDiesBeforeItsServer:
             target=lambda: result.append(pm.terminate_process(stop_request.identity))
         )
         stopper.start()
-        while stopper.is_alive():  # the detection worker keeps scanning
+        relaunch = None
+        while stopper.is_alive() and relaunch is None:  # the detection worker
             requests = supervisor.handle(
                 ProcessObservation(supervisor.generation, pm.observe())
             )
-            assert requests == []
-            assert supervisor.state == LifecycleState.STOPPING
-            assert supervisor.restart_pending is True
-            time.sleep(0.1)
+            if requests:
+                # Detection saw the whole server gone before the stop returned:
+                # only once the saving child had exited.
+                [relaunch] = requests
+                assert gone(ProcessIdentity(child.pid))
+                assert env.marker("saved-sigterm")
+            else:
+                assert supervisor.state == LifecycleState.STOPPING
+                assert supervisor.restart_pending is True
+                time.sleep(0.1)
         stopper.join()
 
-        [relaunch] = supervisor.handle(
+        late = supervisor.handle(
             StopResult(stop_request.generation, stop_request.identity, result[0])
         )
+        if relaunch is None:
+            [relaunch] = late
+        else:
+            assert late == []  # the stop result of the old generation is stale
         assert isinstance(relaunch, LaunchRequest)
         assert supervisor.state == LifecycleState.STARTING
         assert env.marker("saved-sigterm") and gone(ProcessIdentity(child.pid))
+
+
+@POSIX_ONLY
+class TestBackgroundHelper:
+    """run.sh starts a helper in the background (a tunnel, a backup loop)
+    before the server; it never counts as the server (R2, R14)."""
+
+    @pytest.fixture
+    def helper_env(self, env):
+        script = os.path.join(env.server_dir, "run.sh")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(f'#!/bin/sh\nsleep 600 &\n"{sys.executable}" "{env.script}" "$@"\n')
+        os.chmod(script, 0o755)
+        env.settings.startCommand = "./run.sh nogui"
+        return env
+
+    def launch(self, env, pm):
+        wrapper = env.launch(pm)
+        wait_ready(env)
+        root = psutil.Process(wrapper.pid)
+        wait_until(lambda: len(root.children(recursive=True)) == 2)
+        processes = root.children(recursive=True)
+        for process in processes:
+            env.own(process.pid)
+        [server] = [p for p in processes if PROCESS_NAME in " ".join(p.cmdline())]
+        [helper] = [p for p in processes if p is not server]
+        pm.observe()  # remembers both, as the detection worker does
+        return wrapper, server, helper
+
+    @staticmethod
+    def scans_after_exit(pm, wrapper, server):
+        wait_until(lambda: gone(ProcessIdentity(server.pid)) and gone(wrapper))
+        return [pm.observe().tracked_running for _ in range(3)]
+
+    def test_a_crash_is_detected_while_the_helper_lives(self, helper_env):
+        pm = helper_env.manager()
+        wrapper, server, helper = self.launch(helper_env, pm)
+
+        server.kill()
+
+        assert self.scans_after_exit(pm, wrapper, server) == [True, False, False]
+        assert helper.is_running()
+        assert pm.identity_is_running(wrapper) is False  # no "already running"
+
+    def test_an_in_game_stop_is_detected_while_the_helper_lives(self, helper_env):
+        pm = helper_env.manager()
+        wrapper, server, helper = self.launch(helper_env, pm)
+
+        helper_env.stop_file.write_text("stop", encoding="utf-8")  # /stop
+
+        assert self.scans_after_exit(pm, wrapper, server) == [True, False, False]
+        assert helper_env.marker("saved-rcon")
+
+    def test_a_dashboard_stop_does_not_wait_for_the_helper(self, helper_env):
+        helper_env.settings.stopTimeout = 60
+        pm = helper_env.manager()
+        wrapper, server, helper = self.launch(helper_env, pm)
+
+        started = time.monotonic()
+        assert pm.terminate_process(wrapper) is True
+
+        assert time.monotonic() - started < 10  # not the 60 s stopTimeout
+        assert helper_env.marker("saved-stdin")
+        wait_until(lambda: gone(ProcessIdentity(helper.pid)), message="helper kept")
+        assert pm.tracked_identity is None

@@ -142,9 +142,11 @@ autoStop:
 # Monitor state
 # ============================================================================
 monitor:
-  # Folder for players.json, server.pid and server-console.log. A relative
-  # path is relative to the folder holding this settings file (monitor.log
-  # is written there too), wherever the monitor is started from.
+  # Folder for players.json, server.pid, server-console.log and
+  # web-sessions.json (hashed "keep me signed in" tokens; deleting it ends
+  # remembered logins). A relative path is relative to the folder holding this
+  # settings file (monitor.log is written there too), wherever the monitor is
+  # started from.
   dataDir: "data"
 
 # ============================================================================
