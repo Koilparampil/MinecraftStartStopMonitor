@@ -66,22 +66,29 @@ same user, so it can start, find and stop the server process.
    - **Binary:** download `minecraft-monitor-windows.exe` or
      `minecraft-monitor-linux` from the latest
      [GitHub Release](https://github.com/Koilparampil/MinecraftStartStopMonitor/releases).
-   - **From source** (Python 3.11+ and [uv](https://docs.astral.sh/uv/)):
+   - **From source** (Python 3.11+ and [uv](https://docs.astral.sh/uv/)), run
+     inside this repository with the absolute path to your server folder:
      ```bash
      uv sync
-     uv run poe start
+     uv run poe start --server-dir /path/to/your/server
      ```
-2. Run it **from your server folder** (or pass `--server-dir`). On first launch,
-   the setup wizard:
+2. Run it. The binary can simply be started **from your server folder**, or be
+   given `--server-dir`. On first launch, the setup wizard:
    - finds your launch command (`./run.sh nogui` for Forge/NeoForge 1.17+,
      the Fabric/Quilt launcher jar, an old Forge jar, or `server.jar`);
    - offers to enable RCON in `server.properties` (random password,
      `broadcast-rcon-to-ops=false` so polling doesn't spam ops);
    - asks you to accept the [Minecraft EULA](https://aka.ms/MinecraftEULA) if you
      haven't yet;
-   - asks you for a dashboard password;
-   - saves `settings.yaml`.
-3. Open **http://localhost:25580** and log in (username `admin`).
+   - asks you for a dashboard password (the example password `changeme` is
+     refused at startup);
+   - saves `settings.yaml`, before it touches `server.properties` or
+     `eula.txt`.
+
+   Without a terminal (e.g. a service), pass `--server-dir`, `--start-command`
+   and `--web-password` (or `--no-web`) on the first run instead.
+3. Open **http://localhost:25580** and log in (username `admin`). The wizard
+   picks another free port if 25580 clashes with your game, RCON or query port.
 
 From then on, just leave the monitor running. Join the server from Minecraft to
 wake it up.
@@ -120,13 +127,17 @@ settings file's folder.
 | `web.controlServer` | — | Allow start/stop/restart and console commands from the web |
 | `web.console` | — | Log viewer + RCON console |
 | `web.playerAvatars` | — | Player heads from an external avatar service |
+| `web.trustedProxies` | `--trusted-proxies A,B` | Reverse-proxy IPs/CIDRs whose `X-Forwarded-*` headers are trusted (see [Security notes](#security-notes)) |
+| `web.secureCookies` | `--secure-cookies` | Mark cookies `Secure` and send HSTS (only behind HTTPS) |
 | `features.autoStart` | `--no-auto-start` | Wake the server on a join attempt |
 | `features.autoStop` | `--no-auto-stop` | Stop the server when empty |
 | `autoStop.stopDelay` | `--auto-stop-delay SEC` | Seconds empty before stopping (default 600) |
 | `autoStart.motd` / `kickMessage` / `versionName` | — | What players see while it sleeps / wakes (`§` colour codes work) |
 | `autoStart.respectWhitelist` | — | Only players allowed by whitelist/ops/bans can wake the server |
 
-⚑ = required (the setup wizard fills these in). Run with `--help` for all CLI flags.
+⚑ = required (the setup wizard fills these in). Run with `--help` for all CLI
+flags. Misspelled or unknown keys in `settings.yaml` are reported at startup
+with a "did you mean" hint.
 
 ### RCON
 
@@ -143,7 +154,10 @@ broadcast-rcon-to-ops=false
 ```
 
 Without RCON the monitor falls back to the server-list ping. Auto-start and
-auto-stop still work, but kick/ban/console are disabled.
+auto-stop still work, but kick and the console are disabled while the server
+runs. Bans can still be changed while it is stopped. If the RCON password is
+wrong, the dashboard says so and the monitor retries with a growing delay
+instead of filling the server log.
 
 ### Modded server tips
 
@@ -217,6 +231,10 @@ journalctl -u minecraft-monitor -f
 - The unit uses `KillMode=process`: stopping or restarting the monitor leaves a
   running Minecraft server alone, and the next monitor adopts it. Stop the
   server from the dashboard first if you want it down.
+- `TimeoutStopSec` (330 s) must be at least `2 × stopTimeout + 90`. Raise both
+  together for big worlds.
+- When running from source, `ExecStart` needs the absolute path of `uv`, so
+  check it with `command -v uv`.
 
 ## Limitations
 
