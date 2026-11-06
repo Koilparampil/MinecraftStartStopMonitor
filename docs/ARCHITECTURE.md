@@ -331,20 +331,32 @@ light/dark theme, mobile friendly. Original artwork only — no Mojang assets.
 - CLI flags: `--settings`, `--server-dir`, `--start-command`, `--host`,
   `--server-port`, `--rcon-port`, `--rcon-password`, `--polling-rate`,
   `--stop-timeout`, `--no-web`, `--web-port`, `--web-username`, `--web-password`,
-  `--no-auto-start`, `--no-auto-stop`, `--auto-stop-delay`. Settings path:
-  `--settings` → `$MINECRAFT_MONITOR_SETTINGS` → `settings.yaml` next to the
-  executable (frozen) / in `src/`.
-- First run (no settings file): interactive wizard — server dir (default: cwd if it
-  looks like a server), detect launch command (`run.sh`/`run.bat` for
-  Forge/NeoForge ≥ 1.17 → `./run.sh nogui`; `fabric-server-launch.jar` /
-  `quilt-server-launch.jar` / `forge-*.jar` (not `-installer`) / `minecraft_server*.jar`
-  / `server.jar` → `java -Xms1G -Xmx<mem> -jar <jar> nogui`; warn about modpack
-  start scripts with restart loops), offer to enable RCON in server.properties
-  (`enable-rcon=true`, `rcon.port`, random `rcon.password`, and
-  **`broadcast-rcon-to-ops=false`** so polling doesn't spam ops), EULA: if not
-  accepted, ask explicitly (link https://aka.ms/MinecraftEULA) and write
-  `eula=true` only on "yes", web password. EOF (no TTY) → print how to create
-  settings manually and exit 1 (like the reference).
+  `--trusted-proxies`, `--secure-cookies`, `--no-auto-start`, `--no-auto-stop`,
+  `--auto-stop-delay` (`--help` is authoritative). Settings path: `--settings` →
+  `$MINECRAFT_MONITOR_SETTINGS` → `settings.yaml` next to the executable
+  (frozen) / in `src/`. Monitor files (`monitor.log`, `session_secret.key`,
+  `dataDir`) resolve relative to the settings file's folder.
+- First run (no settings file):
+  - With a TTY, the interactive wizard runs. CLI values (`--server-dir`,
+    `--start-command`, `--web-password`) prefill or skip their questions.
+  - Without a TTY, a complete command line is used instead: `--server-dir`,
+    `--start-command`, and `--web-password` or `--no-web`. Otherwise the monitor
+    prints how to create the settings and exits 1.
+  - Before asking anything, the wizard checks that `settings.yaml` is
+    writable. It saves `settings.yaml` (0600) *before* editing
+    `server.properties` or `eula.txt`, so cancelling anywhere changes nothing.
+  - Launch-command detection: `run.sh`/`run.bat` for Forge/NeoForge ≥ 1.17 →
+    `./run.sh nogui`; `fabric-server-launch.jar` / `quilt-server-launch.jar` /
+    `forge-*.jar` (not `-installer`) / `minecraft_server*.jar` / `server.jar`
+    → `java -Xms1G -Xmx<mem> -jar <jar> nogui`. It warns about modpack start
+    scripts that restart in a loop, and the same warning runs at every startup.
+  - It offers to enable RCON in server.properties: `enable-rcon=true`,
+    `rcon.port`, a random `rcon.password`, and **`broadcast-rcon-to-ops=false`**
+    so polling doesn't spam ops.
+  - EULA: if not accepted, ask explicitly (link https://aka.ms/MinecraftEULA) and
+    write `eula=true` only on "yes".
+  - The dashboard port avoids the game, RCON and query ports. The password
+    `changeme` is refused, both at the prompt and at startup.
 - `main`: banner, logging (stdout + `monitor.log`), settings load → CLI overrides →
   `resolve_server_properties()` → validate; build `MinecraftClient(serverHost,
   serverPort, rconPort, rconPassword)`, `EventBus`, process manager

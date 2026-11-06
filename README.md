@@ -104,9 +104,10 @@ comments. Values left `null` are read from the server's own `server.properties`.
 The monitor keeps its own files **next to `settings.yaml`**, wherever it is
 started from:
 - `monitor.log`, rotated at 5 MB with 3 backups;
-- `session_secret.key`;
-- the `data/` folder (`monitor.dataDir`), holding `players.json`, `server.pid`
-  and the server's launch output `server-console.log`.
+- `session_secret.key` (signs the dashboard's cookies; deleting it logs everyone out);
+- the `data/` folder (`monitor.dataDir`), holding `players.json`, `server.pid`,
+  the server's launch output `server-console.log`, and `web-sessions.json`
+  (hashed "keep me signed in" tokens; deleting it ends remembered logins).
 
 Relative paths in the file (`dataDir`, `serverDir`) are resolved against the
 settings file's folder.
