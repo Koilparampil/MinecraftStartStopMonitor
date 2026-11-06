@@ -110,8 +110,10 @@ started from:
 - `monitor.log`, rotated at 5 MB with 3 backups;
 - `session_secret.key` (signs the dashboard's cookies; deleting it logs everyone out);
 - the `data/` folder (`monitor.dataDir`), holding `players.json`, `server.pid`,
-  the server's launch output `server-console.log`, and `web-sessions.json`
-  (hashed "keep me signed in" tokens; deleting it ends remembered logins).
+  the server's launch output `server-console.log`, `web-sessions.json`
+  (hashed "keep me signed in" tokens; deleting it ends remembered logins),
+  and `pending-cleanup.json` while background processes of the last launch
+  still have to be ended.
 
 Relative paths in the file (`dataDir`, `serverDir`) are resolved against the
 settings file's folder.
@@ -175,6 +177,15 @@ instead of filling the server log.
 - **Long loading times are fine.** The dashboard shows *Loading* until the
   server answers, and auto-stop doesn't count down until then.
 - **Big worlds:** raise `stopTimeout` if saving takes longer than two minutes.
+- **Launch scripts that do more than run the server** are fine:
+  - Work after the server exits (a backup after `java`, a `| tee` pipeline)
+    is never interrupted. A Stop doesn't wait for it, but the next start
+    does, for up to `stopTimeout`.
+  - Background processes the launch script starts (a tunnel, a backup loop)
+    never count as the server. They are ended (SIGTERM, then SIGKILL 10 s
+    later) once the server and the launch script have both exited, and at
+    the latest right before the next start, which then starts fresh ones.
+    This also happens when the monitor was stopped in between.
 - **Proxies (Velocity/BungeeCord) and Bedrock/Geyser front-ends** are not
   supported for auto-start: the proxy owns the public port.
 
@@ -213,11 +224,15 @@ instead of filling the server log.
     proxy_set_header Host $http_host;   # not $host, which drops the public port
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host "";   # drop what clients send
+    proxy_set_header X-Forwarded-Port "";
     ```
     `$http_host` already carries the public port, so don't add
     `X-Forwarded-Port $server_port`: it is wrong when nginx listens on a
     different port than the one players use (Docker port mapping, router
-    forwarding).
+    forwarding). nginx passes client headers through by default, and the
+    monitor trusts every `X-Forwarded-*` header that comes from a trusted
+    proxy, so the two empty lines stop clients from setting them.
     The live stream disables proxy buffering itself, so no `proxy_buffering`
     change is needed. Serving HTTP/2 at the proxy also lifts browsers' limit of
     6 connections per host;

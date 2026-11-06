@@ -8,7 +8,10 @@ in teardown; nothing else is ever signalled.
 """
 
 import contextlib
+import json
+import logging
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -30,10 +33,16 @@ from src.lifecycle.messages import (
     StartCommand,
     StopResult,
 )
+from src.lifecycle.runtime import LifecycleRuntime
 from src.lifecycle.supervisor import Supervisor
-from src.process_manager import OSProcessManager, process_start_key
+from src.process_manager import (
+    OSProcessManager,
+    normalized_dir,
+    process_start_key,
+    scan_for_server,
+)
 from test.support import wait_until
-from test.support.fakes import FakeBanlistManager, FakePlayerManager
+from test.support.fakes import FakeBanlistManager, FakeClient, FakePlayerManager
 
 PROCESS_NAME = "fake_mc_server"
 POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX signals, sh wrapper")
@@ -406,7 +415,6 @@ class TestGracefulStop:
         monkeypatch.setenv("FAKE_CHILD", "1")
         env.settings.stopTimeout = 1
         pm = env.manager()
-        pm.HELPER_GRACE_MAX = 0.3
         identity = env.launch(pm)
         wait_ready(env)
         parent = psutil.Process(identity.pid)
@@ -414,7 +422,8 @@ class TestGracefulStop:
         children = parent.children(recursive=True)
 
         # The server saves and exits; its child (a helper that ran with it)
-        # is ended after a grace, without holding back the stop.
+        # is ended once the launch (here the server itself) is over, without
+        # holding back the stop.
         assert pm.terminate_process(identity) is True
 
         assert env.marker("saved-stdin")
@@ -781,7 +790,6 @@ class TestBackgroundHelper:
     def test_a_dashboard_stop_does_not_wait_for_the_helper(self, helper_env):
         helper_env.settings.stopTimeout = 60
         pm = helper_env.manager()
-        pm.HELPER_GRACE_MAX = 0.5  # min(stopTimeout, 30 s) in production
         wrapper, server, helper = self.launch(helper_env, pm)
 
         started = time.monotonic()
@@ -790,11 +798,10 @@ class TestBackgroundHelper:
         assert time.monotonic() - started < 10  # not the 60 s stopTimeout
         assert helper_env.marker("saved-stdin")
         assert pm.tracked_identity is None
-        assert helper.is_running()  # ended only after its grace
+        assert helper.is_running()  # ended by a later scan, once run.sh exited
         wait_helpers_ended(pm, [helper])
 
-    def test_a_crash_ends_the_helper_after_a_grace(self, helper_env):
-        helper_env.settings.stopTimeout = 0.5  # grace: min(stopTimeout, 30 s)
+    def test_a_crash_ends_the_helper_once_the_launcher_exited(self, helper_env):
         pm = helper_env.manager()
         wrapper, server, helper = self.launch(helper_env, pm)
 
@@ -866,3 +873,328 @@ class TestPostStopWork:
         env.own(second.pid)
         assert env.done.exists()  # the backup finished before the relaunch
         assert second != wrapper
+
+
+# ----------------------------------------------------------------------
+# What a launch leaves behind (FU-6) and shutting down meanwhile (FU-7)
+# ----------------------------------------------------------------------
+
+TUNNEL = textwrap.dedent(
+    """
+    import os, sys, time
+    open(os.path.join(sys.argv[1], "tunnel-%d" % os.getpid()), "w").close()
+    time.sleep(600)
+    """
+)
+
+
+def write_script(env, body, shell="/bin/sh"):
+    """./run.sh with *body*; {py}, {server}, {markers} are filled in."""
+    script = os.path.join(env.server_dir, "run.sh")
+    text = body.format(py=sys.executable, server=env.script, markers=env.markers)
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(f"#!{shell}\n{text}")
+    os.chmod(script, 0o755)
+    env.settings.startCommand = "./run.sh nogui"
+    return script
+
+
+def own_tree(env, identity):
+    root = psutil.Process(identity.pid)
+    for child in root.children(recursive=True):
+        env.own(child.pid)
+
+
+def stop_with_scans(env, pm, identity, force=True):
+    """terminate_process() as the process worker runs it, while the
+    detection worker keeps scanning (scans run the cleanup)."""
+    result = []
+    stopper = threading.Thread(
+        target=lambda: result.append(pm.terminate_process(identity, force=force))
+    )
+    stopper.start()
+    while stopper.is_alive():
+        pm.observe()
+        time.sleep(0.05)
+    stopper.join()
+    return result == [True]
+
+
+def scan_until(pm, predicate, timeout=15, message="condition not met"):
+    def check():
+        pm.observe()
+        return predicate()
+
+    wait_until(check, timeout=timeout, message=message)
+
+
+@POSIX_ONLY
+class TestPipelineLaunchScript:
+    """run.sh pipes the server and its post-stop work through ``cat`` (or
+    ``tee``): the pipeline existed while the server ran, so it used to count
+    as background helpers and was ended after min(stopTimeout, 30 s), cutting
+    the backup short (S1). Nothing is ended while run.sh runs."""
+
+    @pytest.fixture
+    def pipeline(self, env):
+        env.done = env.markers / "post-stop-done"
+        write_script(
+            env,
+            '( "{py}" "{server}" "$@"; sleep 3; touch "{markers}/post-stop-done" )'
+            " | cat\n",
+        )
+        return env
+
+    def launch(self, env, pm):
+        identity = env.launch(pm)
+        wait_ready(env)
+        root = psutil.Process(identity.pid)
+        wait_until(lambda: len(root.children(recursive=True)) >= 3)
+        own_tree(env, identity)
+        pm.observe()  # remembers the tree, as the detection worker does
+        return identity
+
+    @pytest.mark.parametrize("force", [True, False], ids=["stop", "auto-stop"])
+    def test_a_stop_lets_the_pipeline_finish(self, pipeline, force):
+        env = pipeline
+        env.settings.stopTimeout = 1  # the old cleanup grace: min(stopTimeout, 30)
+        pm = env.manager()
+        launcher = self.launch(env, pm)
+
+        assert stop_with_scans(env, pm, launcher, force=force)
+
+        assert env.marker("saved-stdin")
+        assert not env.done.exists()  # STOPPED is not held back by the script
+        scan_until(pm, env.done.exists, message="post-stop work was cut short")
+        scan_until(pm, lambda: gone(launcher))
+        assert not os.path.exists(pm.leftovers_file)  # nothing left to end
+
+    def test_a_restart_relaunches_only_after_the_pipeline(self, pipeline):
+        env = pipeline
+        env.settings.stopTimeout = 10  # longer than the 3 s of post-stop work
+        pm = env.manager()
+        bus = EventBus()
+        supervisor = Supervisor(
+            pm, FakePlayerManager(bus), FakeBanlistManager(bus), bus
+        )
+        supervisor.server_stopping_cooldown = 0
+        [launch] = supervisor.handle(StartCommand())
+        first = self.launch(env, pm)
+        supervisor.handle(LaunchResult(launch.generation, first))
+
+        [stop] = supervisor.handle(RestartCommand())
+        stopped = stop_with_scans(env, pm, stop.identity)
+        [relaunch] = supervisor.handle(
+            StopResult(stop.generation, stop.identity, stopped)
+        )
+        assert isinstance(relaunch, LaunchRequest)
+        assert not env.done.exists()
+
+        second = pm.launch_process()  # the process worker's launch
+        assert second is not None
+        env.own(second.pid)
+        assert env.done.exists()  # the backup finished before the relaunch
+        assert gone(first)
+
+
+@POSIX_ONLY
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+class TestProcessSubstitutionLaunchScript:
+    def test_post_stop_steps_through_tee_all_complete(self, env):
+        """``exec > >(tee -a run.log)``: tee ran with the server; the 40
+        backup steps after it print through tee and must all run (the old
+        cleanup ended tee and the script died on SIGPIPE)."""
+        env.settings.stopTimeout = 1  # the old cleanup grace: 1 s
+        write_script(
+            env,
+            "exec > >(tee -a run.log) 2>&1\n"
+            '"{py}" "{server}" "$@"\n'
+            'for step in $(seq 1 40); do echo "backup step $step"; sleep 0.1; done\n'
+            'touch "{markers}/backup-done"\n',
+            shell=shutil.which("bash"),
+        )
+        pm = env.manager()
+        launcher = env.launch(pm)
+        wait_ready(env)
+        wait_until(lambda: psutil.Process(launcher.pid).children(recursive=True))
+        own_tree(env, launcher)
+        pm.observe()
+
+        assert stop_with_scans(env, pm, launcher)
+
+        scan_until(pm, lambda: env.marker("backup-done"), message="steps cut short")
+        log = open(os.path.join(env.server_dir, "run.log"), encoding="utf-8").read()
+        assert "backup step 40" in log
+
+
+@POSIX_ONLY
+class TestLeftoverHelpers:
+    """run.sh starts a tunnel in the background, reusing one that is still
+    running ("only if it isn't running")."""
+
+    @pytest.fixture
+    def tunnel_env(self, env):
+        tunnel = env.script.parent / "tunnel.py"
+        tunnel.write_text(TUNNEL, encoding="utf-8")
+        pid_file = env.markers / "tunnel.pid"
+        env.tunnel_pid_file = pid_file
+        env.post_stop = ""
+
+        def script(post_stop=""):
+            # ps, not kill -0: an orphaned helper that has exited can stay a
+            # zombie where PID 1 does not reap (some containers).
+            write_script(
+                env,
+                f'state=$(ps -o stat= -p "$(cat "{pid_file}" 2>/dev/null)" 2>/dev/null)\n'
+                'case "$state" in\n'
+                f'  ""|Z*) "{{py}}" "{tunnel}" "{{markers}}" &\n'
+                f'         echo $! > "{pid_file}" ;;\n'
+                "esac\n"
+                '"{py}" "{server}" "$@"\n' + post_stop,
+            )
+
+        env.write_run_sh = script
+        yield env
+        for marker in env.markers.glob("tunnel-*"):  # orphans after their run.sh
+            with contextlib.suppress(psutil.Error, ValueError):
+                psutil.Process(int(marker.name.split("-")[1])).kill()
+
+    @staticmethod
+    def live_tunnels(env):
+        alive = []
+        for marker in env.markers.glob("tunnel-*"):
+            identity = ProcessIdentity(int(marker.name.split("-")[1]))
+            if not gone(identity):
+                alive.append(identity.pid)
+        return alive
+
+    def launch(self, env, pm):
+        identity = env.launch(pm)
+        wait_ready(env)
+        wait_until(lambda: self.live_tunnels(env), message="no tunnel")
+        own_tree(env, identity)
+        pm.observe()  # sees the tunnel next to the running server
+        return identity
+
+    def test_the_next_launch_keeps_its_helper(self, tunnel_env):
+        """A player rejoins right after a stop: the old tunnel is ended before
+        the relaunch, so run.sh starts a new one, and no cleanup of the old
+        server ends the one the new server uses."""
+        env = tunnel_env
+        env.settings.stopTimeout = 1  # the old cleanup grace: 1 s
+        env.write_run_sh()
+        pm = env.manager()
+        first = self.launch(env, pm)
+        [old_tunnel] = self.live_tunnels(env)
+
+        assert pm.terminate_process(first) is True
+        second = pm.launch_process()  # the rejoin, within the old grace
+        assert second is not None
+        env.own(second.pid)
+        wait_until(lambda: env.marker("ready"))
+        wait_until(lambda: self.live_tunnels(env) != [old_tunnel])
+
+        for _ in range(30):  # 1.5 s of scans: past the old 1 s grace
+            pm.observe()
+            time.sleep(0.05)
+        [new_tunnel] = self.live_tunnels(env)
+        assert new_tunnel != old_tunnel
+        assert int(env.tunnel_pid_file.read_text()) == new_tunnel
+
+    def test_close_ends_helpers_once_the_launcher_exited(self, tunnel_env):
+        env = tunnel_env
+        env.write_run_sh()
+        pm = env.manager()
+        launcher = self.launch(env, pm)
+
+        assert pm.terminate_process(launcher) is True
+        wait_until(lambda: gone(launcher))
+        pm.close()  # the monitor stops right after the server
+
+        wait_until(lambda: not self.live_tunnels(env), message="tunnel left running")
+        assert not os.path.exists(pm.leftovers_file)
+
+    def test_the_next_monitor_finishes_the_cleanup(self, tunnel_env, caplog):
+        """The monitor stops while run.sh still does post-stop work: the
+        tunnel is saved for later, and the next monitor ends it before it
+        launches, so there is never a second copy."""
+        env = tunnel_env
+        env.settings.stopTimeout = 10
+        env.write_run_sh("sleep 2\n")
+        first_monitor = env.manager()
+        launcher = self.launch(env, first_monitor)
+        [old_tunnel] = self.live_tunnels(env)
+
+        assert first_monitor.terminate_process(launcher) is True
+        first_monitor.close()
+        saved = json.loads(open(first_monitor.leftovers_file).read())
+        [launch] = saved["launches"]
+        assert launch["launcher"][0] == launcher.pid
+        assert [pid for pid, _key in launch["helpers"]] == [old_tunnel]
+        assert self.live_tunnels(env) == [old_tunnel]  # run.sh still runs
+
+        next_monitor = env.manager()
+        with caplog.at_level(logging.INFO, logger="src.process_manager"):
+            second = next_monitor.launch_process()
+        assert second is not None
+        env.own(second.pid)
+        assert "Waiting up to" in caplog.text  # for the old run.sh first
+        assert gone(launcher)
+        wait_until(
+            lambda: self.live_tunnels(env) and old_tunnel not in self.live_tunnels(env)
+        )
+        assert len(self.live_tunnels(env)) == 1
+
+
+@POSIX_ONLY
+class TestShutdownWhileWaitingForTheLaunchScript:
+    def test_close_skips_the_relaunch(self, env, caplog):
+        """FU-7: a Restart waits for run.sh's 10 s of post-stop work; the
+        monitor is stopped 1 s into the wait. close() returns at once and no
+        second server is started."""
+        env.done = env.markers / "post-stop-done"
+        write_launcher(env, after=f'sleep 10\ntouch "{env.done}"\n')
+        env.settings.stopTimeout = 30
+        env.settings.pollingRate = 0.05
+        env.settings.autoStop = False
+        pm = env.manager()
+        launches = []
+        real_launch = pm.launch_process
+
+        def launch_process():
+            identity = real_launch()
+            launches.append(identity)
+            if identity is not None:
+                env.own(identity.pid)
+            return identity
+
+        pm.launch_process = launch_process
+        bus = EventBus()
+        supervisor = Supervisor(
+            pm, FakePlayerManager(bus), FakeBanlistManager(bus), bus
+        )
+        supervisor.server_starting_cooldown = 0
+        supervisor.server_stopping_cooldown = 0
+        runtime = LifecycleRuntime(supervisor, FakeClient(), pm)
+        runtime.start()
+        try:
+            assert runtime.submit_command(StartCommand()).success
+            wait_until(lambda: supervisor.state == LifecycleState.RUNNING)
+            wait_ready(env)
+            own_tree(env, launches[0])
+            with caplog.at_level(logging.INFO, logger="src.process_manager"):
+                assert runtime.submit_command(RestartCommand()).success
+                wait_until(lambda: "Waiting up to" in caplog.text, timeout=15)
+                time.sleep(1)
+
+                started = time.monotonic()
+                runtime.close()
+                elapsed = time.monotonic() - started
+        finally:
+            runtime.close()
+
+        assert elapsed < 2
+        assert "Shutting down: not starting the server" in caplog.text
+        assert len(launches) == 2 and launches[1] is None
+        assert scan_for_server(normalized_dir(env.server_dir), PROCESS_NAME) is None
+        assert not env.done.exists()  # run.sh was left alone

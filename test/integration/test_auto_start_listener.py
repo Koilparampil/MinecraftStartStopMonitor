@@ -9,7 +9,10 @@
   the process launch, and re-armed when the launched server exits.
 """
 
+import contextlib
+import dataclasses
 import json
+import logging
 import socket
 import struct
 import threading
@@ -18,10 +21,17 @@ import psutil
 import pytest
 from mcstatus import JavaServer
 
-from src.auto_start import AutoStartManager, ListenerOptions
+from src.auto_start import (
+    BUSY_MESSAGE,
+    WHITELIST_MESSAGE,
+    AutoStartManager,
+    ListenerOptions,
+    _RefusalLog,
+)
 from src.banlist_manager import BanlistManager
 from src.events import Event, EventBus
 from src.lifecycle.messages import LifecycleState, ProcessIdentity
+from src.minecraft.protocol import safe_for_log
 from src.minecraft_control import MinecraftController
 from src.player_manager import PlayerManager
 from test.support import free_tcp_port, wait_until
@@ -243,6 +253,43 @@ def test_banned_player_does_not_wake(listener, port, server_dir):
     assert len(controller.calls) == 0
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["a\nFAKE ERROR", "b\rFAKE", "\x1b[31mRED\x1b[0m"],
+    ids=["newline", "carriage-return", "ansi-escape"],
+)
+def test_refused_names_are_logged_escaped(listener, port, caplog, name):
+    """The control characters that make a name invalid never reach the log
+    (FU-2): one line per record, no control characters."""
+    manager, controller, _bus = listener
+    manager.refusals = _RefusalLog(interval=0.0)  # log every refusal
+    caplog.set_level(logging.DEBUG)
+
+    assert message_text(join_attempt(port, name)) == "Invalid player name."
+
+    expected = f"Not starting the server for {safe_for_log(name)} (127.0.0.1)"
+    wait_until(
+        lambda: any(expected in r.getMessage() for r in caplog.records),
+        message="the refusal was not logged",
+    )
+    assert all(record.getMessage().isprintable() for record in caplog.records)
+    assert controller.calls == []
+
+
+def test_a_waking_name_is_logged_escaped(listener, port, caplog):
+    """Valid names may still hold invisible characters (NEL, separators)."""
+    _manager, controller, _bus = listener
+    caplog.set_level(logging.DEBUG)
+    name = "Ev\u2028il\x85\u202e"
+
+    join_attempt(port, name)
+
+    assert controller.started.wait(5)
+    messages = [record.getMessage() for record in caplog.records]
+    assert f"{safe_for_log(name)} (127.0.0.1) is trying to join" in "\n".join(messages)
+    assert all(message.isprintable() for message in messages)
+
+
 def test_listener_rearms_after_server_stopped(listener, port):
     manager, controller, bus = listener
     join_attempt(port, "Steve")
@@ -256,6 +303,126 @@ def test_listener_rearms_after_server_stopped(listener, port):
     join_attempt(port, "Steve")
     assert controller.started.wait(5)
     assert [call["port_free"] for call in controller.calls] == [True, True]
+
+
+# ----------------------------------------------------------------------
+# Floods from the joining player's own address (a shared tunnel or NAT)
+# ----------------------------------------------------------------------
+
+
+def hold_lane(port, payload, stop):
+    """Connect, send *payload* (nothing for an idle lane) and hold the
+    connection; reconnect as soon as the listener drops it."""
+    while not stop.is_set():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(0.2)
+            sock.connect(("127.0.0.1", port))
+            if payload:
+                sock.sendall(payload)
+            while not stop.is_set():
+                try:
+                    if sock.recv(4096) == b"":
+                        break  # dropped: reconnect at once
+                except TimeoutError:
+                    continue
+        except OSError:
+            stop.wait(0.02)  # nobody listens (any more)
+        finally:
+            sock.close()
+
+
+@contextlib.contextmanager
+def flood(port, payload, lanes):
+    stop = threading.Event()
+    threads = [
+        threading.Thread(target=hold_lane, args=(port, payload, stop), daemon=True)
+        for _ in range(lanes)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join(2)
+
+
+def wakes_within(port, attempts, starting):
+    replies = []
+    for _ in range(attempts):
+        replies.append(message_text(join_attempt(port, "Steve")))
+        if replies[-1] == starting:
+            return True
+    raise AssertionError(f"not woken in {attempts} attempts: {replies}")
+
+
+def test_held_legacy_pings_do_not_block_a_wake(listener, port, mock_settings):
+    """FU-3: four connections that send a legacy ping (0xFE 0x01) and hold
+    it fill the address's slots; a legacy ping is as evictable as any ping."""
+    manager, controller, _bus = listener
+    with flood(port, b"\xfe\x01", lanes=4):
+        wait_until(lambda: manager.active_connections == 4, message="not held")
+        assert wakes_within(port, 2, mock_settings.startingMessage)
+    assert controller.started.wait(5)
+    assert len(controller.calls) == 1
+
+
+@pytest.mark.parametrize("grace", [0.25, 5.0], ids=["default-grace", "long-grace"])
+def test_idle_lanes_do_not_block_a_wake(port, mock_settings, grace):
+    """FU-4: eight lanes that connect, send nothing and reconnect at once
+    keep the address's slots full of young idle connections. A complete
+    login evicts one of them, however young (the long grace makes every
+    one of them young)."""
+    controller = RecordingController(port)
+    options = dataclasses.replace(OPTIONS, eviction_grace=grace)
+    manager = AutoStartManager(controller, EventBus(), options=options)
+    try:
+        manager.listen()
+        wait_until(lambda: manager.is_listening, message="listener did not bind")
+        with flood(port, b"", lanes=8):
+            wait_until(lambda: manager.active_connections == 4, message="not held")
+            assert wakes_within(port, 2, mock_settings.startingMessage)
+        assert controller.started.wait(5)
+        assert len(controller.calls) == 1
+    finally:
+        manager.close()
+
+
+def test_a_burst_of_refused_players_all_get_a_message(listener, port, server_dir):
+    """FU-5: 12 players who are not whitelisted join 30 times each, all at
+    once, through one address. Every join gets a message (the refusal, or
+    "busy" when every slot is taken), never a bare close, and none wakes
+    the server."""
+    (server_dir / "server.properties").write_text("white-list=true\n", encoding="utf-8")
+    (server_dir / "whitelist.json").write_text(
+        json.dumps([{"name": "Alex"}]), encoding="utf-8"
+    )
+    manager, controller, _bus = listener
+    manager.refusals = _RefusalLog(interval=3600)  # one log line, not 360
+    replies, failures = [], []
+
+    def player(number):
+        for attempt in range(30):
+            try:
+                reply = join_attempt(port, f"Stranger{number}x{attempt}")
+            except OSError as error:
+                failures.append(f"{number}/{attempt}: {error!r}")
+            else:
+                replies.append(message_text(reply))
+
+    players = [threading.Thread(target=player, args=(n,)) for n in range(12)]
+    for thread in players:
+        thread.start()
+    for thread in players:
+        thread.join(60)
+
+    assert failures == []
+    assert len(replies) == 12 * 30
+    assert set(replies) <= {WHITELIST_MESSAGE, BUSY_MESSAGE}
+    assert WHITELIST_MESSAGE in replies
+    assert controller.calls == []
 
 
 # ----------------------------------------------------------------------

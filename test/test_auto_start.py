@@ -25,6 +25,7 @@ from src.auto_start import (
     ListenerOptions,
     accept_error_action,
     bind_address,
+    bytes_waiting,
     client_key,
     normalize_client_ip,
 )
@@ -583,6 +584,25 @@ class TestAccessPolicy:
 # ----------------------------------------------------------------------
 
 
+class Conn:
+    """A fake accepted socket for ConnectionSlots."""
+
+    def __init__(self, waiting=False):
+        self.waiting = waiting  # bytes unread in its receive buffer
+        self.shut_down = []
+        self.closed = False
+
+    def shutdown(self, how):
+        self.shut_down.append(how)
+
+    def close(self):
+        self.closed = True
+
+
+def no_bytes(_conn):
+    return False
+
+
 def idle_socket(port, source="127.0.0.1"):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -825,17 +845,14 @@ class TestAdmission:
                 thread.join(2)
 
     def test_connection_slots(self):
-        class Conn:
-            shut_down = closed = False
-
-            def shutdown(self, _how):
-                self.shut_down = True
-
-            def close(self):
-                self.closed = True
-
         now = [0.0]
-        slots = ConnectionSlots(total=3, per_client=2, grace=1.0, clock=lambda: now[0])
+        slots = ConnectionSlots(
+            total=3,
+            per_client=2,
+            grace=1.0,
+            clock=lambda: now[0],
+            probe=lambda conn: conn.waiting,
+        )
         conns = [Conn() for _ in range(6)]
         a1, a2 = slots.admit(conns[0], "a"), slots.admit(conns[1], "a")
         assert a1 and a2
@@ -852,6 +869,7 @@ class TestAdmission:
         c1 = slots.admit(conns[4], "c")  # evicts it; allowed logins never
         assert c1 and b1.evicted and not a2.evicted and not a3.evicted
         assert slots.admit(conns[5], "d") is None  # pending c1 is too young
+        conns[4].waiting = True  # c1's request is in its socket buffer
         assert slots.admit(conns[5], "d", phase="login") is None  # even for a login
         assert slots.promote(c1, "status")
         d1 = slots.admit(conns[5], "d", phase="login")  # a login evicts any ping
@@ -859,6 +877,132 @@ class TestAdmission:
         assert slots.promote(d1, "allowed")
         assert slots.admit(conns[0], "e", phase="login") is None  # all allowed
         assert slots.in_use == 3
+
+    @pytest.mark.parametrize("phase", ["status", "legacy", "refused", "new-phase"])
+    def test_every_phase_but_an_allowed_login_is_evictable(self, phase):
+        """FU-3: legacy pings (and any phase added later) are cheap."""
+        now = [0.0]
+        slots = ConnectionSlots(
+            total=8, per_client=2, grace=1.0, clock=lambda: now[0], probe=no_bytes
+        )
+        held, allowed = Conn(), Conn()
+        assert slots.promote(slots.admit(held, "a"), phase)
+        assert slots.promote(slots.admit(allowed, "a"), "allowed")
+
+        assert slots.admit(Conn(), "a") is None  # a newcomer spares it while young
+        login = slots.admit(Conn(), "a", phase="login")  # a login does not wait
+
+        assert login is not None
+        assert held.shut_down == [socket.SHUT_RD]  # a reply in progress goes out
+        assert allowed.shut_down == []
+        assert slots.promote(login, "allowed")
+        assert slots.admit(Conn(), "a", phase="login") is None  # all allowed now
+
+    def test_a_login_evicts_young_idle_connections_but_not_a_burst(self):
+        """FU-4: a young pending connection whose client is not delivering a
+        request (nothing unread, no first byte in the last *stall* seconds)
+        makes room for a complete login. One whose request waits in its
+        socket buffer, or is arriving, is a friend joining in the same burst."""
+        now = [0.0]
+        slots = ConnectionSlots(
+            total=8,
+            per_client=4,
+            grace=1.0,
+            stall=0.1,
+            clock=lambda: now[0],
+            probe=lambda conn: conn.waiting,
+        )
+        waiting, arriving, stalled, idle = Conn(waiting=True), Conn(), Conn(), Conn()
+        entries = [
+            slots.admit(conn, "a") for conn in (waiting, arriving, stalled, idle)
+        ]
+        entries[1].first_byte_at = 0.45  # its request is coming in
+        entries[2].first_byte_at = 0.0  # one byte, then nothing
+        now[0] = 0.5  # all younger than the grace
+
+        assert slots.admit(Conn(), "a") is None  # plain newcomers never evict them
+        first = slots.admit(Conn(), "a", phase="login")
+        second = slots.admit(Conn(), "a", phase="login")
+
+        assert first and second
+        assert idle.shut_down == [socket.SHUT_RD]  # never sent anything: first
+        assert stalled.shut_down == [socket.SHUT_RD]
+        assert waiting.shut_down == arriving.shut_down == []
+        assert slots.admit(Conn(), "a", phase="login") is None  # the burst stays
+        now[0] = 0.6  # the arriving request should be complete by now
+        assert slots.admit(Conn(), "a", phase="login") is not None
+        assert arriving.shut_down == [socket.SHUT_RD]
+
+    def test_a_login_waits_a_moment_for_just_connected_clients(self):
+        """A client sends its request right after connecting: a connection
+        that is silent for less than *stall* is not idle yet. A login that
+        finds only such connections learns when to try again."""
+        now = [0.0]
+        slots = ConnectionSlots(
+            total=8,
+            per_client=2,
+            grace=1.0,
+            stall=0.1,
+            clock=lambda: now[0],
+            probe=lambda conn: conn.waiting,
+        )
+        early, late = Conn(), Conn()
+        slots.admit(early, "a")
+        now[0] = 0.05
+        slots.admit(late, "a")
+
+        assert slots.admit(Conn(), "a", phase="login") is None
+        assert slots.retry_at("a") == pytest.approx(0.1)  # early is silent by then
+        late.waiting = True  # ... while late's request has arrived
+        now[0] = 0.1
+        assert slots.admit(Conn(), "a", phase="login") is not None
+        assert early.shut_down == [socket.SHUT_RD] and late.shut_down == []
+        assert slots.retry_at("a") is None  # late will be served, not evicted
+        assert slots.retry_at("b") == pytest.approx(0.1)  # room for others now
+
+    def test_a_read_and_its_time_are_noted_together(self):
+        """The handler's read and the evictor's probe take the same lock, so
+        a request being read never looks idle (no race with the kernel)."""
+        ours, theirs = socket.socketpair()
+        with ours, theirs:
+            slots = ConnectionSlots(total=8, per_client=1, grace=60.0, stall=60.0)
+            entry = slots.admit(ours, "a")
+            theirs.sendall(b"\x10")
+            assert entry.receive(16, timeout=5) == b"\x10"
+            assert entry.first_byte_at is not None
+            assert slots.admit(Conn(), "a", phase="login") is None  # still busy
+            with pytest.raises(TimeoutError):
+                entry.receive(16, timeout=0.05)
+
+    def test_only_a_stalled_request_is_shut_down_completely(self):
+        now = [0.0]
+        slots = ConnectionSlots(
+            total=8, per_client=2, grace=1.0, clock=lambda: now[0], probe=no_bytes
+        )
+        stalled, checking = Conn(waiting=True), Conn()
+        slots.admit(stalled, "a")
+        assert slots.promote(slots.admit(checking, "a"), "login")
+        now[0] = 2.0
+
+        assert slots.admit(Conn(), "a") is not None
+        assert slots.admit(Conn(), "a") is not None
+
+        assert stalled.shut_down == [socket.SHUT_RDWR]  # its read gives up
+        assert checking.shut_down == [socket.SHUT_RD]  # still gets its answer
+
+    def test_bytes_waiting_peeks_without_consuming(self):
+        ours, theirs = socket.socketpair()
+        with ours, theirs:
+            assert bytes_waiting(ours) is False
+            theirs.sendall(b"\x10\x00")
+            wait_until(lambda: bytes_waiting(ours))
+            assert ours.recv(16) == b"\x10\x00"  # nothing was consumed
+            assert bytes_waiting(ours) is False
+            ours.settimeout(5)  # never waits for the socket's timeout
+            started = time.monotonic()
+            assert bytes_waiting(ours) is False
+            assert time.monotonic() - started < 0.5
+        assert bytes_waiting(ours) is False  # closed: no error either
 
     @pytest.mark.parametrize(
         ("ip", "key"),

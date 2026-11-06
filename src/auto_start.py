@@ -37,6 +37,7 @@ reset by hand at the start of every cycle):
   leave a listener bound during the launch.
 """
 
+import array
 import contextlib
 import dataclasses
 import errno
@@ -44,6 +45,7 @@ import ipaddress
 import json
 import logging
 import os
+import select
 import selectors
 import socket
 import threading
@@ -55,8 +57,19 @@ from datetime import datetime
 from src.events import Event, EventBus
 from src.lifecycle.messages import LifecycleState
 from src.minecraft import server_files, sleeping
-from src.minecraft.protocol import PacketReader, encode_string, frame_packet
+from src.minecraft.protocol import (
+    PacketReader,
+    encode_string,
+    frame_packet,
+    safe_for_log,
+)
 from src.settings import DEFAULT_GAME_PORT, settings
+
+try:  # FIONREAD: bytes waiting in a socket's receive buffer (POSIX)
+    import fcntl
+    import termios
+except ImportError:  # Windows
+    fcntl = termios = None
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +134,9 @@ class ListenerOptions:
     request_timeout: float = 2.0  # the first request must have arrived by then
     status_timeout: float = 1.0  # a server-list ping, its Ping/Pong included
     eviction_grace: float = 0.25  # younger connections are not evicted by newcomers
+    request_stall: float = (
+        0.1  # clients send their whole request this soon after connecting
+    )
     max_connections: int = 64  # concurrent connections being served
     max_connections_per_client: int = 4  # per IPv4 address / IPv6 /56
     triage_capacity: int = 256  # sockets waiting in the no-slot triage
@@ -225,25 +241,102 @@ def client_key(ip):
     return str(address)
 
 
-class _Admission:
-    """One admitted connection. Its phase is "pending" until the first request
-    arrived, then "status" (server-list ping, legacy ping) or "login"."""
+# Phases of an admitted connection: "pending" until its first request has
+# arrived, then the request's kind ("status", "legacy", "login", or "refused"
+# for an invalid name), then the access check's "allowed" or "refused".
+ALLOWED = "allowed"  # a login about to wake the server: never evicted
+_IN_PROGRESS = frozenset({"pending", "login"})  # spared while young
 
-    def __init__(self, conn, key, admitted_at, phase="pending"):
+
+def bytes_waiting(conn) -> bool:
+    """Whether bytes from the client wait unread in *conn*'s receive buffer.
+
+    Never blocks and never consumes. POSIX asks the kernel (FIONREAD): a
+    ``recv(1, MSG_PEEK | MSG_DONTWAIT)`` through the socket object would
+    first wait out the socket's timeout. Windows has no FIONREAD for Python
+    sockets: there a readable socket (data, or a close not yet read) counts.
+    """
+    try:
+        if fcntl is not None:
+            count = array.array("i", [0])
+            fcntl.ioctl(conn.fileno(), termios.FIONREAD, count, True)
+            return count[0] > 0
+        readable, _writable, _failed = select.select([conn], [], [], 0)
+        return bool(readable)
+    except (OSError, ValueError):
+        return False
+
+
+def _wait_readable(conn, timeout) -> bool:
+    """Data, a close or an error is ready on *conn* within *timeout* s."""
+    timeout = max(0.0, timeout)
+    if hasattr(select, "poll"):  # no FD_SETSIZE limit
+        poller = select.poll()
+        poller.register(conn, select.POLLIN)
+        return bool(poller.poll(timeout * 1000))
+    readable, _writable, _failed = select.select([conn], [], [], timeout)
+    return bool(readable)
+
+
+class _Admission:
+    """One admitted connection and its phase (see the phases above)."""
+
+    def __init__(self, conn, key, admitted_at, phase="pending", clock=time.monotonic):
         self.conn = conn
         self.key = key
         self.admitted_at = admitted_at
         self.phase = phase
+        self.first_byte_at = None  # when its handler read the first request byte
         self.evicted = False
+        self._clock = clock
         self._lock = threading.Lock()
         self._closed = False
 
-    def abort(self):
-        """Evicted: wake the handler's blocked read so it gives up at once."""
+    def receive(self, size, timeout):
+        """Wait up to *timeout* s for request bytes, then read them. The read
+        and noting its time are one step for the evictor's probe (both hold
+        the lock), so a request in progress never looks idle. None: nothing
+        to read yet; b"": closed. Raises TimeoutError and OSError."""
+        if not _wait_readable(self.conn, timeout):
+            raise TimeoutError("timed out")
+        with self._lock:
+            if self._closed:
+                return b""
+            self.conn.settimeout(0)  # it is readable: never block holding the lock
+            try:
+                chunk = self.conn.recv(size)
+            except BlockingIOError:
+                return None
+            if chunk and self.first_byte_at is None:
+                self.first_byte_at = self._clock()
+            return chunk
+
+    def spared_until(self, stall) -> float:
+        """A client sends its whole request as soon as it has connected:
+        until then (and *stall* s more) it is not idle, just not there yet."""
+        started = self.admitted_at if self.first_byte_at is None else self.first_byte_at
+        return started + stall
+
+    def delivering(self, probe, now, stall) -> bool:
+        """Its client is still delivering its request: bytes wait unread
+        (*probe*), or it connected or started the request less than *stall*
+        seconds ago."""
+        with self._lock:
+            if self._closed:
+                return False
+            return now < self.spared_until(stall) or probe(self.conn)
+
+    def has_bytes(self, probe) -> bool:
+        with self._lock:
+            return not self._closed and probe(self.conn)
+
+    def abort(self, how=socket.SHUT_RDWR):
+        """Evicted: wake the handler's blocked read so it gives up at once.
+        With SHUT_RD a reply that is being sent still goes out."""
         with self._lock:
             if not self._closed:
                 with contextlib.suppress(OSError):
-                    self.conn.shutdown(socket.SHUT_RDWR)
+                    self.conn.shutdown(how)
 
     def close(self):
         with self._lock:
@@ -254,19 +347,47 @@ class _Admission:
 class ConnectionSlots:
     """Admission control: a global cap and a per-client cap.
 
-    Logins are never evicted. When a cap is reached, a new connection evicts
-    the oldest one that is still waiting for its request or is only a ping
-    (once older than *grace*), and a complete login evicts the oldest
-    non-login connection of any age. So idle, trickling or stalled-ping
-    sockets cannot keep a player from waking the server; admit() returns
-    None only when no connection may be evicted.
+    When a cap is reached, a newcomer evicts, oldest first:
+
+    1. a cheap connection: a ping, a legacy ping, a refused login -- every
+       phase except a request in progress and an allowed login, so a new
+       phase can never become unevictable by accident. Spared while younger
+       than *grace*, except when a complete login needs the room;
+    2. else a request in progress (``pending`` its request, ``login`` its
+       access check) older than *grace*;
+    3. else, for a complete login only, a young ``pending`` connection whose
+       client is not delivering a request: nothing unread in its socket
+       buffer, and neither connected nor started a request within the last
+       *stall* seconds (clients send the whole request at once). Idle ones
+       go first, then those stalled after a few bytes. A player of the same
+       burst, whose request waits in the buffer or is arriving, is spared;
+       retry_at() tells a login refused for that alone when to try again.
+
+    Allowed logins (about to wake the server) are never evicted, so admit()
+    returns None only when nothing else may be evicted. Victims are shut
+    down for reading only (SHUT_RD), which wakes their handler's read: a
+    reply being sent (a refusal, a status) still goes out, a login evicted
+    during its access check still gets its answer, and a request that
+    completed just as it was evicted can still be told "busy". Only a
+    connection that waited too long for its request is shut down
+    completely.
     """
 
-    def __init__(self, total, per_client, grace=0.0, clock=time.monotonic):
+    def __init__(
+        self,
+        total,
+        per_client,
+        grace=0.0,
+        clock=time.monotonic,
+        probe=bytes_waiting,
+        stall=0.1,
+    ):
         self._total = total
         self._per_client = per_client
         self._grace = grace
+        self._stall = stall
         self._clock = clock
+        self._probe = probe  # bytes_waiting(conn); tests pass fakes
         self._lock = threading.Lock()
         self._entries: list[_Admission] = []  # oldest first
 
@@ -282,15 +403,15 @@ class ConnectionSlots:
         with self._lock:
             full = self._full(key)
             if full is not None:
-                victim = self._victim(full, now, for_login=phase == "login")
+                victim, how = self._victim(full, now, for_login=phase == "login")
                 if victim is None:
                     return None
                 victim.evicted = True
                 self._entries.remove(victim)
-            entry = _Admission(conn, key, now, phase)
+            entry = _Admission(conn, key, now, phase, self._clock)
             self._entries.append(entry)
         if victim is not None:
-            victim.abort()
+            victim.abort(how)
         return entry
 
     def _full(self, key):
@@ -302,24 +423,43 @@ class ConnectionSlots:
         return None
 
     def _victim(self, entries, now, for_login):
-        """The connection to evict: the oldest finished-or-cheap one (a ping
-        or a refused login) first, then the oldest still waiting for its
-        request or its access check. Only allowed logins (about to wake the
-        server) are never evicted. Connections younger than the grace period
-        are spared, except pings and refused logins when a login needs room."""
+        """(connection to evict, how to shut it down), or (None, None); see
+        the class docstring for the order."""
         cheap_grace = 0.0 if for_login else self._grace
-        for phases, grace in (
-            (("status", "refused"), cheap_grace),
-            (("pending", "login"), self._grace),
-        ):
-            for entry in entries:
-                if entry.phase in phases and now - entry.admitted_at >= grace:
-                    return entry
-        return None
+        for entry in entries:
+            cheap = entry.phase not in _IN_PROGRESS and entry.phase != ALLOWED
+            if cheap and now - entry.admitted_at >= cheap_grace:
+                return entry, socket.SHUT_RD
+        for entry in entries:
+            if entry.phase in _IN_PROGRESS and now - entry.admitted_at >= self._grace:
+                stalled = entry.phase == "pending"
+                return entry, socket.SHUT_RDWR if stalled else socket.SHUT_RD
+        if for_login:
+            young = [entry for entry in entries if entry.phase == "pending"]
+            young.sort(key=lambda entry: entry.first_byte_at is not None)
+            for entry in young:
+                if not entry.delivering(self._probe, now, self._stall):
+                    return entry, socket.SHUT_RD
+        return None, None
+
+    def retry_at(self, key):
+        """When a complete login of *key* that found no room may try again:
+        the moment a connection spared only as just connected (or just
+        started) stops being spared, if its client is silent; else None."""
+        with self._lock:
+            full = self._full(key)
+            if full is None:
+                return self._clock()
+            times = [
+                entry.spared_until(self._stall)
+                for entry in full
+                if entry.phase == "pending" and not entry.has_bytes(self._probe)
+            ]
+        return min(times) if times else None
 
     def promote(self, entry, phase):
-        """Its request arrived (``"status"`` or ``"login"``), or the access
-        check decided (``"allowed"`` / ``"refused"``). False if evicted."""
+        """Its request arrived (its kind), or the access check decided
+        (``"allowed"`` / ``"refused"``). False if evicted."""
         with self._lock:
             if entry.evicted:
                 return False
@@ -427,12 +567,14 @@ class MinecraftRequests:
         return None
 
 
-def read_request(conn, timeout, classify):
+def read_request(conn, timeout, classify, receive=None):
     """Read the client's first request within *timeout* seconds in total.
 
     Returns (bytes read, kind); the bytes are replayed to the protocol
     handler. (None, None) if the request did not arrive complete in time,
-    the client closed, or it is not a valid request."""
+    the client closed, or it is not a valid request. *receive(size,
+    timeout)* replaces ``conn.recv`` (an admitted connection notes when its
+    request started; None means nothing to read yet)."""
     deadline = time.monotonic() + timeout
     data = b""
     while len(data) <= _REQUEST_LIMIT:
@@ -446,10 +588,15 @@ def read_request(conn, timeout, classify):
         if remaining <= 0:
             return None, None
         try:
-            conn.settimeout(remaining)
-            chunk = conn.recv(4096)
-        except OSError:  # timeout, reset, or shut down by an eviction
+            if receive is None:
+                conn.settimeout(remaining)
+                chunk = conn.recv(4096)
+            else:
+                chunk = receive(4096, remaining)
+        except (OSError, ValueError):  # timeout, reset, shut down by an eviction
             return None, None
+        if chunk is None:
+            continue
         if not chunk:
             return None, None
         data += chunk
@@ -480,7 +627,9 @@ class _Triage:
     reads, so it never holds up the accept loop. Once a request is complete,
     a login takes a slot by evicting a non-login connection and is served
     normally; anything else (or a login when every slot holds a login) gets
-    a short reply and is closed. Bounded: past *capacity* waiting sockets
+    a short reply and is closed. A login that finds only connections spared
+    for a moment (just connected, request arriving) waits that moment once
+    (ConnectionSlots.retry_at). Bounded: past *capacity* waiting sockets
     the oldest is dropped, and each one waits at most *timeout*."""
 
     def __init__(self, cycle, capacity, timeout):
@@ -490,6 +639,7 @@ class _Triage:
         self._lock = threading.Lock()
         self._incoming = []
         self._waiting = {}  # socket -> [ip, key, config, deadline, data]
+        self._deferred = []  # logins retried once: (at, conn, ip, key, config, data)
         self._closed = False
         self._final_message = None  # set by close(): the reply for logins
         self._selector = selectors.DefaultSelector()
@@ -548,6 +698,7 @@ class _Triage:
                     else:
                         self._read(key.fileobj)
                 self._expire()
+                self._retry_deferred()
         except Exception:
             logger.exception("Auto-start triage failed")
         finally:
@@ -566,10 +717,11 @@ class _Triage:
         self._waiting[conn] = [ip, key, config, deadline, b""]
 
     def _next_timeout(self):
-        if not self._waiting:
+        times = [state[3] for state in self._waiting.values()]
+        times += [item[0] for item in self._deferred]
+        if not times:
             return None
-        soonest = min(state[3] for state in self._waiting.values())
-        return max(0.0, soonest - time.monotonic())
+        return max(0.0, min(times) - time.monotonic())
 
     def _read(self, conn):
         state = self._waiting.get(conn)
@@ -594,14 +746,15 @@ class _Triage:
             self._forget(conn)
             self._resolve(conn, kind, *state)
 
-    def _resolve(self, conn, kind, ip, key, config, _deadline, data):
+    def _resolve(self, conn, kind, ip, key, config, _deadline, data, retried=False):
         final = self._final_message
-        if (
-            final is None
-            and kind == "login"
-            and self._cycle.admit_login(conn, ip, key, config, data)
-        ):
-            return
+        if final is None and kind == "login":
+            if self._cycle.admit_login(conn, ip, key, config, data):
+                return
+            at = None if retried else self._cycle.retry_login_at(key)
+            if at is not None and len(self._deferred) < self._capacity:
+                self._deferred.append((at, conn, ip, key, config, data))
+                return
         try:
             reply = self._cycle.requests.busy_reply(kind, data, config, final)
             if reply:
@@ -614,6 +767,15 @@ class _Triage:
         now = time.monotonic()
         for conn in [c for c, state in self._waiting.items() if state[3] <= now]:
             self._drop(conn)
+
+    def _retry_deferred(self, everything=False):
+        now = time.monotonic()
+        due = [item for item in self._deferred if everything or item[0] <= now]
+        if not due:
+            return
+        self._deferred = [item for item in self._deferred if item not in due]
+        for _at, conn, ip, key, config, data in due:
+            self._resolve(conn, "login", ip, key, config, None, data, retried=True)
 
     def _forget(self, conn):
         self._waiting.pop(conn, None)
@@ -642,6 +804,7 @@ class _Triage:
             with contextlib.suppress(OSError):
                 conn.recv(_REQUEST_LIMIT)  # nothing unread: FIN, not RST
             self._drop(conn)
+        self._retry_deferred(everything=True)  # the final message
         self._selector.close()
         _close_quietly(self._wake_r)
         _close_quietly(self._wake_w)
@@ -664,6 +827,8 @@ class _RefusalLog:
         self._suppressed = 0
 
     def note(self, name, ip, reason):
+        """*name* is what the client sent (control characters are often
+        why it was refused): it is escaped before it is logged."""
         with self._lock:
             now = self._clock()
             if now < self._quiet_until:
@@ -674,7 +839,9 @@ class _RefusalLog:
         more = (
             f" ({suppressed} more refused since the last report)" if suppressed else ""
         )
-        logger.info(f"Not starting the server for {name} ({ip}): {reason}{more}")
+        logger.info(
+            f"Not starting the server for {safe_for_log(name)} ({ip}): {reason}{more}"
+        )
 
 
 # ----------------------------------------------------------------------
@@ -768,6 +935,7 @@ class _ListenCycle:
             self._options.max_connections,
             self._options.max_connections_per_client,
             grace=self._options.eviction_grace,
+            stall=self._options.request_stall,
         )
         self.requests = manager.requests
         self._triage = None
@@ -967,6 +1135,9 @@ class _ListenCycle:
             return
         self._start_handler(entry, ip, config)
 
+    def retry_login_at(self, key):
+        return self._slots.retry_at(key)
+
     def admit_login(self, conn, ip, key, config, request):
         """Called by the triage for a complete login with no slot: evict a
         non-login connection for it. False when every slot holds a login."""
@@ -995,10 +1166,16 @@ class _ListenCycle:
         try:
             if request is None:
                 request, kind = read_request(
-                    entry.conn, self._options.request_timeout, self.requests.classify
+                    entry.conn,
+                    self._options.request_timeout,
+                    self.requests.classify,
+                    receive=entry.receive,
                 )
-            if kind is None or not self._slots.promote(entry, kind):
+            if kind is None:
                 logger.debug(f"Incomplete sleeping-server request from {ip} dropped")
+            elif not self._slots.promote(entry, kind):
+                # Evicted just as its request completed: a word, not a reset.
+                self._reply_busy(entry.conn, kind, request, config)
             else:
                 outcome = self._serve_request(entry, ip, config, request, kind)
         except Exception:
@@ -1014,8 +1191,18 @@ class _ListenCycle:
             self._manager.refusals.note(outcome.player_name, ip, "invalid name")
         if outcome.wake and not self.claim_wake(outcome.player_name, ip):
             logger.debug(
-                f"{outcome.player_name} ({ip}) joined while the server is already starting"
+                f"{safe_for_log(outcome.player_name)} ({ip}) joined while the "
+                "server is already starting"
             )
+
+    def _reply_busy(self, conn, kind, request, config):
+        try:
+            reply = self.requests.busy_reply(kind, request, config)
+            if reply:
+                conn.settimeout(self._options.status_timeout)
+                conn.sendall(reply)
+        except (OSError, ValueError):
+            pass
 
     def _serve_request(self, entry, ip, config, request, kind):
         # A ping gets little time (a client that never sends the Ping must
@@ -1028,7 +1215,7 @@ class _ListenCycle:
 
         def is_allowed(name, client_ip):
             allowed, message = self._manager.is_allowed(name, client_ip)
-            self._slots.promote(entry, "allowed" if allowed else "refused")
+            self._slots.promote(entry, ALLOWED if allowed else "refused")
             return allowed, message
 
         entry.conn.settimeout(timeout)
@@ -1268,7 +1455,10 @@ class AutoStartManager:
         with self._lock:
             if self._closed:
                 return
-        logger.info(f"{name} ({ip}) is trying to join: starting the Minecraft server")
+        logger.info(
+            f"{safe_for_log(name)} ({ip}) is trying to join: "
+            "starting the Minecraft server"
+        )
         try:
             started = bool(self.controller.start_server())
         except Exception:

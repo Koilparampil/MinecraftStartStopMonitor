@@ -39,6 +39,15 @@ reports into lifecycle state.
   ``pause``, scripts may ``read``) does not keep the server "running": once
   the tree has had a server process, two scans without one count as an exit
   (the first also closes our stdin pipe so such a launcher can return).
+- What a launch leaves once its server has stopped: the launch script while
+  it does post-stop work (a backup, a pipeline's ``tee``), and background
+  helpers that ran with the server (a tunnel, a backup loop). Nothing is
+  ever ended while that launch script runs: the next launch waits for it
+  (up to ``stopTimeout``, abortable when the monitor shuts down). Once it
+  has exited, its helpers are ended (SIGTERM, then SIGKILL), at the latest
+  right before the next launch, so a new launch never reuses an old helper
+  nor has one ended underneath it. Pending cleanups survive a monitor
+  restart in ``data/pending-cleanup.json``.
 - Stop: ``stop`` on our stdin pipe (or the RCON ``graceful_stopper`` for an
   adopted server; also RCON when stdin did not work within 15 s), wait
   ``stopTimeout`` for the whole tree, then terminate (SIGTERM runs the JVM
@@ -48,6 +57,7 @@ reports into lifecycle state.
 """
 
 import contextlib
+import json
 import logging
 import ntpath
 import os
@@ -57,6 +67,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import psutil
@@ -68,11 +79,13 @@ logger = logging.getLogger(__name__)
 
 IS_WINDOWS = os.name == "nt"
 PID_FILE_NAME = "server.pid"
+LEFTOVERS_FILE_NAME = "pending-cleanup.json"
 CONSOLE_LOG_NAME = "server-console.log"
 STOP_COMMAND = b"stop\n"
 DEFAULT_STOP_TIMEOUT = 120.0
 
 _INFO_ATTRS = ["name", "exe", "cmdline"]
+_SHUTTING_DOWN = "shutting down"  # _launch_blocker(): skip the launch
 # cmd.exe cannot pass these through a quoted list-form .bat/.cmd element.
 _CMD_UNQUOTABLE = frozenset('"%')
 
@@ -472,6 +485,66 @@ def _fresh_process(pid: int):
         raise _unknown(e) from e
 
 
+def _identity_of(process) -> ProcessIdentity | None:
+    """(pid, start key) of a live process; None if gone or unknown."""
+    if not _is_alive(process):
+        return None
+    try:
+        key = process_start_key(process.pid)
+    except ProcessStateUnknown:
+        return None
+    return ProcessIdentity(process.pid, key) if key is not None else None
+
+
+def _still_running(identity: ProcessIdentity) -> bool:
+    """Like _liveness, but unknown counts as running (never "exited")."""
+    try:
+        return _liveness(identity)
+    except ProcessStateUnknown:
+        return True
+
+
+def _signal_identity(identity: ProcessIdentity, method: str) -> None:
+    """terminate()/kill() the process, only if it is still that process."""
+    try:
+        process = _fresh_process(identity.pid)
+        if process is None or not _liveness(identity):
+            return
+    except ProcessStateUnknown:
+        return
+    with contextlib.suppress(psutil.Error, OSError):
+        getattr(process, method)()
+
+
+def _identity_to_json(identity: ProcessIdentity | None):
+    return None if identity is None else [identity.pid, identity.create_time]
+
+
+def _identity_from_json(value) -> ProcessIdentity | None:
+    """A saved [pid, start key]; None unless both are valid (a PID alone
+    could name a reused process)."""
+    try:
+        pid, key = value
+        pid, key = int(pid), float(key)
+    except (TypeError, ValueError):
+        return None
+    return ProcessIdentity(pid, key) if pid > 0 else None
+
+
+@dataclass(eq=False)  # each launch is its own entry, whatever it holds
+class _Leftovers:
+    """What one launch leaves once its server has stopped: its launch script
+    (the tracked root) while it still runs, and the background helpers that
+    ran with the server. Post-stop work belongs to the launch script, so the
+    helpers are ended only once it has exited."""
+
+    launcher: ProcessIdentity | None
+    helpers: list  # ProcessIdentity, each with its start key
+    stopped_at: float  # time.monotonic() when the server stopped (or loaded)
+    kill_at: dict = field(default_factory=dict)  # pid -> SIGKILL due (SIGTERMed)
+    warned: bool = False  # "still running after stopTimeout" was logged
+
+
 def _may_match_linux(pid: int, target: str) -> bool:
     """Cheap prefilter: does processName appear in comm, cmdline or exe?"""
     base = f"{getattr(psutil, 'PROCFS_PATH', '/proc')}/{pid}"
@@ -548,16 +621,19 @@ class OSProcessManager:
     WAIT_INTERVAL = 0.2
     STDIN_STOP_GRACE = 15.0  # then also send `stop` over RCON
     SERVER_GONE_SCANS = 2  # scans without the server before its launcher is ignored
-    HELPER_GRACE_MAX = 30.0  # helpers outliving the server: min(this, stopTimeout)
-    HELPER_KILL_GRACE = 10.0  # after SIGTERM to such a helper, before SIGKILL
+    HELPER_KILL_GRACE = 10.0  # after SIGTERM to a leftover helper, before SIGKILL
+    CLOSE_CLEANUP_WAIT = 1.0  # close(): how long SIGTERMed helpers may take to exit
+    WAIT_NOTE_INTERVAL = 10.0  # progress log while waiting for a launch script
 
     def __init__(
         self,
         graceful_stopper: Callable[[], bool] | None = None,
         pid_file: str | None = None,
+        leftovers_file: str | None = None,
     ):
         self._graceful_stopper = graceful_stopper
         self._pid_file = pid_file
+        self._leftovers_file = leftovers_file
         self._lock = threading.RLock()
         self._identity: ProcessIdentity | None = None
         self._popen: subprocess.Popen | None = None
@@ -566,10 +642,13 @@ class OSProcessManager:
         self._members: set = set()  # descendants of the tracked process seen
         self._stopping: ProcessIdentity | None = None  # identity being stopped
         self._helpers: set = set()  # non-server processes seen with the server
-        self._cleanup: dict = {}  # helpers of a stopped server -> next signal
-        self._signalled: set = set()  # helpers already sent SIGTERM
-        self._previous_launcher: psutil.Process | None = None
+        self._leftovers: list[_Leftovers] = []  # earlier launches, oldest first
+        self._launching = False
+        # Set when the monitor shuts down: close(), plus the runtime's own
+        # event (watch_shutdown) so a waiting launch is skipped in time.
+        self._shutdown_events = [threading.Event()]
         self._load_identity_from_file()
+        self._load_leftovers()
 
     # ------------------------------------------------------------------
     # Tracking
@@ -585,7 +664,9 @@ class OSProcessManager:
         return self._pid_file or settings.data_path(PID_FILE_NAME)
 
     def set_known_identity(self, identity: ProcessIdentity) -> None:
-        """Record the process we own before any SERVER_STARTED is committed."""
+        """Record the process we own before any SERVER_STARTED is committed
+        (an adopted server). What earlier launches left is no longer ended:
+        the server running now may use it (a reused tunnel)."""
         with self._lock:
             if self._popen is not None and self._popen.pid != identity.pid:
                 self._release_popen_locked()
@@ -593,14 +674,18 @@ class OSProcessManager:
                 self._reset_tree_watch_locked()
             self._identity = identity
             self._write_pid_file(identity)
+            abandoned, self._leftovers = self._leftovers, []
+        if abandoned:
+            self._abandon(abandoned, "a server process is running again")
+            self._save_leftovers()
 
     def clear_identity(self, expected: ProcessIdentity | None) -> bool:
         """Compare-and-clear: never forget a replacement process.
 
-        The tracked server is over. Background helpers that ran with it are
-        ended after a grace (see _run_cleanup). A launcher still running
-        (post-stop work such as a backup) is never touched: the next launch
-        waits for it instead."""
+        The tracked server is over. What its launch leaves (the launch script
+        doing post-stop work, background helpers) is remembered: the helpers
+        are ended once the launch script has exited (_run_cleanup), and the
+        next launch waits for the launch script first."""
         with self._lock:
             current = self._identity
             if current is None or expected is None or not current.matches(expected):
@@ -611,18 +696,8 @@ class OSProcessManager:
             self._remove_pid_file()
             if self._popen is not None and self._popen.pid == current.pid:
                 self._release_popen_locked()
-        self._schedule_cleanup(helpers)
-        self._remember_launcher(current)
+        self._leave_behind(current, helpers)
         return True
-
-    def _remember_launcher(self, identity: ProcessIdentity):
-        try:
-            launcher = _fresh_process(identity.pid) if _liveness(identity) else None
-        except ProcessStateUnknown:
-            launcher = None
-        if launcher is not None:
-            with self._lock:
-                self._previous_launcher = launcher
 
     def identity_is_running(self, identity: ProcessIdentity | None) -> bool:
         """True while the process lives, or (for the tracked identity) a
@@ -714,17 +789,16 @@ class OSProcessManager:
     def observe(self) -> ProcessSnapshot:
         """I/O-only observation for the lifecycle supervisor (one per scan).
 
-        Also ends, once their grace is over, background helpers of a server
-        that has stopped. Raises ProcessStateUnknown when the OS cannot be
-        asked; the runtime then keeps the last state."""
-        self._run_cleanup()
+        While no server runs, it also ends the background helpers of earlier
+        launches whose launch script has exited (_run_cleanup). Raises
+        ProcessStateUnknown when the OS cannot be asked; the runtime then
+        keeps the last state."""
         tracked = self.tracked_identity
         running = tracked is not None and self._tracked_running(tracked)
-        return ProcessSnapshot(
-            tracked=tracked,
-            tracked_running=running,
-            found=self.find_process_identity(),
-        )
+        found = self.find_process_identity()
+        if tracked is None and found is None:
+            self._run_cleanup()
+        return ProcessSnapshot(tracked=tracked, tracked_running=running, found=found)
 
     def _tracked_running(self, tracked: ProcessIdentity) -> bool:
         root_alive = self._root_alive(tracked)
@@ -819,6 +893,9 @@ class OSProcessManager:
             logger.error(f"Cannot create the monitor data directory: {e}")
             return None
         problem = self._server_dir_problem(server_dir) or self._launch_blocker()
+        if problem is _SHUTTING_DOWN:
+            logger.info("Shutting down: not starting the server")
+            return None
         if problem is not None:
             logger.error(f"Cannot launch the Minecraft server: {problem}")
             return None
@@ -854,11 +931,20 @@ class OSProcessManager:
             )
         return None
 
-    def _launch_blocker(self) -> str | None:
+    def _launch_blocker(self):
         """Wait for the previous launch script to finish its post-stop work
-        (up to stopTimeout), then refuse if a server process is running in
-        the directory already: never two servers on one world."""
-        self._await_previous_launcher()
+        (up to stopTimeout) and end what earlier launches left behind, then
+        refuse if a server process is running in the directory already:
+        never two servers on one world. _SHUTTING_DOWN when the monitor
+        began shutting down meanwhile."""
+        with self._lock:
+            self._launching = True
+        try:
+            if not self._await_previous_launchers() or not self._finish_leftovers():
+                return _SHUTTING_DOWN
+        finally:
+            with self._lock:
+                self._launching = False
         try:
             found = self.find_process_identity()
         except ProcessStateUnknown as e:
@@ -870,24 +956,63 @@ class OSProcessManager:
             )
         return None
 
-    def _await_previous_launcher(self):
+    def watch_shutdown(self, event: threading.Event) -> None:
+        """Skip a launch still waiting (for the previous launch script, or
+        for leftovers to exit) once *event* is set: the lifecycle runtime's
+        close() sets it before it waits for the process worker."""
         with self._lock:
-            launcher, self._previous_launcher = self._previous_launcher, None
-        if launcher is None or not _is_alive(launcher):
-            return
+            self._shutdown_events.append(event)
+
+    def _shutting_down(self) -> bool:
+        return any(event.is_set() for event in self._shutdown_events)
+
+    def _pause(self, seconds: float) -> bool:
+        """Sleep *seconds*; True (at once) if the monitor shuts down."""
+        deadline = time.monotonic() + seconds
+        while not self._shutting_down():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self._shutdown_events[-1].wait(min(remaining, 0.05))
+        return True
+
+    def _running_launchers(self) -> list:
+        with self._lock:
+            pending = list(self._leftovers)
+        running = [self._running_launcher(entry) for entry in pending]
+        return [launcher for launcher in running if launcher is not None]
+
+    def _await_previous_launchers(self) -> bool:
+        """Wait up to stopTimeout for earlier launch scripts to finish their
+        post-stop work. False if the monitor began shutting down meanwhile."""
+        if self._shutting_down():
+            return False
+        launchers = self._running_launchers()
+        if not launchers:
+            return True
         timeout = _seconds(settings.stopTimeout, DEFAULT_STOP_TIMEOUT)
         logger.info(
             f"Waiting up to {timeout:g}s for the previous launch script (pid "
-            f"{launcher.pid}) to finish before starting the server"
+            f"{launchers[0].pid}) to finish before starting the server"
         )
-        deadline = time.monotonic() + timeout
-        while _is_alive(launcher) and time.monotonic() < deadline:
-            time.sleep(self.WAIT_INTERVAL)
-        if _is_alive(launcher):
+        started = time.monotonic()
+        next_note = started + self.WAIT_NOTE_INTERVAL
+        while launchers and time.monotonic() - started < timeout:
+            if self._pause(self.WAIT_INTERVAL):
+                return False
+            launchers = self._running_launchers()
+            if launchers and time.monotonic() >= next_note:
+                next_note += self.WAIT_NOTE_INTERVAL
+                logger.info(
+                    "Still waiting for the previous launch script (pid "
+                    f"{launchers[0].pid})"
+                )
+        if launchers:
             logger.warning(
-                f"The previous launch script (pid {launcher.pid}) is still running "
-                "after the stop timeout; starting the server anyway"
+                f"The previous launch script (pid {launchers[0].pid}) is still "
+                "running after the stop timeout; starting the server anyway"
             )
+        return True
 
     def _spawn(self, args, cwd: str, log_path: str) -> subprocess.Popen | None:
         with contextlib.ExitStack() as stack:
@@ -1141,54 +1266,228 @@ class OSProcessManager:
                 p for p in processes if p not in servers and p.pid != root
             )
 
-    def _schedule_cleanup(self, helpers: list):
-        if not helpers:
+    # ------------------------------------------------------------------
+    # What a launch leaves behind (see the module docstring)
+    # ------------------------------------------------------------------
+
+    def _leave_behind(self, launcher: ProcessIdentity, helpers: list):
+        """Remember what the stopped server's launch leaves: its launch
+        script while it still runs (post-stop work, which the next launch
+        waits for) and the background helpers that ran with the server."""
+        running = _still_running(launcher)
+        identities = [i for i in map(_identity_of, helpers) if i is not None]
+        if not running and not identities:
             return
-        stop_timeout = _seconds(settings.stopTimeout, DEFAULT_STOP_TIMEOUT)
-        grace = min(stop_timeout, self.HELPER_GRACE_MAX)
-        due = time.monotonic() + grace
-        with self._lock:
-            for helper in helpers:
-                self._cleanup.setdefault(helper, due)
-        pids = sorted(helper.pid for helper in helpers)
-        logger.info(
-            f"Background processes {pids} started with the server will be ended "
-            f"in {grace:g}s unless they exit"
+        leftovers = _Leftovers(
+            launcher if running else None, identities, time.monotonic()
         )
+        with self._lock:
+            self._leftovers.append(leftovers)
+        self._save_leftovers()
+        if identities:
+            pids = sorted(identity.pid for identity in identities)
+            when = (
+                f"once its launch script (pid {launcher.pid}) has exited"
+                if running
+                else "now that its launch script has exited"
+            )
+            logger.info(
+                f"Background processes {pids} started with the server will be "
+                f"ended {when}"
+            )
+
+    def _running_launcher(self, leftovers: _Leftovers) -> ProcessIdentity | None:
+        """The launch's script while it still runs (forgotten once exited)."""
+        launcher = leftovers.launcher
+        if launcher is None:
+            return None
+        if _still_running(launcher):
+            return launcher
+        with self._lock:
+            leftovers.launcher = None
+        return None
 
     def _run_cleanup(self):
-        """End helpers of a stopped server whose grace is over: SIGTERM, then
-        SIGKILL HELPER_KILL_GRACE later. Best-effort, never the launcher."""
-        now = time.monotonic()
+        """End the helpers of earlier launches whose launch script has
+        exited: SIGTERM, then SIGKILL HELPER_KILL_GRACE later. A launch
+        script that still runs is never touched, nor what it started."""
         with self._lock:
-            due = [helper for helper, at in self._cleanup.items() if at <= now]
-        for helper in due:
-            if not _is_alive(helper) or helper in self._signalled:
-                if _is_alive(helper):
-                    with contextlib.suppress(psutil.Error, OSError):
-                        helper.kill()
+            pending = list(self._leftovers)
+        if not pending:
+            return
+        for leftovers in pending:
+            launcher = self._running_launcher(leftovers)
+            if launcher is not None:
+                self._warn_lingering(leftovers, launcher)
+            elif self._end_helpers(leftovers):
                 with self._lock:
-                    self._cleanup.pop(helper, None)
-                    self._signalled.discard(helper)
+                    if leftovers in self._leftovers:
+                        self._leftovers.remove(leftovers)
+        self._save_leftovers()
+
+    def _end_helpers(self, leftovers: _Leftovers) -> bool:
+        """One step of ending a launch's helpers; True once none is left."""
+        now = time.monotonic()
+        alive = [helper for helper in leftovers.helpers if _still_running(helper)]
+        for helper in alive:
+            kill_at = leftovers.kill_at.get(helper.pid)
+            if kill_at is None:
+                logger.info(
+                    f"Ending background process {helper.pid} left by the server's "
+                    "launch"
+                )
+                _signal_identity(helper, "terminate")
+                leftovers.kill_at[helper.pid] = now + self.HELPER_KILL_GRACE
+            elif now >= kill_at:
+                _signal_identity(helper, "kill")
+        with self._lock:
+            leftovers.helpers = alive
+        return not alive
+
+    def _warn_lingering(self, leftovers: _Leftovers, launcher: ProcessIdentity):
+        timeout = _seconds(settings.stopTimeout, DEFAULT_STOP_TIMEOUT)
+        with self._lock:
+            if self._launching or leftovers.warned:
+                return
+            if time.monotonic() - leftovers.stopped_at < timeout:
+                return
+            leftovers.warned = True
+        logger.warning(
+            f"The launch script (pid {launcher.pid}) is still running "
+            f"{timeout:g}s after the server stopped; leaving it alone. What it "
+            "started in the background is ended once it exits."
+        )
+
+    def _finish_leftovers(self) -> bool:
+        """Right before a launch: end what earlier launches left, so the new
+        launch never finds an old helper to reuse, nor has one ended under
+        it later. A launch script still running after the wait is the
+        user's: what it started is left alone. False if the monitor began
+        shutting down meanwhile (the rest is kept for the next start)."""
+        with self._lock:
+            pending, self._leftovers = self._leftovers, []
+        ending = []
+        for leftovers in pending:
+            launcher = self._running_launcher(leftovers)
+            if launcher is not None:
+                reason = f"its launch script (pid {launcher.pid}) still runs"
+                self._abandon([leftovers], reason)
+            else:
+                ending.append(leftovers)
+        deadline = time.monotonic() + self.HELPER_KILL_GRACE + self.KILL_TIMEOUT
+        while True:
+            ending = [
+                leftovers for leftovers in ending if not self._end_helpers(leftovers)
+            ]
+            if not ending:
+                break
+            if time.monotonic() >= deadline:
+                self._abandon(ending, "they survived SIGKILL")
+                break
+            if self._pause(self.WAIT_INTERVAL):
+                with self._lock:
+                    self._leftovers.extend(ending)
+                self._save_leftovers()
+                return False
+        self._save_leftovers()
+        return True
+
+    @staticmethod
+    def _abandon(abandoned: list, reason: str):
+        pids = sorted(
+            helper.pid for leftovers in abandoned for helper in leftovers.helpers
+        )
+        if pids:
+            logger.warning(
+                f"Leaving background processes {pids} of an earlier launch alone: "
+                f"{reason}"
+            )
+
+    @property
+    def leftovers_file(self) -> str:
+        return self._leftovers_file or settings.data_path(LEFTOVERS_FILE_NAME)
+
+    def _save_leftovers(self):
+        """Persist pending cleanups (atomic), so a monitor restart finishes
+        them; no file when there is nothing to do."""
+        with self._lock:
+            launches = [
+                {
+                    "launcher": _identity_to_json(leftovers.launcher),
+                    "helpers": [_identity_to_json(h) for h in leftovers.helpers],
+                }
+                for leftovers in self._leftovers
+            ]
+            try:
+                path = self.leftovers_file
+                if not launches:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(path)
+                    return
+                temp_path = f"{path}.tmp"
+                with open(temp_path, "w", encoding="utf-8") as file:
+                    json.dump({"version": 1, "launches": launches}, file)
+                os.replace(temp_path, path)
+            except OSError as e:
+                logger.warning(f"Could not save the pending process cleanup: {e}")
+
+    def _load_leftovers(self):
+        """Pending cleanups of an earlier monitor run. Entries whose process
+        is gone, or whose PID now names another process, are dropped."""
+        try:
+            path = self.leftovers_file
+            with open(path, encoding="utf-8") as file:
+                launches = json.load(file).get("launches", [])
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, AttributeError) as e:
+            logger.warning(f"Ignoring an unreadable pending process cleanup: {e}")
+            return
+        now = time.monotonic()
+        for entry in launches if isinstance(launches, list) else []:
+            if not isinstance(entry, dict):
                 continue
-            logger.info(f"Ending background process {helper.pid} left by the server")
-            with contextlib.suppress(psutil.Error, OSError):
-                helper.terminate()
-            with self._lock:
-                self._signalled.add(helper)
-                self._cleanup[helper] = now + self.HELPER_KILL_GRACE
+            launcher = _identity_from_json(entry.get("launcher"))
+            if launcher is not None and not _still_running(launcher):
+                launcher = None
+            helpers = [_identity_from_json(h) for h in entry.get("helpers") or []]
+            helpers = [h for h in helpers if h is not None and _still_running(h)]
+            if launcher is not None or helpers:
+                self._leftovers.append(_Leftovers(launcher, helpers, now))
+        if self._leftovers:
+            pids = sorted(h.pid for entry in self._leftovers for h in entry.helpers)
+            logger.info(
+                f"Processes left by an earlier launch are pending cleanup: {pids}"
+            )
 
     # ------------------------------------------------------------------
     # Popen and PID file bookkeeping
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Close our pipes. Never stops the server (it is adopted next time)."""
+        """Close our pipes. Never stops the server (it is adopted next time).
+
+        Ends the background helpers of earlier launches whose launch script
+        has exited; the rest is kept in the pending-cleanup file and
+        finished by the next monitor."""
+        self._shutdown_events[0].set()
         with self._lock:
             popen = self._popen
         if popen is not None:
             self._close_stdin(popen)
             self._reap(popen)
+        if self.tracked_identity is None:
+            deadline = time.monotonic() + self.CLOSE_CLEANUP_WAIT
+            self._run_cleanup()
+            while self._ending_helpers() and time.monotonic() < deadline:
+                time.sleep(self.WAIT_INTERVAL)
+                self._run_cleanup()
+        self._save_leftovers()
+
+    def _ending_helpers(self) -> bool:
+        """Helpers were sent SIGTERM and may not have exited yet."""
+        with self._lock:
+            return any(leftovers.kill_at for leftovers in self._leftovers)
 
     def _popen_for(self, identity: ProcessIdentity) -> subprocess.Popen | None:
         with self._lock:

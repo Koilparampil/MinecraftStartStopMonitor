@@ -86,7 +86,7 @@ Attribute names, defaults and the nested YAML mapping are defined in
 | `sleepingMotd`, `startingMessage`, `sleepingVersionName`, `respectWhitelist` | `autoStart.*` | sleeping-server presentation and access policy |
 | `autoStopDelay` | `autoStop.stopDelay` | seconds empty before auto-stop (600) |
 | `webBindHost`, `webServerPort` (25580), `webUsername`, `webPassword`, `controlServerThroughWeb`, `showServerIPAddress`, `webConsole`, `playerAvatars` | `web.*` | dashboard |
-| `dataDir` | `monitor.dataDir` | monitor state dir (`data/`): `players.json`, `server.pid`, `server-console.log`; use `settings.data_path(name)` |
+| `dataDir` | `monitor.dataDir` | monitor state dir (`data/`): `players.json`, `server.pid`, `server-console.log`, `pending-cleanup.json`; use `settings.data_path(name)` |
 
 `settings.resolve_server_properties()` fills `None` ports/password/bind host from
 `server.properties`; `main` calls it after CLI overrides, before
@@ -230,6 +230,23 @@ Passive backend (no threads, no events). API in the stub. Semantics:
 - `observe()`, `identity_is_running()` (zombie = not running; reap our Popen),
   `set_known_identity`, `clear_identity`, `close()` (close pipes, do **not** stop
   the server).
+- What a launch leaves once its server stopped (`clear_identity`): the launch
+  script (the tracked root) while it does post-stop work, and the background
+  helpers that ran with the server, each as (PID, start key).
+  - Nothing is ended while that launch script runs. `launch_process()` waits
+    for it first (up to `stopTimeout`, a progress line every 10 s), then ends
+    the helpers of every earlier launch whose script has exited (SIGTERM,
+    10 s, SIGKILL) before it spawns. `observe()` does the same while no
+    server runs. Helpers of a launch script still running after the wait are
+    left alone, as are all of them when a server is adopted: the server
+    running now may use them.
+  - `close()` ends the helpers whose launch script has exited and saves the
+    rest to `data/pending-cleanup.json`; the next start finishes them (a PID
+    whose start key no longer matches is ignored).
+  - `watch_shutdown(event)`: the runtime passes its closing event, so a launch
+    still waiting for the previous launch script is skipped (returns None,
+    "Shutting down: not starting the server") instead of starting a server
+    nobody supervises.
 - `create_process_manager(graceful_stopper)` picks the OS backend.
 
 ### Supervisor / runtime / auto-stop — lifecycle
@@ -288,7 +305,20 @@ unsubscribes). TCP instead of UDP:
   when binding all interfaces and available; `SO_REUSEADDR` on POSIX,
   `SO_EXCLUSIVEADDRUSE` on Windows; bind retries like the reference.
 - Accept loop with a short timeout so it notices aborts; each connection handled in
-  a daemon thread (cap ~16 concurrent) via `sleeping.handle_connection`.
+  a daemon thread via `sleeping.handle_connection`.
+- Admission (`ConnectionSlots`): 64 connections, 4 per IPv4 address or IPv6
+  /56. When full, a newcomer evicts (oldest first) a cheap connection (every
+  phase except a request in progress and an allowed login: pings, legacy
+  pings, refused logins), else a request in progress older than 0.25 s, else
+  (for a complete login only) a young `pending` connection whose client is
+  not delivering a request (nothing unread per FIONREAD, no connect or first
+  byte in the last 0.1 s). Allowed logins are never evicted. Victims are shut
+  down for reading only, so a reply in progress still goes out. Connections
+  without a slot wait in a one-thread triage; a complete login there takes a
+  slot by eviction (waiting once, ≤ 0.1 s, for a just-connected client) or is
+  told "busy".
+- Client-supplied text (player names) is logged through
+  `protocol.safe_for_log()`, which escapes control characters.
 - Config per listen cycle: `motd=settings.sleepingMotd`, `version_name`,
   `protocol_version=None`, `max_players` from server.properties (`max-players`,
   default 20), `favicon=read_server_icon(serverDir)`, `kick_message=settings.startingMessage`.

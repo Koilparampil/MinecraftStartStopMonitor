@@ -76,6 +76,7 @@ from src.auth import (
 from src.events import Event
 from src.lifecycle.messages import ActionResult, LifecycleState
 from src.minecraft import server_files
+from src.minecraft.protocol import safe_for_log
 from src.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -524,7 +525,30 @@ def _last_value(header) -> str:
     return str(header or "").split(",")[-1].strip()
 
 
-_HOST_RE = re.compile(r"[A-Za-z0-9.\-]+(:\d{1,5})?|\[[0-9A-Fa-f:.]+\](:\d{1,5})?")
+# ASCII only throughout: `\d` and str.isdigit() also accept other scripts'
+# digits and superscripts, which int() turns into a number or rejects.
+_HOST_RE = re.compile(r"(?:[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:.]+\])(?::([0-9]{1,5}))?")
+_PORT_RE = re.compile(r"[0-9]{1,5}")
+
+
+def _port_number(text) -> int | None:
+    """A TCP port (1-65535) written in ASCII digits, else None."""
+    text = str(text or "")
+    if not _PORT_RE.fullmatch(text):
+        return None
+    port = int(text)
+    return port if 0 < port < 65536 else None
+
+
+def _forwarded_host(text) -> str | None:
+    """A host[:port] value fit for the Host header, else None."""
+    match = _HOST_RE.fullmatch(text) if text else None
+    if match is None:
+        return None
+    port = match.group(1)
+    if port is not None and _port_number(port) is None:
+        return None
+    return text
 
 
 class _TrustedProxyMiddleware:
@@ -546,9 +570,12 @@ def _apply_forwarded_headers(environ, networks) -> None:
     hops = [hop.strip() for hop in environ.get("HTTP_X_FORWARDED_FOR", "").split(",")]
     client = None
     for hop in reversed([hop for hop in hops if hop]):
-        if _ip(hop) is None:
+        address = _ip(hop)
+        if address is None:
             break
-        client = hop  # the nearest address that is not one of our proxies
+        # The nearest address that is not one of our proxies, normalized:
+        # the raw text could carry anything after a "%" scope separator.
+        client = str(address)
         if not _in_networks(hop, networks):
             break
     environ["mcmonitor.proxied"] = True
@@ -557,15 +584,16 @@ def _apply_forwarded_headers(environ, networks) -> None:
     proto = _last_value(environ.get("HTTP_X_FORWARDED_PROTO")).lower()
     if proto in ("http", "https"):
         environ["wsgi.url_scheme"] = proto
-    host = _last_value(environ.get("HTTP_X_FORWARDED_HOST"))
-    if host and _HOST_RE.fullmatch(host):
+    host = _forwarded_host(_last_value(environ.get("HTTP_X_FORWARDED_HOST")))
+    if host is not None:
         environ["HTTP_HOST"] = host
-    port = _last_value(environ.get("HTTP_X_FORWARDED_PORT"))
-    if port.isdigit() and 0 < int(port) < 65536:
+    port = _port_number(_last_value(environ.get("HTTP_X_FORWARDED_PORT")))
+    if port is not None:
         # The port the proxy itself listens on: the public port, unless the
         # proxy sits behind port mapping (Docker -p 443:8443, a router).
         # _check_origin accepts it in addition to the Host header's port.
-        environ["mcmonitor.forwarded_port"] = int(port)
+        # Anything else (superscript digits, out of range) is ignored.
+        environ["mcmonitor.forwarded_port"] = port
 
 
 def _acceptable_origins(expected) -> set:
@@ -810,10 +838,10 @@ class WebServer:
         (logger.debug if quiet else logger.warning)(
             "Refused a cross-origin %s %s from %s (origin %r, expected %s)",
             request.method,
-            request.path,
+            safe_for_log(request.path),
             request.remote_addr,
             claimed[:200],
-            request.host_url.rstrip("/"),
+            safe_for_log(request.host_url.rstrip("/")),
         )
         message = (
             "Request blocked: it did not come from this dashboard's own page. "
@@ -974,7 +1002,11 @@ class WebServer:
             # the admin from logging out: end this caller's own session only.
             # "Everywhere" always needs a valid token.
             return self._handle_logout(allow_everywhere=False)
-        logger.warning("CSRF check failed for %s: %s", request.path, error.description)
+        logger.warning(
+            "CSRF check failed for %s: %s",
+            safe_for_log(request.path),
+            error.description,
+        )
         return (
             jsonify(
                 success=False,

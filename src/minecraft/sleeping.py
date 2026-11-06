@@ -33,6 +33,7 @@ from src.minecraft.protocol import (
     encode_legacy_kick,
     encode_string,
     frame_packet,
+    safe_for_log,
     send_all,
     utf16_length,
 )
@@ -249,7 +250,9 @@ def _check_access(is_allowed, name, client_ip, config) -> tuple[bool, str]:
     try:
         allowed, message = is_allowed(name, client_ip)
     except Exception:
-        logger.exception("Access check failed for %s (%s)", name, client_ip)
+        logger.exception(
+            "Access check failed for %s (%s)", safe_for_log(name), client_ip
+        )
         return False, ACCESS_ERROR_MESSAGE
     if allowed:
         return True, ""

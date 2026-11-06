@@ -2,6 +2,10 @@
 
 Open items from the final verification round, with a plan to close each one.
 
+**Status: all eight items are done.** Each item below ends with a
+**Done** note: what changed, where it differs from the proposed fix, and the
+tests that cover it.
+
 ## Where things stand
 
 - **QA history.** An independent QA pass probed the running app: auto-start,
@@ -14,11 +18,25 @@ Open items from the final verification round, with a plan to close each one.
   fixed items include the one critical issue: an unauthenticated
   "log out everywhere".
 - **New findings.** The final round found **7 new minor regressions**.
-- **Nothing critical or major is open.** Every remaining item is a minor edge
-  case: deliberate connection floods aimed at the sleeping listener, unusual
-  launch-script layouts, a malformed proxy header, or a short UI glitch.
-- **Tests.** `uv run poe test` gives 1275 passed and 1 skipped (a Windows-only
-  test). `uv run poe smoke` gives 6 passed. Lint is clean.
+- **Nothing critical or major was open.** Every remaining item was a minor
+  edge case: deliberate connection floods aimed at the sleeping listener,
+  unusual launch-script layouts, a malformed proxy header, or a short UI
+  glitch.
+- **Tests (before this plan).** `uv run poe test` gave 1275 passed and 1
+  skipped (a Windows-only test). `uv run poe smoke` gave 6 passed. Lint was
+  clean.
+- **Tests (after this plan).** `uv run poe test` gives 1352 passed and 1
+  skipped (the same Windows-only test). `uv run poe smoke` gives 7 passed.
+  Lint is clean.
+- **Live check.** The listener scenarios were re-run against a live monitor
+  (`python -m src.main` with the dummy server):
+  - 4 held legacy pings, then 8 idle reconnecting lanes, from the player's
+    address: the join woke the server on the first attempt each time;
+  - 12 × 30 refused joins: 360 of 360 got a message, and none woke it;
+  - forged names were logged escaped, on one line.
+  FU-7 was checked the same way: SIGINT during a Restart's wait for
+  `run.sh` ended the monitor in 0.1 s. No server was launched, and `run.sh`
+  was left running and saved for the next start.
 
 Severity scale used below (the same as in QA):
 - **critical:** data loss, auto-stop with players online, a server that can
@@ -28,16 +46,16 @@ Severity scale used below (the same as in QA):
 
 ## Order of work
 
-| # | Item | Area | Severity | Effort |
-|---|------|------|----------|--------|
-| 1 | [FU-1](#fu-1-x-forwarded-port-with-non-ascii-digits-crashes-requests) X-Forwarded-Port with non-ASCII digits crashes requests | web | minor (anonymous log flooding) | S |
-| 2 | [FU-2](#fu-2-invalid-player-names-are-logged-verbatim) Invalid player names logged verbatim | auto-start | minor (log forging) | S |
-| 3 | [FU-3](#fu-3-legacy-pings-are-never-evicted) Legacy pings are never evicted | auto-start | minor (wake can be blocked) | S |
-| 4 | [FU-4](#fu-4-young-idle-connections-are-protected-from-a-real-login) Young idle connections are protected from a real login | auto-start | minor (wake can be blocked) | M |
-| 5 | [FU-5](#fu-5-refused-players-in-a-burst-sometimes-get-no-message) Refused players in a burst sometimes get no message | auto-start | minor | S |
-| 6 | [FU-6](#fu-6-one-policy-for-processes-the-launch-script-leaves-behind) One policy for processes the launch script leaves behind (covers 3 findings) | lifecycle | minor | M |
-| 7 | [FU-7](#fu-7-monitor-shutdown-during-wait-for-the-previous-launch-script) Monitor shutdown during "wait for the previous launch script" | lifecycle | minor | S |
-| 8 | [FU-8](#fu-8-a-re-shown-tab-can-show-live-during-an-outage) A re-shown tab can show "Live" during an outage | web UI | minor (cosmetic) | S |
+| # | Item | Area | Severity | Effort | Status |
+|---|------|------|----------|--------|--------|
+| 1 | [FU-1](#fu-1-x-forwarded-port-with-non-ascii-digits-crashes-requests) X-Forwarded-Port with non-ASCII digits crashes requests | web | minor (anonymous log flooding) | S | Done |
+| 2 | [FU-2](#fu-2-invalid-player-names-are-logged-verbatim) Invalid player names logged verbatim | auto-start | minor (log forging) | S | Done |
+| 3 | [FU-3](#fu-3-legacy-pings-are-never-evicted) Legacy pings are never evicted | auto-start | minor (wake can be blocked) | S | Done |
+| 4 | [FU-4](#fu-4-young-idle-connections-are-protected-from-a-real-login) Young idle connections are protected from a real login | auto-start | minor (wake can be blocked) | M | Done |
+| 5 | [FU-5](#fu-5-refused-players-in-a-burst-sometimes-get-no-message) Refused players in a burst sometimes get no message | auto-start | minor | S | Done |
+| 6 | [FU-6](#fu-6-one-policy-for-processes-the-launch-script-leaves-behind) One policy for processes the launch script leaves behind (covers 3 findings) | lifecycle | minor | M | Done |
+| 7 | [FU-7](#fu-7-monitor-shutdown-during-wait-for-the-previous-launch-script) Monitor shutdown during "wait for the previous launch script" | lifecycle | minor | S | Done |
+| 8 | [FU-8](#fu-8-a-re-shown-tab-can-show-live-during-an-outage) A re-shown tab can show "Live" during an outage | web UI | minor (cosmetic) | S | Done |
 
 Effort: S is under half a day, M is about a day, both including tests.
 
@@ -80,6 +98,23 @@ Effort: S is under half a day, M is about a day, both including tests.
 - **Tests:** a unit test sending `X-Forwarded-Port` values `²`, `٣` (Arabic-Indic
   digit), `65536`, `-1`, `8443` and `abc` from a trusted proxy address. Only
   `8443` is used; nothing raises, and no traceback is logged.
+- **Done.**
+  - `_apply_forwarded_headers` parses ports with `_port_number()`: ASCII
+    digits only, 1–65535. Anything else is ignored.
+  - The `X-Forwarded-Host` port goes through the same check. Its regex no
+    longer uses `\d`, which also matches other scripts' digits.
+  - The forwarded client address is normalized (`str(ip_address(...))`). An
+    IPv6 scope id after `%` is free text and could carry control characters
+    into the log.
+  - The README's nginx block clears `X-Forwarded-Host` and
+    `X-Forwarded-Port` and explains why.
+  - Tests:
+    - `test/test_web_server.py`: strict port and host parsing, client
+      normalization;
+    - `test/integration/test_web_request.py`: `TestProxyOrigins`, the six
+      values through the full app; `TestMalformedProxyHeaders`, raw Latin-1
+      and UTF-8 header bytes through the real server: HTTP 200, no error and
+      no traceback.
 
 ## FU-2: Invalid player names are logged verbatim
 
@@ -99,6 +134,23 @@ Effort: S is under half a day, M is about a day, both including tests.
   `src/minecraft/protocol.py` that both the listener and the web server use.
 - **Tests:** feed Login Start names containing `\n`, `\r` and `\x1b[…`. Assert
   the log record is a single line with no control characters.
+- **Done.**
+  - `safe_for_log()` in `src/minecraft/protocol.py` escapes backslashes and
+    every character `str.isprintable()` rejects: C0/C1 controls, NEL, line
+    and paragraph separators, bidi overrides. It cuts text at 200 characters.
+  - The listener uses it for every logged player name: refusals, the wake
+    line, "joined while starting" and the access-check failure in
+    `sleeping.py`. Valid names can still hold invisible non-ASCII
+    characters, so all of these needed it.
+  - The web server uses it for the URL path and `Host` in the cross-origin
+    and CSRF warnings. A path can carry `%0A` or `%1B`.
+  - The handshake address is not logged anywhere, so it needed no change.
+  - Tests:
+    - `test/test_protocol.py`: `safe_for_log` cases;
+    - `test/integration/test_auto_start_listener.py`: names with `\n`, `\r`
+      and ANSI escapes over the real protocol, plus a waking name with
+      NEL/U+2028/U+202E. Every log record is printable, so one line;
+    - `test/integration/test_web_request.py`: a forged path.
 
 ## FU-3: Legacy pings are never evicted
 
@@ -122,6 +174,15 @@ Effort: S is under half a day, M is about a day, both including tests.
 - **Tests:** a unit test where a slot held by a legacy ping is evicted by a
   complete allowed login. An integration test where 4 held legacy pings from
   the joining player's address don't block the wake.
+- **Done (the inverted rule).**
+  - `ConnectionSlots._victim` treats every phase except a request in progress
+    (`pending`, `login`) and an `allowed` login as cheap. Legacy pings, and
+    any phase added later, are evictable.
+  - Tests:
+    - `test/test_auto_start.py::test_every_phase_but_an_allowed_login_is_evictable`
+      (`status`, `legacy`, `refused` and an unknown phase);
+    - `test/integration/test_auto_start_listener.py::test_held_legacy_pings_do_not_block_a_wake`
+      (fails on the old code).
 
 ## FU-4: Young idle connections are protected from a real login
 
@@ -146,6 +207,35 @@ Effort: S is under half a day, M is about a day, both including tests.
     a login; ones with buffered data are spared.
   - An integration test: 8 reconnecting idle lanes from the player's address,
     and the join wakes the server within 2 attempts.
+- **Done, with three changes to the proposal:**
+  - **FIONREAD instead of a `MSG_PEEK` recv.** A `recv(1, MSG_PEEK |
+    MSG_DONTWAIT)` through a Python socket that has a timeout first waits out
+    that timeout (measured: 1.5 s), under the slots lock. `bytes_waiting()`
+    asks the kernel with `FIONREAD`; Windows uses a zero-timeout `select()`.
+  - **Requests being delivered are spared, not only buffered ones.** Real
+    clients send the handshake and Login Start as two writes, and a client
+    has sometimes not sent anything yet in the first milliseconds after
+    accept. The burst test showed both being evicted with a reset. A young
+    pending connection is now spared while bytes wait unread, or while it
+    connected or sent its first byte less than `request_stall` (0.1 s) ago.
+    The handler's read and the time it records are one step under the lock
+    the evictor's probe takes, so the kernel can't hand over bytes unseen.
+    Idle lanes are evicted at once, never-sent first; stalled ones
+    (one-byte lanes) after 0.1 s.
+  - **The login waits rather than being told "busy".** A complete login
+    that finds only connections spared this way waits in the triage once,
+    for at most 0.1 s (`ConnectionSlots.retry_at`), then evicts one that is
+    still silent. A flood that refreshes every slot at once can't turn the
+    player away.
+  - Victims of this tier are shut down for reading only. A request that
+    completed just as it was evicted is answered "busy" instead of reset.
+  - Tests:
+    - `test/test_auto_start.py`: fake-probe unit tests for idle vs.
+      buffered/arriving entries, the just-connected grace, `retry_at`, the
+      atomic read, and `bytes_waiting` on a real socket pair;
+    - `test/integration/test_auto_start_listener.py::test_idle_lanes_do_not_block_a_wake`:
+      8 lanes from the player's address; the default grace and a long grace
+      (every lane young). Both fail on the old code.
 
 ## FU-5: Refused players in a burst sometimes get no message
 
@@ -167,6 +257,20 @@ Effort: S is under half a day, M is about a day, both including tests.
     progress still goes out.
 - **Tests:** a burst test with non-whitelisted names (12 × 30 joins) in which
   every join gets a message.
+- **Done (`SHUT_RD`).**
+  - Evicted connections are shut down for reading only. That still wakes the
+    handler's blocked read, while a reply being sent (a refusal, a status)
+    goes out.
+  - A login evicted during its access check also gets its answer.
+  - Only a `pending` connection older than the grace (stalled before its
+    request) still gets `SHUT_RDWR`.
+  - Tests:
+    - `test/integration/test_auto_start_listener.py::test_a_burst_of_refused_players_all_get_a_message`:
+      12 × 30 non-whitelisted joins through one address. Every join gets the
+      refusal or "busy" and none wakes the server. It failed on the old code
+      in 3 of 3 runs.
+    - The listener tests passed 30 of 30 repeated runs, half of them next to
+      two CPU-bound processes.
 
 ## FU-6: One policy for processes the launch script leaves behind
 
@@ -222,6 +326,51 @@ That fixed the round-2 problems, but three gaps remain.
     launching, so there is no second copy.
   - The existing post-stop-work, background-helper and lifecycle-1 tests keep
     passing.
+- **Done, as proposed:**
+  - **Per launch.** `clear_identity()` records what the ended launch leaves:
+    its launch script while it still runs, plus the helpers that ran with
+    the server, as `(pid, start key)`.
+  - **Nothing ended while the launch script runs.** Helpers of a launch are
+    ended (SIGTERM, 10 s, SIGKILL) once its script has exited. That happens
+    on the next detection scan while no server runs, or at the latest
+    synchronously in `launch_process()`. There it follows the
+    (bounded, abortable) wait for the previous launch script and comes
+    before the spawn.
+  - **Bounded.**
+    - A launch script still running `stopTimeout` after the stop is warned
+      about once and left alone.
+    - If it still runs when the next launch starts anyway, its helpers are
+      left alone too (logged): the new server may use them.
+    - Adopting a server does the same.
+  - **Monitor restarts.**
+    - `close()` ends the helpers of exited launch scripts (waiting up to 1 s
+      for SIGTERM) and saves the rest to `data/pending-cleanup.json`.
+    - The next start loads that file and drops entries whose process is
+      gone or whose start key no longer matches.
+    - The next launch also waits for a saved launch script.
+  - **Docs.** README ("Modded server tips", the `data/` files),
+    `settings.yaml.example` and `docs/ARCHITECTURE.md`.
+  - Tests in `test/integration/test_process_manager.py`:
+    - `TestPipelineLaunchScript`: `( server; sleep 3; touch marker ) | cat`.
+      The marker appears after a Stop and an auto-stop, with `stopTimeout` 1
+      (the old 1 s grace killed the pipeline). A Restart relaunches only
+      after the marker.
+    - `TestProcessSubstitutionLaunchScript`: `exec > >(tee -a run.log)`
+      followed by 40 short steps printing through `tee`; all complete. The
+      steps are 0.1 s each; the old grace was set to 1 s, so they outlast it.
+    - `TestLeftoverHelpers`:
+      - a tunnel that the script starts "only if it isn't running": the
+        next launch's tunnel survives, because the old one was ended first;
+      - `close()` ends it once the launch script has exited;
+      - the monitor is stopped during post-stop work: the next monitor
+        waits for the old script, ends the saved tunnel before launching,
+        and only one tunnel exists.
+  - Tests in `test/test_process_manager.py` (`TestLeftovers`), with faked
+    liveness and signals: the order of signals, the lingering warning,
+    save and reload, reused PIDs, unusable files, adoption, and a launch
+    script that outlives the wait.
+  - Seven of the new integration tests fail on the old code. The
+    pipeline-restart test is a regression guard and passes on both.
 
 ## FU-7: Monitor shutdown during "wait for the previous launch script"
 
@@ -244,6 +393,22 @@ That fixed the round-2 problems, but three gaps remain.
      previous launch script (pid N)".
 - **Tests:** start a Restart while the previous launcher sleeps 10 s, call
   `close()` after 1 s. It must return within 2 s, with no new server process.
+- **Done.**
+  - `LifecycleRuntime` hands its closing event to the process manager
+    (`watch_shutdown`). `close()` sets that event *before* it joins the
+    process worker; the process manager's own `close()` sets another.
+  - The wait for the previous launch script and the wait for leftover
+    helpers both stop at once when either event is set. `launch_process()`
+    then returns None and logs "Shutting down: not starting the server".
+  - While waiting, it logs "Still waiting for the previous launch script
+    (pid N)" every 10 s.
+  - Stops are still never cut short.
+  - Tests:
+    - `test/integration/test_process_manager.py::TestShutdownWhileWaitingForTheLaunchScript`:
+      a real Supervisor, LifecycleRuntime and OSProcessManager with the
+      lifecycle fakes. `close()` returns in under 2 s, no second server is
+      found, and run.sh is left alone. On the old code `close()` took 9 s.
+    - `test/test_process_manager.py::test_shutdown_skips_a_launch_that_waits`.
 
 ## FU-8: A re-shown tab can show "Live" during an outage
 
@@ -267,6 +432,20 @@ That fixed the round-2 problems, but three gaps remain.
      "Connecting…" until the first relay, instead of "Live".
 - **Tests:** a Playwright test that cuts the monitor, re-shows a hidden tab
   within 1 s, and asserts it never shows "Live" until the monitor is back.
+- **Done.**
+  - `startLive()` records `helloAt`. Its timeout follows only if a `leader`
+    or `payload` message arrived since then (`leaderSeenAt > helloAt`), and
+    otherwise becomes the leader.
+  - `becomeFollower(relayed)` shows the leader's relayed connection state,
+    or "Connecting…" until the first relay.
+  - `mirrorConnection()` ignores unknown kinds.
+  - Tests:
+    - `test/e2e/test_live_tabs.py`: an in-process WebServer, a leader tab
+      and a tab opened hidden. The test cuts the monitor and re-shows the
+      hidden tab right away. It records every connection label: no "Live"
+      during the outage, then "Live" in both tabs once the monitor is back.
+    - On the old code the hidden tab went `Paused → Connecting… → Live →
+      Reconnecting…`.
 
 ---
 

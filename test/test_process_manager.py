@@ -3,15 +3,20 @@ identity bookkeeping. No server process is started here (see
 test/integration/test_process_manager.py for real processes)."""
 
 import errno
+import json
+import logging
 import ntpath
 import os
 import sys
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import psutil
 import pytest
 
+from src import process_manager
 from src.lifecycle.messages import ProcessIdentity
 from src.process_manager import (
     OSProcessManager,
@@ -722,3 +727,189 @@ class TestCmdListCommandError:
         assert cmd_list_command_error(["java", "-jar", "100%.jar"]) is None
         assert cmd_list_command_error("run.bat 50%") is None
         assert cmd_list_command_error([]) is None
+
+
+LAUNCHER = ProcessIdentity(100, 1.0)
+HELPER = ProcessIdentity(200, 2.0)
+
+
+class TestLeftovers:
+    """What a launch leaves once its server stopped (FU-6, FU-7). Liveness
+    and signals are faked: no process is started or signalled here."""
+
+    @pytest.fixture
+    def procs(self, monkeypatch, mock_settings):
+        mock_settings.stopTimeout = 5
+        alive = {LAUNCHER.pid: LAUNCHER.create_time, HELPER.pid: HELPER.create_time}
+        signals = []
+
+        def liveness(identity):
+            return alive.get(identity.pid) == identity.create_time
+
+        def signal(identity, method):
+            signals.append((identity.pid, method))
+            if identity.pid in procs.dies_on:
+                alive.pop(identity.pid, None)
+
+        monkeypatch.setattr(process_manager, "_liveness", liveness)
+        monkeypatch.setattr(process_manager, "_signal_identity", signal)
+        monkeypatch.setattr(process_manager, "_identity_of", lambda identity: identity)
+        procs = SimpleNamespace(alive=alive, signals=signals, dies_on=set())
+        return procs
+
+    @staticmethod
+    def manager():
+        pm = OSProcessManager()
+        pm.WAIT_INTERVAL = 0.01
+        return pm
+
+    def stopped(self, launcher=LAUNCHER, helpers=(HELPER,)):
+        """A manager whose server has just stopped."""
+        pm = self.manager()
+        pm.set_known_identity(launcher)
+        pm._helpers.update(helpers)  # seen next to the running server
+        assert pm.clear_identity(launcher)
+        return pm
+
+    def test_nothing_is_ended_while_the_launch_script_runs(self, procs):
+        pm = self.stopped()
+        pm.HELPER_KILL_GRACE = 0.0
+
+        pm._run_cleanup()
+        assert procs.signals == []  # post-stop work belongs to run.sh
+
+        del procs.alive[LAUNCHER.pid]  # run.sh has exited
+        pm._run_cleanup()
+        assert procs.signals == [(HELPER.pid, "terminate")]
+        pm._run_cleanup()
+        assert procs.signals[-1] == (HELPER.pid, "kill")  # SIGTERM was ignored
+
+        del procs.alive[HELPER.pid]
+        pm._run_cleanup()
+        assert pm._leftovers == []
+        assert not os.path.exists(pm.leftovers_file)
+
+    def test_a_lingering_launch_script_is_warned_about_once(
+        self, procs, mock_settings, caplog
+    ):
+        mock_settings.stopTimeout = 0
+        pm = self.stopped()
+
+        with caplog.at_level(logging.WARNING, logger="src.process_manager"):
+            pm._run_cleanup()
+            pm._run_cleanup()
+
+        warnings = [r for r in caplog.records if "still running" in r.message]
+        assert len(warnings) == 1
+        assert procs.signals == []  # it is the user's script: left alone
+
+    def test_pending_cleanup_survives_a_monitor_restart(self, procs):
+        pm = self.stopped()
+        saved = json.loads(open(pm.leftovers_file, encoding="utf-8").read())
+        assert saved == {
+            "version": 1,
+            "launches": [{"launcher": [100, 1.0], "helpers": [[200, 2.0]]}],
+        }
+
+        pm.close()  # run.sh still runs: kept for the next monitor
+        assert procs.signals == []
+        restarted = self.manager()
+        [leftovers] = restarted._leftovers
+        assert (leftovers.launcher, leftovers.helpers) == (LAUNCHER, [HELPER])
+
+        del procs.alive[LAUNCHER.pid]
+        restarted.close()  # run.sh has exited: the helper is ended now
+        assert procs.signals == [(HELPER.pid, "terminate")]
+
+    def test_reused_pids_are_never_signalled(self, procs):
+        self.stopped()
+        procs.alive[HELPER.pid] = 99.0  # the PID now names another process
+        del procs.alive[LAUNCHER.pid]
+
+        restarted = self.manager()
+        restarted._run_cleanup()
+
+        assert restarted._leftovers == []
+        assert procs.signals == []
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "not json",
+            "[]",
+            '{"launches": [{"helpers": [[200, null], [-1, 2.0], "x"]}]}',
+        ],
+    )
+    def test_an_unusable_pending_cleanup_file_is_ignored(
+        self, procs, mock_settings, content
+    ):
+        with open(mock_settings.data_path("pending-cleanup.json"), "w") as f:
+            f.write(content)
+
+        pm = self.manager()
+        pm._run_cleanup()
+
+        assert pm._leftovers == []
+        assert procs.signals == []
+
+    def test_a_server_running_again_keeps_the_old_helpers(self, procs):
+        """An adopted server may use what the last launch left (a tunnel)."""
+        pm = self.stopped()
+        del procs.alive[LAUNCHER.pid]
+
+        pm.set_known_identity(ProcessIdentity(300, 3.0))
+        pm._run_cleanup()
+
+        assert procs.signals == []
+        assert not os.path.exists(pm.leftovers_file)
+
+    def test_the_next_launch_ends_the_leftovers_first(self, procs, monkeypatch):
+        pm = self.stopped()
+        del procs.alive[LAUNCHER.pid]
+        procs.dies_on.add(HELPER.pid)
+        monkeypatch.setattr(pm, "find_process_identity", lambda: None)
+
+        assert pm._launch_blocker() is None
+
+        assert procs.signals == [(HELPER.pid, "terminate")]
+        assert pm._leftovers == []
+
+    def test_a_launch_script_still_running_after_the_wait_is_left_alone(
+        self, procs, mock_settings, monkeypatch, caplog
+    ):
+        mock_settings.stopTimeout = 0.1
+        pm = self.stopped()
+        monkeypatch.setattr(pm, "find_process_identity", lambda: None)
+
+        with caplog.at_level(logging.WARNING, logger="src.process_manager"):
+            assert pm._launch_blocker() is None  # starts anyway
+
+        assert "still running after the stop timeout" in caplog.text
+        assert "Leaving background processes [200]" in caplog.text
+        assert procs.signals == []  # the new server may use them
+        assert pm._leftovers == []
+
+    def test_shutdown_skips_a_launch_that_waits(self, procs, mock_settings, caplog):
+        """FU-7: the wait for the previous launch script is abortable."""
+        mock_settings.stopTimeout = 60
+        pm = self.stopped()
+        pm.WAIT_NOTE_INTERVAL = 0.05
+        closing = threading.Event()
+        pm.watch_shutdown(closing)
+        result = []
+        with caplog.at_level(logging.INFO, logger="src.process_manager"):
+            launcher = threading.Thread(
+                target=lambda: result.append(pm.launch_process())
+            )
+            launcher.start()
+            time.sleep(0.3)
+            started = time.monotonic()
+            closing.set()
+            launcher.join(5)
+
+        assert result == [None]
+        assert time.monotonic() - started < 0.5
+        assert "Still waiting for the previous launch script (pid 100)" in caplog.text
+        assert "Shutting down: not starting the server" in caplog.text
+        assert procs.signals == []
+        assert pm._leftovers  # kept for the next start

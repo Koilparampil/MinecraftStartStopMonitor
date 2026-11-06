@@ -8,9 +8,9 @@ Explore the project before making changes. Use `uv` for dependencies and
 commands, always `uv run` for Python. [README.md](README.md) covers user-facing
 setup and the CLI flags. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the
 design contract: snapshot schema, event payloads, module APIs.
-[docs/FOLLOW_UP_PLAN.md](docs/FOLLOW_UP_PLAN.md) lists the open follow-up items
-from QA, with fixes and tests to add. Read it before touching the listener,
-the launch/stop chain or the dashboard's live stream.
+[docs/FOLLOW_UP_PLAN.md](docs/FOLLOW_UP_PLAN.md) records the follow-up items
+from QA and how each was closed, with its tests. Read it before touching the
+listener, the launch/stop chain or the dashboard's live stream.
 
 ## Commands
 
@@ -68,6 +68,10 @@ the launch/stop chain or the dashboard's live stream.
   - The graceful stop chain: `stop` on stdin or over RCON → wait
     `stopTimeout` → SIGTERM (a JVM shutdown hook saves; a hard kill on
     Windows) → kill.
+  - What a launch leaves (post-stop work, background helpers) is never ended
+    while its launch script runs. Helpers are ended once it has exited, at
+    the latest right before the next launch; pending cleanups survive a
+    restart in `data/pending-cleanup.json`.
   - Owns no threads and never publishes events.
 
 ### Minecraft protocol (`src/minecraft/`)
@@ -92,6 +96,8 @@ the launch/stop chain or the dashboard's live stream.
   port while the committed state is STOPPED.
   - It serves connections via `sleeping.handle_connection` and enforces
     whitelist/ops/bans.
+  - Connection caps with eviction (`ConnectionSlots`): only an allowed login
+    is never evicted; client-supplied names are logged via `safe_for_log()`.
   - On the first allowed join it releases the port, then calls
     `controller.start_server()`.
   - Re-arms on `SERVER_STOPPED` or a rejected start; disarms on

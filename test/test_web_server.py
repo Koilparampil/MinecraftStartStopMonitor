@@ -575,6 +575,22 @@ class TestProxyHelpers:
         assert environ["wsgi.url_scheme"] == "https"
         assert environ["HTTP_HOST"] == "mc.example.net"
 
+    @pytest.mark.parametrize(
+        ("hop", "client"),
+        [
+            ("fe80::1%\x1b[31mred", "fe80::1"),  # a scope id is free text
+            ("::ffff:203.0.113.9", "203.0.113.9"),
+            ("2001:DB8::0:1", "2001:db8::1"),
+        ],
+    )
+    def test_forwarded_client_is_normalized(self, mock_settings, hop, client):
+        mock_settings.trustedProxies = ["127.0.0.1"]
+        environ = {"REMOTE_ADDR": "127.0.0.1", "HTTP_X_FORWARDED_FOR": hop}
+
+        _apply_forwarded_headers(environ, _trusted_networks())
+
+        assert environ["REMOTE_ADDR"] == client
+
     def test_forwarded_port_and_bad_values(self, mock_settings):
         mock_settings.trustedProxies = ["127.0.0.1"]
         environ = {
@@ -591,6 +607,64 @@ class TestProxyHelpers:
         assert environ["wsgi.url_scheme"] == "http"
         assert environ["HTTP_HOST"] == "mc.example.net"  # never rewritten
         assert environ["mcmonitor.forwarded_port"] == 8443
+
+    @pytest.mark.parametrize(
+        ("value", "port"),
+        [
+            ("8443", 8443),
+            ("²", None),  # superscript: isdigit() but not int() (FU-1)
+            ("٣", None),  # Arabic-Indic three: int() would say 3
+            ("65536", None),
+            ("0", None),
+            ("-1", None),
+            ("+80", None),
+            ("abc", None),
+            ("", None),
+        ],
+    )
+    def test_forwarded_port_is_parsed_strictly(
+        self, mock_settings, caplog, value, port
+    ):
+        mock_settings.trustedProxies = ["127.0.0.1"]
+        environ = {
+            "REMOTE_ADDR": "127.0.0.1",
+            "HTTP_X_FORWARDED_PORT": value,
+            "wsgi.url_scheme": "http",
+            "HTTP_HOST": "mc.example.net",
+        }
+
+        _apply_forwarded_headers(environ, _trusted_networks())
+
+        assert environ.get("mcmonitor.forwarded_port") == port
+        assert caplog.records == []
+
+    @pytest.mark.parametrize(
+        ("value", "accepted"),
+        [
+            ("mc.example.net:8443", True),
+            ("[2001:db8::1]:443", True),
+            ("mc.example.net", True),
+            ("mc.example.net:²", False),
+            ("mc.example.net:٣", False),
+            ("mc.example.net:65536", False),
+            ("mc.example.net:0", False),
+            ("[2001:db8::1]:٣", False),
+        ],
+    )
+    def test_forwarded_host_port_is_parsed_strictly(
+        self, mock_settings, value, accepted
+    ):
+        mock_settings.trustedProxies = ["127.0.0.1"]
+        environ = {
+            "REMOTE_ADDR": "127.0.0.1",
+            "HTTP_X_FORWARDED_HOST": value,
+            "wsgi.url_scheme": "http",
+            "HTTP_HOST": "127.0.0.1:25580",
+        }
+
+        _apply_forwarded_headers(environ, _trusted_networks())
+
+        assert environ["HTTP_HOST"] == (value if accepted else "127.0.0.1:25580")
 
     def test_peer_key_groups_ipv6_by_64(self):
         assert (

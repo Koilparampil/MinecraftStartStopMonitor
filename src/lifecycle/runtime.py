@@ -56,7 +56,8 @@ _WORKER_JOIN_TIMEOUT = 5
 _COMMAND_TIMEOUT = 5
 # A graceful stop may wait stopTimeout, then max(30, stopTimeout) after SIGTERM
 # and 10 s after SIGKILL. A launch or stop must finish before close() returns,
-# or it would act on a server the monitor no longer supervises.
+# or it would act on a server the monitor no longer supervises. (A launch
+# still waiting for the previous launch script is skipped instead.)
 _PROCESS_WORKER_JOIN_MARGIN = 60
 _MIN_TERMINATE_WAIT = 30.0
 STOPPED_DETECTION_INTERVAL = 1.0  # seconds between scans while STOPPED
@@ -89,6 +90,11 @@ class LifecycleRuntime:
         self._process_requests: queue.Queue = queue.Queue()
 
         self._closing = threading.Event()
+        # A launch still waiting for the previous launch script is skipped
+        # once close() sets this, before close() waits for the process worker.
+        watch_shutdown = getattr(process_manager, "watch_shutdown", None)
+        if callable(watch_shutdown):
+            watch_shutdown(self._closing)
         # Set on every committed state change (and on close): the detection
         # worker scans at once instead of finishing a RUNNING-cadence wait.
         self._wake_detection = threading.Event()

@@ -1165,6 +1165,21 @@ class TestOriginCheck:
         )
         assert response.status_code == status
 
+    def test_logged_paths_and_hosts_are_escaped(self, auth_client, caplog):
+        """A URL path can carry %0A or %1B: never a forged log line (FU-2)."""
+        caplog.set_level(logging.DEBUG)
+
+        response = auth_client.post(
+            "/action%0A2026-01-01 FAKE ERROR%1B[31m",
+            data={"action": "getStatus"},
+            headers={"Origin": "http://evil.example", "Host": "localhost\x1b[2J"},
+        )
+
+        assert response.status_code == 403
+        [warning] = [r for r in caplog.records if "cross-origin" in r.getMessage()]
+        assert "/action\\n2026-01-01 FAKE ERROR\\x1b[31m" in warning.getMessage()
+        assert all(record.getMessage().isprintable() for record in caplog.records)
+
     def test_cross_origin_login_is_refused(self, client):
         response = client.post(
             "/login",
@@ -1546,6 +1561,24 @@ class TestProxyOrigins:
         }
         assert self.post_login(client, headers).status_code == 302
 
+    @pytest.mark.parametrize("port", ["²", "٣", "65536", "-1", "abc", "8443"])
+    def test_forwarded_port_is_parsed_strictly(self, proxied, caplog, port):
+        """Only a real port number is used; nothing else raises (FU-1)."""
+        _, client = proxied
+        headers = {
+            "Host": "mc.example.com",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Port": port,
+            "Origin": "https://mc.example.com:8443",
+        }
+
+        response = self.post_login(client, headers)
+
+        assert response.status_code == (302 if port == "8443" else 403)
+        assert client.get("/healthz", headers=headers).status_code == 200
+        problems = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert problems == [] and not any(r.exc_info for r in caplog.records)
+
     def test_missing_port_gets_an_accurate_hint(self, proxied):
         _, client = proxied
         headers = {
@@ -1727,6 +1760,50 @@ class TestLogoutCannotBeForged:
                     headers={"Origin": "http://evil.example"},
                 )
         assert sum("cross-origin" in r.getMessage() for r in caplog.records) == 1
+
+
+class TestMalformedProxyHeaders:
+    """Raw header bytes through the real server, from a trusted proxy (FU-1)."""
+
+    @pytest.fixture
+    def web(self, build, mock_settings):
+        mock_settings.trustedProxies = ["127.0.0.1"]
+        mock_settings.webServerPort = free_tcp_port()
+        web = build()
+        thread = threading.Thread(target=web.run, daemon=True)
+        thread.start()
+        assert web.serving.wait(5)
+        yield web
+        web.shutdown()
+        thread.join(5)
+
+    @staticmethod
+    def raw_get(port, header_bytes):
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.sendall(
+                b"GET /healthz HTTP/1.1\r\nHost: mc.example.com\r\n"
+                + header_bytes
+                + b"\r\nConnection: close\r\n\r\n"
+            )
+            reply = b""
+            while chunk := sock.recv(4096):
+                reply += chunk
+        return reply.split(b"\r\n", 1)[0]
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            b"X-Forwarded-Port: \xb2",  # superscript two, as Latin-1
+            b"X-Forwarded-Port: \xd9\xa3",  # Arabic-Indic three, as UTF-8
+            b"X-Forwarded-Host: mc.example.com:\xb9",
+        ],
+    )
+    def test_no_error_and_no_traceback(self, web, caplog, header):
+        with caplog.at_level(logging.DEBUG):
+            status = self.raw_get(web.bound_port, header)
+
+        assert status == b"HTTP/1.1 200 OK"
+        assert not any(r.levelno >= logging.ERROR or r.exc_info for r in caplog.records)
 
 
 class TestPortMappedProxy:

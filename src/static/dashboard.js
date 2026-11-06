@@ -1352,7 +1352,7 @@
   var HEARTBEAT_MS = 2000;
   var LEADER_TIMEOUT_MS = 5000;
   var channel = openChannel();
-  var live = { role: 'paused', leaderSeenAt: 0, lastPayload: null, conn: null };
+  var live = { role: 'paused', leaderSeenAt: 0, helloAt: 0, lastPayload: null, conn: null };
   var pauseTimer = null;
 
   function openChannel() {
@@ -1376,10 +1376,14 @@
     if (live.role === 'leader' || live.role === 'follower') return;
     live.role = 'candidate';
     setConnection('connecting', 'Connecting…');
+    live.helloAt = Date.now();
     post('hello');
     window.setTimeout(function () {
       if (live.role !== 'candidate') return;
-      if (Date.now() - live.leaderSeenAt < LEADER_TIMEOUT_MS) becomeFollower();
+      // Follow only a leader heard since this hello. Heartbeats heard while
+      // the tab was hidden don't count: that leader's stream may be down now,
+      // and a leader whose stream is down stays silent.
+      if (live.leaderSeenAt > live.helloAt) becomeFollower(null);
       else becomeLeader();
     }, 400 + Math.random() * 300);
   }
@@ -1389,12 +1393,14 @@
     connectStream();
   }
 
-  function becomeFollower() {
+  function becomeFollower(relayed) {
     if (live.role === 'leader') closeStream();
     live.role = 'follower';
     view.revision = -1;
     view.previousStatus = null;
-    setConnection('live', 'Live');
+    // Show the leader's own connection state; until it is relayed, the
+    // stream is not known to be up.
+    if (!mirrorConnection(relayed)) setConnection('connecting', 'Connecting…');
   }
 
   function stopLive() {
@@ -1414,10 +1420,14 @@
       if (live.lastPayload) post('payload', Object.assign({}, live.lastPayload, { csrfToken: csrfToken }));
     } else if (message.type === 'leader' || message.type === 'payload') {
       live.leaderSeenAt = Date.now();
+      var relayed = message.type === 'leader' ? message.payload : null;
       // Two leaders (a race): the one with the smaller id keeps streaming.
-      if (live.role === 'candidate' || (live.role === 'leader' && message.from < TAB_ID)) becomeFollower();
+      if (live.role === 'candidate' || (live.role === 'leader' && message.from < TAB_ID)) {
+        becomeFollower(relayed);
+      } else if (live.role === 'follower') {
+        mirrorConnection(relayed);
+      }
       if (message.type === 'payload' && live.role === 'follower') applyPayload(message.payload);
-      if (message.type === 'leader' && live.role === 'follower') mirrorConnection(message.payload);
     } else if (message.type === 'conn' && live.role === 'follower') {
       mirrorConnection({ conn: message.payload });
     } else if (message.type === 'reset' && live.role === 'follower') {
@@ -1431,7 +1441,9 @@
 
   function mirrorConnection(payload) {
     var conn = payload && payload.conn;
-    if (conn && typeof conn.text === 'string') setConnection(conn.kind, conn.text);
+    if (!conn || typeof conn.text !== 'string' || CONNECTION_KINDS.indexOf(conn.kind) === -1) return false;
+    setConnection(conn.kind, conn.text);
+    return true;
   }
 
   function liveTick() {

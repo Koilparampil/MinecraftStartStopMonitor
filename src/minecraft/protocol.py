@@ -2,7 +2,8 @@
 
 VarInt / String / UShort / Long codecs, uncompressed packet framing
 (``VarInt length + VarInt packet id + payload``) over sockets with size limits
-and an overall deadline, text-component flattening and ``§`` code stripping.
+and an overall deadline, text-component flattening and ``§`` code stripping,
+and ``safe_for_log()`` for peer text that goes into the log.
 
 Everything that parses peer data raises ProtocolError (a ValueError) for
 malformed input, ``TimeoutError`` when the deadline passes and
@@ -370,3 +371,41 @@ def strip_formatting(text: str) -> str:
 def plain_text(component: Any) -> str:
     """flatten_text + strip_formatting."""
     return strip_formatting(flatten_text(component))
+
+
+# ----------------------------------------------------------------------
+# Logging peer data
+# ----------------------------------------------------------------------
+
+LOG_TEXT_LIMIT = 200
+
+
+def safe_for_log(text: Any, limit: int = LOG_TEXT_LIMIT) -> str:
+    """*text* from a peer (a player name, a URL path), fit for one log line.
+
+    Backslashes and every character ``str.isprintable()`` rejects (control
+    characters such as newlines and ANSI escapes, line and paragraph
+    separators, invisible formatting such as bidi overrides) are written as
+    Python escapes (``\\n``, ``\\x1b``, ``\\u2028``). So a client can neither
+    start a forged log line nor send escape sequences to the operator's
+    terminal, and an escape in the output always means the client sent that
+    character. Longer text is cut to *limit* characters, ending in "...".
+    """
+    text = str(text)
+    cut = len(text) > limit
+    if cut:
+        text = text[:limit]
+    if text.isprintable() and "\\" not in text:
+        escaped = text
+    else:
+        escaped = "".join(
+            char if char.isprintable() and char != "\\" else _escape_for_log(char)
+            for char in text
+        )
+    return escaped + "..." if cut else escaped
+
+
+def _escape_for_log(char: str) -> str:
+    if char == "\\":
+        return "\\\\"
+    return char.encode("unicode_escape").decode("ascii")

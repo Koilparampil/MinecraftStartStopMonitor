@@ -23,6 +23,7 @@ from src.minecraft.protocol import (
     flatten_text,
     frame_packet,
     plain_text,
+    safe_for_log,
     strip_formatting,
     utf16_length,
     write_packet,
@@ -309,3 +310,30 @@ def test_strip_formatting(text, expected):
 
 def test_plain_text_combines_both():
     assert plain_text({"text": "§7A ", "extra": [{"text": "§aB"}]}) == "A B"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Steve", "Steve"),
+        ("Zoë_ünï", "Zoë_ünï"),  # printable non-ASCII is kept
+        ("a\nFAKE ERROR", "a\\nFAKE ERROR"),
+        ("b\r\tc", "b\\r\\tc"),
+        ("\x1b[31mRED\x1b[0m", "\\x1b[31mRED\\x1b[0m"),
+        ("x\x85y\u2028z\u2029", "x\\x85y\\u2028z\\u2029"),  # NEL, separators
+        ("ab\u202ecd", "ab\\u202ecd"),  # a bidi override
+        ("\x00\x7f\x9b", "\\x00\\x7f\\x9b"),
+        ("back\\slash", "back\\\\slash"),  # so escapes stay unambiguous
+        (None, "None"),
+    ],
+)
+def test_safe_for_log_escapes_what_could_forge_a_line(text, expected):
+    escaped = safe_for_log(text)
+
+    assert escaped == expected
+    assert escaped.isprintable()
+
+
+def test_safe_for_log_cuts_long_text():
+    assert safe_for_log("a" * 300) == "a" * 200 + "..."
+    assert safe_for_log("\n" * 10, limit=4) == "\\n" * 4 + "..."
