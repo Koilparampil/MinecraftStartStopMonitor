@@ -374,6 +374,19 @@ def _handshake(payload):
     return protocol, reader.read_varint()
 
 
+def _valid_login_name(payload):
+    """The Login Start name is one the sleeping server accepts (else the
+    login is refused before any access check)."""
+    try:
+        reader = PacketReader(payload)
+        if reader.read_varint() != 0x00:
+            return False
+        name = reader.read_string(sleeping.MAX_NAME_LENGTH)
+    except ValueError:
+        return False
+    return bool(name) and all(" " < char != "\x7f" for char in name)
+
+
 class MinecraftRequests:
     """Recognises a client's first request -- the handshake plus the packet
     after it (Status Request or Login Start), which every client sends right
@@ -382,8 +395,9 @@ class MinecraftRequests:
 
     @staticmethod
     def classify(data):
-        """None while incomplete, then "legacy", "status" or "login";
-        ValueError for anything that is not a request."""
+        """None while incomplete, then "legacy", "status", "login" or
+        "refused" (a login with an invalid name); ValueError for anything
+        that is not a request."""
         if not data:
             return None
         if data[0] == 0xFE:
@@ -395,14 +409,14 @@ class MinecraftRequests:
         if next_state == 1:
             return "status"
         if next_state in (2, 3):
-            return "login"
+            return "login" if _valid_login_name(frames[1]) else "refused"
         raise ValueError(f"unknown next state {next_state}")
 
     @staticmethod
     def busy_reply(kind, data, config, message=None):
         """*message* ("Too many connections" by default) for a login, the
         sleeping status (without the icon) for a ping; None to just close."""
-        if kind == "login":
+        if kind in ("login", "refused"):
             text = json.dumps({"text": message or BUSY_MESSAGE})
             return frame_packet(0x00, encode_string(text, None))
         if kind == "status":
@@ -995,12 +1009,7 @@ class _ListenCycle:
         if outcome is None:
             return
         logger.debug(f"Sleeping-server connection from {ip}: {outcome}")
-        if (
-            kind == "login"
-            and entry.phase == "login"
-            and outcome.player_name
-            and not outcome.wake
-        ):
+        if kind == "refused" and outcome.player_name:
             # Refused before any access check: an invalid player name.
             self._manager.refusals.note(outcome.player_name, ip, "invalid name")
         if outcome.wake and not self.claim_wake(outcome.player_name, ip):
@@ -1012,7 +1021,7 @@ class _ListenCycle:
         # A ping gets little time (a client that never sends the Ping must
         # not hold its slot); a login gets the full connection timeout, and
         # only an allowed one is protected from eviction meanwhile.
-        if kind == "login":
+        if kind in ("login", "refused"):
             timeout = self._options.connection_timeout
         else:
             timeout = self._options.status_timeout

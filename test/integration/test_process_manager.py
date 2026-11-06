@@ -203,6 +203,24 @@ def touch_stop_file(env, calls):
     return stopper
 
 
+def launcher_dies(wrapper):
+    """The launcher dies before its server (the OOM killer, an admin...):
+    the stop chain itself never signals the launcher."""
+    with contextlib.suppress(psutil.NoSuchProcess):
+        psutil.Process(wrapper.pid).terminate()
+    wait_until(lambda: gone(wrapper), message="the launcher survived SIGTERM")
+
+
+def wait_helpers_ended(pm, processes):
+    """Helpers are ended after their grace by the detection scans."""
+
+    def ended():
+        pm.observe()
+        return all(gone(ProcessIdentity(p.pid)) for p in processes)
+
+    wait_until(ended, timeout=10, message="a helper kept running")
+
+
 class TestLaunchAndDiscovery:
     def test_launch_runs_in_the_server_dir_with_a_console_log(self, env):
         pm = env.manager()
@@ -388,20 +406,19 @@ class TestGracefulStop:
         monkeypatch.setenv("FAKE_CHILD", "1")
         env.settings.stopTimeout = 1
         pm = env.manager()
+        pm.HELPER_GRACE_MAX = 0.3
         identity = env.launch(pm)
         wait_ready(env)
         parent = psutil.Process(identity.pid)
         wait_until(lambda: parent.children(recursive=True), message="no child")
         children = parent.children(recursive=True)
 
-        # The server saves and exits; its child outlives it and still holds
-        # resources, so the stop is complete only once the child is gone too.
+        # The server saves and exits; its child (a helper that ran with it)
+        # is ended after a grace, without holding back the stop.
         assert pm.terminate_process(identity) is True
 
         assert env.marker("saved-stdin")
-        assert all(
-            gone(ProcessIdentity(c.pid, process_start_key(c.pid))) for c in children
-        )
+        wait_helpers_ended(pm, children)
 
 
 @POSIX_ONLY
@@ -436,7 +453,7 @@ class TestWrapperTree:
         assert pm.terminate_process(wrapper) is True
 
         assert env.marker("saved-stdin")  # the child read our stdin pipe
-        assert gone(wrapper)
+        wait_until(lambda: gone(wrapper))  # the launcher finishes by itself
         assert not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
         log = open(
             env.settings.data_path("server-console.log"), encoding="utf-8"
@@ -459,7 +476,7 @@ class TestWrapperTree:
 
         assert calls == [True]  # no console pipe any more: RCON stop
         assert env.marker("saved-rcon")
-        assert gone(wrapper)
+        wait_until(lambda: gone(wrapper))
 
     def stop_server_by_itself(self, env, child):
         """The server exits on its own (crash, in-game /stop)."""
@@ -566,7 +583,7 @@ class TestWindowsBatchWrapper:
         # the pipe is closed so pause returns and the tree exits in time.
         assert pm.terminate_process(identity) is True
         assert env.marker("saved-stdin")
-        assert gone(identity)
+        wait_until(lambda: gone(identity))
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="/proc/stat btime")
@@ -645,7 +662,7 @@ class TestLauncherDiesBeforeItsServer:
         stopper = threading.Thread(target=lambda: result.append(pm.terminate_process()))
         stopper.start()
 
-        wait_until(lambda: gone(wrapper), message="the launcher survived SIGTERM")
+        launcher_dies(wrapper)
         seen = []
         while stopper.is_alive():
             snapshot = pm.observe()
@@ -680,6 +697,7 @@ class TestLauncherDiesBeforeItsServer:
             target=lambda: result.append(pm.terminate_process(stop_request.identity))
         )
         stopper.start()
+        launcher_dies(wrapper)
         relaunch = None
         while stopper.is_alive() and relaunch is None:  # the detection worker
             requests = supervisor.handle(
@@ -763,6 +781,7 @@ class TestBackgroundHelper:
     def test_a_dashboard_stop_does_not_wait_for_the_helper(self, helper_env):
         helper_env.settings.stopTimeout = 60
         pm = helper_env.manager()
+        pm.HELPER_GRACE_MAX = 0.5  # min(stopTimeout, 30 s) in production
         wrapper, server, helper = self.launch(helper_env, pm)
 
         started = time.monotonic()
@@ -770,5 +789,80 @@ class TestBackgroundHelper:
 
         assert time.monotonic() - started < 10  # not the 60 s stopTimeout
         assert helper_env.marker("saved-stdin")
-        wait_until(lambda: gone(ProcessIdentity(helper.pid)), message="helper kept")
         assert pm.tracked_identity is None
+        assert helper.is_running()  # ended only after its grace
+        wait_helpers_ended(pm, [helper])
+
+    def test_a_crash_ends_the_helper_after_a_grace(self, helper_env):
+        helper_env.settings.stopTimeout = 0.5  # grace: min(stopTimeout, 30 s)
+        pm = helper_env.manager()
+        wrapper, server, helper = self.launch(helper_env, pm)
+
+        server.kill()
+        assert self.scans_after_exit(pm, wrapper, server)[-1] is False
+        assert pm.clear_identity(wrapper)  # the supervisor commits the exit
+
+        assert helper.is_running()
+        wait_helpers_ended(pm, [helper])
+
+
+@POSIX_ONLY
+class TestPostStopWork:
+    """run.sh does work after the server exits (a backup): a monitor stop
+    lets it finish, and a restart waits for it before relaunching (S1)."""
+
+    @pytest.fixture
+    def post_stop(self, env):
+        env.done = env.markers / "post-stop-done"
+        write_launcher(env, after=f'sleep 3\ntouch "{env.done}"\n')
+        return env
+
+    @staticmethod
+    def launch_tree(env, pm):
+        wrapper = env.launch(pm)
+        wait_ready(env)
+        root = psutil.Process(wrapper.pid)
+        wait_until(lambda: root.children(recursive=True), message="no server child")
+        for child in root.children(recursive=True):
+            env.own(child.pid)
+        pm.observe()
+        return wrapper
+
+    @pytest.mark.parametrize("force", [True, False], ids=["stop", "auto-stop"])
+    def test_a_stop_lets_the_launch_script_finish(self, post_stop, force):
+        env = post_stop
+        pm = env.manager()
+        wrapper = self.launch_tree(env, pm)
+
+        assert pm.terminate_process(wrapper, force=force) is True
+
+        assert env.marker("saved-stdin")
+        assert not env.done.exists()  # STOPPED is not held back by the script
+        wait_until(env.done.exists, timeout=10, message="post-stop work cut off")
+        wait_until(lambda: gone(wrapper))
+
+    def test_a_restart_relaunches_only_after_the_launch_script(self, post_stop):
+        env = post_stop
+        pm = env.manager()
+        bus = EventBus()
+        supervisor = Supervisor(
+            pm, FakePlayerManager(bus), FakeBanlistManager(bus), bus
+        )
+        supervisor.server_stopping_cooldown = 0
+        [launch] = supervisor.handle(StartCommand())
+        wrapper = self.launch_tree(env, pm)
+        supervisor.handle(LaunchResult(launch.generation, wrapper))
+
+        [stop] = supervisor.handle(RestartCommand())
+        stopped = pm.terminate_process(stop.identity)
+        [relaunch] = supervisor.handle(
+            StopResult(stop.generation, stop.identity, stopped)
+        )
+        assert isinstance(relaunch, LaunchRequest)
+        assert not env.done.exists()
+
+        second = pm.launch_process()  # the process worker's launch
+        assert second is not None
+        env.own(second.pid)
+        assert env.done.exists()  # the backup finished before the relaunch
+        assert second != wrapper

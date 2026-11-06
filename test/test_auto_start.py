@@ -92,11 +92,13 @@ class LineRequests:
     def classify(data):
         if not data.endswith(b"\n"):
             return None
-        return "login" if data.startswith(b"LOGIN") else "status"
+        if not data.startswith(b"LOGIN"):
+            return "status"
+        return "refused" if b" " in data.strip()[6:] else "login"  # invalid name
 
     @staticmethod
     def busy_reply(kind, data, config, message=None):
-        if kind == "login":
+        if kind in ("login", "refused"):
             return f"DENY {message or BUSY_MESSAGE}\n".encode()
         return f"MOTD {config.motd}\n".encode()
 
@@ -992,6 +994,8 @@ class TestMinecraftRequests:
         assert classify(status[:-1]) is None  # incomplete
         assert classify(status) == "status"
         assert classify(login) == "login"
+        bad_name = handshake(2) + frame_packet(0x00, encode_string("a b"))
+        assert classify(bad_name) == "refused"
         assert classify(b"\xfe\x01") == "legacy"
         with pytest.raises(ValueError):
             classify(b"\xff\xff\xff\xff")

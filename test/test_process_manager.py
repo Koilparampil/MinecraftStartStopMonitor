@@ -20,6 +20,7 @@ from src.process_manager import (
     _is_alive,
     _probe_linux,
     build_launch_command,
+    cmd_list_command_error,
     create_process_manager,
     match_rank,
     normalized_dir,
@@ -705,3 +706,19 @@ class TestLeftoversAfterTheLauncherExited:
         manager._remember([FakeMember(5001, ["sleep", "600"], alive=False)], tracked)
 
         assert manager.observe().tracked_running is False
+
+
+class TestCmdListCommandError:
+    """The pure check app-shell runs at startup (and the launch runs too)."""
+
+    def test_reasons(self):
+        assert cmd_list_command_error(["run.bat", "nogui"]) is None
+        assert cmd_list_command_error([r"C:\R&D Server\run.bat", "a^b|c"]) is None
+        assert "as one string" in cmd_list_command_error(["run.bat", "50%"])
+        assert "as one string" in cmd_list_command_error(["run.cmd", 'say "x"'])
+        assert "as one string" in cmd_list_command_error(["run.bat", "a\nb"])
+
+    def test_anything_but_a_batch_list_is_fine(self):
+        assert cmd_list_command_error(["java", "-jar", "100%.jar"]) is None
+        assert cmd_list_command_error("run.bat 50%") is None
+        assert cmd_list_command_error([]) is None
