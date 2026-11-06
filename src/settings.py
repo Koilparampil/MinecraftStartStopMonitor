@@ -726,6 +726,14 @@ def start_command_errors(command, os_name=None):
         start_command_argv(command, os_name)
     except ValueError as e:
         return [f"minecraft.startCommand is invalid: {e}"]
+    if (os_name or os.name) == "nt" and not isinstance(command, str):
+        # The launcher refuses these lists; report it at startup rather than
+        # on the first wake. Imported here: process_manager imports settings.
+        from src.process_manager import cmd_list_command_error
+
+        reason = cmd_list_command_error(command)
+        if reason:
+            return [f"minecraft.startCommand: {reason}"]
     return []
 
 
