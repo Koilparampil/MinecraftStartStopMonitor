@@ -254,7 +254,9 @@ class SessionStore:
     def open_session(self, epoch, idle: float, lifetime: float, token_id=None) -> str:
         sid = secrets.token_urlsafe(24)
         now = self._clock()
-        record = _SessionRecord(_sha256(str(epoch)), now + lifetime, idle, now, token_id)
+        record = _SessionRecord(
+            _sha256(str(epoch)), now + lifetime, idle, now, token_id
+        )
         with self._lock:
             if len(self._sessions) >= _PRUNE_THRESHOLD:
                 self._prune_sessions(now)
@@ -344,8 +346,14 @@ class SessionStore:
             return token_id
 
     def revoke_token(self, token_id) -> None:
+        """Forget a token and end every session that was restored from it."""
+        if not token_id:
+            return
         with self._lock:
-            if token_id and self._tokens.pop(token_id, None) is not None:
+            for sid, record in list(self._sessions.items()):
+                if record.token_id == token_id:
+                    del self._sessions[sid]
+            if self._tokens.pop(token_id, None) is not None:
                 self._save()
 
     def token_count(self) -> int:
@@ -377,7 +385,9 @@ class SessionStore:
                 if float(entry["expires"]) > now
             }
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-            logger.warning("Ignoring unreadable remember-me store %s: %s", self._path, error)
+            logger.warning(
+                "Ignoring unreadable remember-me store %s: %s", self._path, error
+            )
             return {}
 
     def _save(self) -> None:
@@ -393,4 +403,6 @@ class SessionStore:
                 json.dump({"version": 1, "tokens": self._tokens}, handle)
             os.replace(temporary, self._path)
         except OSError as error:
-            logger.warning("Could not save remember-me tokens to %s: %s", self._path, error)
+            logger.warning(
+                "Could not save remember-me tokens to %s: %s", self._path, error
+            )

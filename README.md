@@ -163,8 +163,35 @@ auto-stop still work, but kick/ban/console are disabled.
 
 - Change the default dashboard password. The RCON console in the dashboard is
   equivalent to the server console (operator commands).
-- If you expose the dashboard to the internet, put it behind an HTTPS reverse
-  proxy.
+- **Sessions:**
+  - Logging out ends the session on the server, so a copied cookie stops
+    working.
+  - "Keep me signed in" lasts 7 days. Ordinary sessions also end after 12 hours
+    regardless of activity.
+  - "Log out everywhere" (in the footer) ends every session, and changing the
+    dashboard credentials does the same.
+  - Restarting the monitor logs out everyone who didn't tick "Keep me signed in".
+- **Cross-site protection:** actions only work from the dashboard's own page.
+  - Requests from other sites, or from other ports on the same host, are
+    refused, in addition to the usual CSRF tokens.
+  - Cookies are `SameSite=Strict`, so following a link to the dashboard from
+    another site shows the login page until you reload.
+- **Connection floods:**
+  - The dashboard drops requests that don't arrive within 15 s.
+  - It allows at most 24 connections per address and 128 in total, so one
+    client can't tie it up.
+  - Many users behind one NAT address share the 24.
+- **Internet exposure:** put the dashboard behind an HTTPS reverse proxy (nginx,
+  Caddy, ...), then:
+  - set `web.trustedProxies` to the proxy's address(es), e.g. `["127.0.0.1"]`,
+    so the real client address is used for the login lockout, the rate limit
+    and the logs. Never list addresses clients connect from directly;
+  - make the proxy pass the original `Host` and `X-Forwarded-For` /
+    `X-Forwarded-Proto`. In nginx:
+    `proxy_set_header Host $host; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto $scheme;`.
+    Without this, logins and actions are refused as cross-site;
+  - set `web.secureCookies: true` (HTTPS only). Cookies become `Secure` with
+    the `__Host-` prefix and HSTS is sent, and plain-HTTP logins stop working.
 - The sleeping server can't verify Mojang accounts. Someone who knows a
   whitelisted name could wake the server, but they still can't join it. With
   `respectWhitelist` (default) and a whitelist enabled, random scanners can't

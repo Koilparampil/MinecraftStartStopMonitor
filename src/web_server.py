@@ -393,17 +393,28 @@ class _GuardedWSGIServer(ThreadedWSGIServer):
         with self._connections_lock:
             same_peer = sum(1 for c in self._connections.values() if c.peer == peer)
             if not proxy and same_peer >= self.limits.max_connections_per_ip:
-                self._warn("peer", "Refusing connections from %s: too many open", address)
+                self._warn(
+                    "peer", "Refusing connections from %s: too many open", address
+                )
                 return False
-            if len(self._connections) >= self.limits.max_connections and not self._evict():
-                self._warn("full", "Refusing a connection: %s already open", len(self._connections))
+            if (
+                len(self._connections) >= self.limits.max_connections
+                and not self._evict()
+            ):
+                self._warn(
+                    "full",
+                    "Refusing a connection: %s already open",
+                    len(self._connections),
+                )
                 return False
             self._connections[request] = _Connection(peer, time.monotonic())
         return True
 
     def _evict(self) -> bool:
         """Drop the oldest connection still waiting for its request."""
-        waiting = [(c.accepted_at, s) for s, c in self._connections.items() if c.waiting]
+        waiting = [
+            (c.accepted_at, s) for s, c in self._connections.items() if c.waiting
+        ]
         if not waiting:
             return False
         _accepted, victim = min(waiting, key=lambda item: item[0])
@@ -1017,7 +1028,9 @@ class WebServer:
 
     def _rcon_status(self) -> str | None:
         try:
-            value = getattr(getattr(self.controller, "client", None), "rcon_status", None)
+            value = getattr(
+                getattr(self.controller, "client", None), "rcon_status", None
+            )
             if callable(value):
                 value = value()
         except Exception:
@@ -1074,7 +1087,9 @@ class WebServer:
             user = User(str(settings.webUsername), self._credential_epoch())
             token_id, token = None, None
             if remember:
-                token_id, token = self.sessions.issue_token(user.epoch, REMEMBER_SECONDS)
+                token_id, token = self.sessions.issue_token(
+                    user.epoch, REMEMBER_SECONDS
+                )
             self._establish_session(user, token_id)
             self.login_tracker.record_successful_login(ip)
             logger.info("Web login from %s", ip)
@@ -1115,7 +1130,9 @@ class WebServer:
     def _handle_logout(self):
         everywhere = request.form.get("scope") == "all"
         logger.info(
-            "Web logout%s from %s", " of every session" if everywhere else "", request.remote_addr
+            "Web logout%s from %s",
+            " of every session" if everywhere else "",
+            request.remote_addr,
         )
         sid = session.get("sid")
         self.sessions.revoke_token(self.sessions.close_session(sid))
@@ -1156,7 +1173,9 @@ class WebServer:
             status=status_label(snapshot),
             config=config,
             auto_start_blocked=bool(
-                config["autoStart"] and listener.get("armed") and not listener.get("listening")
+                config["autoStart"]
+                and listener.get("armed")
+                and not listener.get("listening")
             ),
             bootstrap={
                 "payload": self._payload(snapshot),

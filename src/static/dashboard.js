@@ -339,14 +339,12 @@
       if (event.target === dialog && pressedOnBackdrop) dialog.close('cancel');
       pressedOnBackdrop = false;
     });
-    // The Enter that opened the dialog (a double press, or key repeat) must
-    // not also confirm it.
-    function tooSoon() { return Date.now() - dialogOpenedAt < CONFIRM_GUARD_MS; }
+    // A second Enter right after the one that opened the dialog (a double
+    // press, or key repeat) must not also confirm it. Implicit submission
+    // and button activation are both default actions of the keydown.
     dialog.addEventListener('keydown', function (event) {
-      if (event.key === 'Enter' && (event.repeat || tooSoon())) event.preventDefault();
-    });
-    $('confirmForm').addEventListener('submit', function (event) {
-      if (tooSoon()) event.preventDefault();
+      if (event.key !== 'Enter') return;
+      if (event.repeat || Date.now() - dialogOpenedAt < CONFIRM_GUARD_MS) event.preventDefault();
     });
   }
 

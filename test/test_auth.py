@@ -2,6 +2,8 @@
 
 import threading
 
+import os
+
 import pytest
 
 from src.auth import (
@@ -246,3 +248,104 @@ class TestLoginAttemptTracker:
         clock.advance(11)
         tracker.record_failed_attempt("fresh")
         assert len(tracker._failures) == 1
+
+
+class WallClock:
+    def __init__(self, now=1_000_000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+class TestSessionStore:
+    def make(self, tmp_path=None, clock=None):
+        from src.auth import SessionStore
+
+        path = str(tmp_path / "web-sessions.json") if tmp_path else None
+        return SessionStore(path, clock=clock or WallClock())
+
+    def test_sessions_open_check_and_close(self):
+        store = self.make()
+        sid = store.open_session("epoch", idle=60, lifetime=3600, token_id="t1")
+        assert store.check_session(sid, "epoch")
+        assert not store.check_session(sid, "other-epoch")  # credentials changed
+        assert not store.check_session(sid, "epoch")  # ...and it is gone for good
+        sid = store.open_session("epoch", idle=60, lifetime=3600, token_id="t1")
+        assert store.close_session(sid) == "t1"
+        assert not store.check_session(sid, "epoch")
+        assert store.close_session(sid) is None
+        assert not store.check_session(None, "epoch")
+
+    def test_idle_timeout_slides_but_lifetime_is_absolute(self):
+        clock = WallClock()
+        store = self.make(clock=clock)
+        sid = store.open_session("e", idle=60, lifetime=150)
+        for _ in range(2):
+            clock.now += 50
+            assert store.check_session(sid, "e")  # activity keeps it alive
+        clock.now += 51  # 151 s after opening
+        assert not store.check_session(sid, "e")
+        idle = store.open_session("e", idle=60, lifetime=3600)
+        clock.now += 61
+        assert not store.check_session(idle, "e")
+
+    def test_check_without_touch_does_not_extend(self):
+        clock = WallClock()
+        store = self.make(clock=clock)
+        sid = store.open_session("e", idle=60, lifetime=3600)
+        clock.now += 40
+        assert store.check_session(sid, "e", touch=False)
+        clock.now += 30
+        assert not store.check_session(sid, "e")
+
+    def test_tokens_are_random_hashed_and_persisted(self, tmp_path):
+        store = self.make(tmp_path)
+        first_id, first = store.issue_token("e", lifetime=600)
+        second_id, second = store.issue_token("e", lifetime=600)
+        assert first != second and first_id != second_id
+        assert store.redeem_token(first, "e") == first_id
+        stored = (tmp_path / "web-sessions.json").read_text()
+        assert first.split(".", 1)[1] not in stored  # only a hash is kept
+        restarted = self.make(tmp_path)  # survives a monitor restart
+        assert restarted.redeem_token(second, "e") == second_id
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+    def test_token_file_is_private(self, tmp_path):
+        store = self.make(tmp_path)
+        store.issue_token("e", lifetime=600)
+        assert (tmp_path / "web-sessions.json").stat().st_mode & 0o077 == 0
+
+    def test_bad_expired_and_revoked_tokens(self, tmp_path):
+        clock = WallClock()
+        store = self.make(tmp_path, clock)
+        token_id, token = store.issue_token("e", lifetime=600)
+        assert store.redeem_token(token_id + ".wrong-secret", "e") is None
+        assert store.redeem_token("garbage", "e") is None
+        assert store.redeem_token(None, "e") is None
+        assert store.redeem_token(token, "e") == token_id  # wrong guesses don't burn it
+        assert store.redeem_token(token, "new-epoch") is None  # password changed
+        assert store.redeem_token(token, "e") is None
+        token_id, token = store.issue_token("e", lifetime=600)
+        store.revoke_token(token_id)
+        assert store.redeem_token(token, "e") is None
+        token_id, token = store.issue_token("e", lifetime=600)
+        clock.now += 601
+        assert store.redeem_token(token, "e") is None
+        assert store.token_count() == 0
+
+    def test_close_all_ends_sessions_and_tokens(self, tmp_path):
+        store = self.make(tmp_path)
+        sid = store.open_session("e", idle=60, lifetime=600)
+        _, token = store.issue_token("e", lifetime=600)
+        store.close_all()
+        assert not store.check_session(sid, "e")
+        assert store.redeem_token(token, "e") is None
+        assert self.make(tmp_path).token_count() == 0
+
+    def test_corrupt_store_is_ignored(self, tmp_path):
+        (tmp_path / "web-sessions.json").write_text("{not json")
+        store = self.make(tmp_path)
+        assert store.token_count() == 0
+        _, token = store.issue_token("e", lifetime=600)
+        assert self.make(tmp_path).redeem_token(token, "e")

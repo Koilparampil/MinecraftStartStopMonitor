@@ -7,8 +7,7 @@ import threading
 from unittest.mock import MagicMock
 
 import pytest
-
-from flask_login import login_user
+from flask import session
 
 from src.auth import User
 from src.events import Event, EventBus
@@ -18,7 +17,11 @@ from src.web_server import (
     COMMITTED_EVENTS,
     MAX_COMMAND_LENGTH,
     WebServer,
+    _apply_forwarded_headers,
+    _origin_of,
+    _peer_key,
     _put_latest,
+    _trusted_networks,
     clean_command,
     clean_reason,
     status_label,
@@ -60,7 +63,8 @@ def open_stream(server):
     from src.settings import settings
 
     with server.app.test_request_context():
-        login_user(User(str(settings.webUsername), server._credential_epoch()))
+        user = User(str(settings.webUsername), server._credential_epoch())
+        server._establish_session(user)
         return server._handle_stream()
 
 
@@ -340,12 +344,37 @@ class TestStreamLifetime:
     def test_load_user_requires_the_current_credential_epoch(self, mock_settings):
         server, _, _ = make_server()
         epoch = server._credential_epoch()
-        assert server._load_user(f"test_admin|{epoch}").username == "test_admin"
-        assert server._load_user("test_admin") is None  # pre-epoch session
-        assert server._load_user("test_admin|" + "0" * 32) is None
-        assert server._load_user(f"intruder|{epoch}") is None
-        mock_settings.webPassword = "changed"
-        assert server._load_user(f"test_admin|{epoch}") is None
+        with server.app.test_request_context():
+            server._establish_session(User("test_admin", epoch))
+            assert server._load_user(f"test_admin|{epoch}").username == "test_admin"
+            assert server._load_user("test_admin") is None  # pre-epoch session
+            assert server._load_user("test_admin|" + "0" * 32) is None
+            assert server._load_user(f"intruder|{epoch}") is None
+            mock_settings.webPassword = "changed"
+            assert server._load_user(f"test_admin|{epoch}") is None
+
+    def test_load_user_requires_an_open_server_side_session(self, mock_settings):
+        server, _, _ = make_server()
+        epoch = server._credential_epoch()
+        with server.app.test_request_context():
+            sid = server._establish_session(User("test_admin", epoch))
+            assert server._load_user(f"test_admin|{epoch}") is not None
+            server.sessions.close_session(sid)  # logout elsewhere
+            assert server._load_user(f"test_admin|{epoch}") is None
+            session["sid"] = "forged"
+            assert server._load_user(f"test_admin|{epoch}") is None
+
+    def test_establish_session_starts_from_a_clean_session(self, mock_settings):
+        server, _, _ = make_server()
+        with server.app.test_request_context():
+            session["csrf_token"] = "planted-secret"
+            session["planted"] = True
+            server._establish_session(User("test_admin", server._credential_epoch()))
+            assert "planted" not in session
+            assert session["csrf_token"] != "planted-secret"
+            assert server.sessions.check_session(
+                session["sid"], server._credential_epoch()
+            )
 
 
 class TestHelpers:
@@ -520,3 +549,86 @@ class TestControllerFailures:
         assert server._call_action("kick_player", "x").message == "ok"
         controller.kick_player.side_effect = RuntimeError("boom")
         assert server._call_action("kick_player", "x").success is False
+
+
+class TestProxyHelpers:
+    def test_trusted_networks_parse_lists_and_strings(self, mock_settings):
+        mock_settings.trustedProxies = ["10.0.0.0/8", "bogus", "::1"]
+        assert [str(n) for n in _trusted_networks()] == ["10.0.0.0/8", "::1/128"]
+        mock_settings.trustedProxies = "127.0.0.1, 192.168.1.0/24"
+        assert len(_trusted_networks()) == 2
+        mock_settings.trustedProxies = None
+        assert _trusted_networks() == ()
+
+    def test_forwarded_client_skips_trusted_hops(self, mock_settings):
+        mock_settings.trustedProxies = ["127.0.0.1", "10.0.0.0/8"]
+        environ = {
+            "REMOTE_ADDR": "127.0.0.1",
+            "HTTP_X_FORWARDED_FOR": "1.2.3.4, 203.0.113.9, 10.1.1.1",
+            "HTTP_X_FORWARDED_PROTO": "https",
+            "HTTP_X_FORWARDED_HOST": "mc.example.net",
+            "wsgi.url_scheme": "http",
+            "HTTP_HOST": "127.0.0.1:25580",
+        }
+        _apply_forwarded_headers(environ, _trusted_networks())
+        assert environ["REMOTE_ADDR"] == "203.0.113.9"  # 1.2.3.4 is client-supplied
+        assert environ["wsgi.url_scheme"] == "https"
+        assert environ["HTTP_HOST"] == "mc.example.net"
+
+    def test_forwarded_port_and_bad_values(self, mock_settings):
+        mock_settings.trustedProxies = ["127.0.0.1"]
+        environ = {
+            "REMOTE_ADDR": "127.0.0.1",
+            "HTTP_X_FORWARDED_FOR": "not-an-ip",
+            "HTTP_X_FORWARDED_PROTO": "gopher",
+            "HTTP_X_FORWARDED_HOST": "evil.example/path",
+            "HTTP_X_FORWARDED_PORT": "8443",
+            "wsgi.url_scheme": "http",
+            "HTTP_HOST": "mc.example.net",
+        }
+        _apply_forwarded_headers(environ, _trusted_networks())
+        assert environ["REMOTE_ADDR"] == "127.0.0.1"
+        assert environ["wsgi.url_scheme"] == "http"
+        assert environ["HTTP_HOST"] == "mc.example.net:8443"
+
+    def test_peer_key_groups_ipv6_by_64(self):
+        assert (
+            _peer_key("2001:db8::1") == _peer_key("2001:db8::ffff") == "2001:db8::/64"
+        )
+        assert _peer_key("::ffff:10.0.0.1") == "10.0.0.1"
+        assert _peer_key("192.0.2.7") == "192.0.2.7"
+
+    def test_origin_of(self):
+        assert _origin_of("http://Host:80/x") == ("http", "host", 80)
+        assert _origin_of("https://host") == ("https", "host", 443)
+        assert _origin_of("null") is None
+        assert _origin_of("http://host:99999") is None
+
+
+class TestMonitorStatus:
+    def test_rcon_status_is_read_from_the_client(self, mock_settings):
+        server, controller, _ = make_server()
+        controller.client.rcon_status = "auth_failed"
+        assert server._rcon_status() == "auth_failed"
+        controller.client.rcon_status = "nonsense"
+        assert server._rcon_status() is None
+        del controller.client
+        assert server._rcon_status() is None
+
+    def test_auto_start_status_is_validated(self, mock_settings):
+        server, _, _ = make_server()
+        assert server._auto_start_state() is None
+        server.auto_start_status = lambda: {
+            "armed": 1,
+            "listening": 0,
+            "error": OSError(98, "Address already in use"),
+        }
+        assert server._auto_start_state() == {
+            "armed": True,
+            "listening": False,
+            "error": "[Errno 98] Address already in use",
+        }
+        server.auto_start_status = MagicMock(side_effect=RuntimeError("boom"))
+        assert server._auto_start_state() is None
+        server.auto_start_status = lambda: "nope"
+        assert server._auto_start_state() is None
