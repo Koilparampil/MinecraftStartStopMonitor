@@ -66,22 +66,33 @@ same user, so it can start, find and stop the server process.
    - **Binary:** download `minecraft-monitor-windows.exe` or
      `minecraft-monitor-linux` from the latest
      [GitHub Release](https://github.com/Koilparampil/MinecraftStartStopMonitor/releases).
-   - **From source** (Python 3.11+ and [uv](https://docs.astral.sh/uv/)):
+   - **From source** (Python 3.11+ and [uv](https://docs.astral.sh/uv/)), run
+     inside this repository with the absolute path to your server folder:
      ```bash
      uv sync
-     uv run poe start
+     uv run poe start --server-dir /path/to/your/server
      ```
-2. Run it **from your server folder** (or pass `--server-dir`). On first launch,
-   the setup wizard:
+2. Run it. The binary can simply be started **from your server folder**, or be
+   given `--server-dir`. On first launch, the setup wizard:
    - finds your launch command (`./run.sh nogui` for Forge/NeoForge 1.17+,
      the Fabric/Quilt launcher jar, an old Forge jar, or `server.jar`);
    - offers to enable RCON in `server.properties` (random password,
      `broadcast-rcon-to-ops=false` so polling doesn't spam ops);
    - asks you to accept the [Minecraft EULA](https://aka.ms/MinecraftEULA) if you
      haven't yet;
-   - asks you for a dashboard password;
-   - saves `settings.yaml`.
-3. Open **http://localhost:25580** and log in (username `admin`).
+   - asks you for a dashboard password (the example password `changeme` is
+     refused at startup);
+   - saves `settings.yaml`, before it touches `server.properties` or
+     `eula.txt`.
+
+   Without a terminal (e.g. a service), pass `--server-dir`, `--start-command`
+   and `--web-password` (or `--no-web`) once instead. The monitor saves them to
+   `settings.yaml` (owner-only permissions) and later runs need no flags.
+   `server.properties` and `eula.txt` are left untouched, so enable RCON and
+   accept the EULA yourself. Don't keep `--web-password` in a unit file, because
+   command lines are visible to every user.
+3. Open **http://localhost:25580** and log in (username `admin`). The wizard
+   picks another free port if 25580 clashes with your game, RCON or query port.
 
 From then on, just leave the monitor running. Join the server from Minecraft to
 wake it up.
@@ -97,9 +108,10 @@ comments. Values left `null` are read from the server's own `server.properties`.
 The monitor keeps its own files **next to `settings.yaml`**, wherever it is
 started from:
 - `monitor.log`, rotated at 5 MB with 3 backups;
-- `session_secret.key`;
-- the `data/` folder (`monitor.dataDir`), holding `players.json`, `server.pid`
-  and the server's launch output `server-console.log`.
+- `session_secret.key` (signs the dashboard's cookies; deleting it logs everyone out);
+- the `data/` folder (`monitor.dataDir`), holding `players.json`, `server.pid`,
+  the server's launch output `server-console.log`, and `web-sessions.json`
+  (hashed "keep me signed in" tokens; deleting it ends remembered logins).
 
 Relative paths in the file (`dataDir`, `serverDir`) are resolved against the
 settings file's folder.
@@ -120,13 +132,17 @@ settings file's folder.
 | `web.controlServer` | — | Allow start/stop/restart and console commands from the web |
 | `web.console` | — | Log viewer + RCON console |
 | `web.playerAvatars` | — | Player heads from an external avatar service |
+| `web.trustedProxies` | `--trusted-proxies A,B` | Reverse-proxy IPs/CIDRs whose `X-Forwarded-*` headers are trusted (see [Security notes](#security-notes)) |
+| `web.secureCookies` | `--secure-cookies` | Mark cookies `Secure` and send HSTS (only behind HTTPS) |
 | `features.autoStart` | `--no-auto-start` | Wake the server on a join attempt |
 | `features.autoStop` | `--no-auto-stop` | Stop the server when empty |
 | `autoStop.stopDelay` | `--auto-stop-delay SEC` | Seconds empty before stopping (default 600) |
 | `autoStart.motd` / `kickMessage` / `versionName` | — | What players see while it sleeps / wakes (`§` colour codes work) |
 | `autoStart.respectWhitelist` | — | Only players allowed by whitelist/ops/bans can wake the server |
 
-⚑ = required (the setup wizard fills these in). Run with `--help` for all CLI flags.
+⚑ = required (the setup wizard fills these in). Run with `--help` for all CLI
+flags. Misspelled or unknown keys in `settings.yaml` are reported at startup
+with a "did you mean" hint.
 
 ### RCON
 
@@ -143,7 +159,10 @@ broadcast-rcon-to-ops=false
 ```
 
 Without RCON the monitor falls back to the server-list ping. Auto-start and
-auto-stop still work, but kick/ban/console are disabled.
+auto-stop still work, but kick and the console are disabled while the server
+runs. Bans can still be changed while it is stopped. If the RCON password is
+wrong, the dashboard says so and the monitor retries with a growing delay
+instead of filling the server log.
 
 ### Modded server tips
 
@@ -163,8 +182,47 @@ auto-stop still work, but kick/ban/console are disabled.
 
 - Change the default dashboard password. The RCON console in the dashboard is
   equivalent to the server console (operator commands).
-- If you expose the dashboard to the internet, put it behind an HTTPS reverse
-  proxy.
+- **Sessions:**
+  - Logging out ends the session on the server, so a copied cookie stops
+    working.
+  - "Keep me signed in" lasts 7 days. Ordinary sessions also end after 12 hours
+    regardless of activity.
+  - "Log out everywhere" (in the footer) ends every session, and changing the
+    dashboard credentials does the same.
+  - Restarting the monitor logs out everyone who didn't tick "Keep me signed in".
+- **Cross-site protection:** actions only work from the dashboard's own page.
+  - Requests from other sites, or from other ports on the same host, are
+    refused, in addition to the usual CSRF tokens.
+  - Cookies are `SameSite=Strict`, so following a link to the dashboard from
+    another site shows the login page until you reload.
+- **Connection floods:**
+  - The dashboard drops requests that don't arrive within 15 s.
+  - It allows at most 24 connections per address and 128 in total, so one
+    client can't tie it up.
+  - Many users behind one NAT address share the 24.
+- **Internet exposure:** put the dashboard behind an HTTPS reverse proxy (nginx,
+  Caddy, ...), then:
+  - set `web.trustedProxies` to the proxy's address(es), e.g. `["127.0.0.1"]`,
+    so the real client address is used for the login lockout, the rate limit
+    and the logs. Never list addresses clients connect from directly;
+  - make the proxy pass the original host *with its port*, plus the client
+    address and scheme. Without this, logins and actions are refused as
+    cross-site. In nginx:
+    ```nginx
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;   # not $host, which drops the public port
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    ```
+    `$http_host` already carries the public port, so don't add
+    `X-Forwarded-Port $server_port`: it is wrong when nginx listens on a
+    different port than the one players use (Docker port mapping, router
+    forwarding).
+    The live stream disables proxy buffering itself, so no `proxy_buffering`
+    change is needed. Serving HTTP/2 at the proxy also lifts browsers' limit of
+    6 connections per host;
+  - set `web.secureCookies: true` (HTTPS only). Cookies become `Secure` with
+    the `__Host-` prefix and HSTS is sent, and plain-HTTP logins stop working.
 - The sleeping server can't verify Mojang accounts. Someone who knows a
   whitelisted name could wake the server, but they still can't join it. With
   `respectWhitelist` (default) and a whitelist enabled, random scanners can't
@@ -172,8 +230,9 @@ auto-stop still work, but kick/ban/console are disabled.
 
 ## Running as a service (Linux)
 
-Run the monitor under systemd so it survives reboots. Complete the first-run
-setup manually once (systemd has no terminal for the wizard), then:
+Run the monitor under systemd so it survives reboots. Create `settings.yaml`
+first: run the wizard once in a terminal, or run once with the flags shown in
+the quick start. Then:
 
 ```bash
 sudo cp deploy/minecraft-monitor.service /etc/systemd/system/
@@ -190,6 +249,10 @@ journalctl -u minecraft-monitor -f
 - The unit uses `KillMode=process`: stopping or restarting the monitor leaves a
   running Minecraft server alone, and the next monitor adopts it. Stop the
   server from the dashboard first if you want it down.
+- `TimeoutStopSec` (330 s) must be at least `2 × stopTimeout + 90`. Raise both
+  together for big worlds.
+- When running from source, `ExecStart` needs the absolute path of `uv`, so
+  check it with `command -v uv`.
 
 ## Limitations
 
