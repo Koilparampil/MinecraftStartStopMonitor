@@ -1445,7 +1445,9 @@ class TestSessionRenewal:
         stream.close()
         fresh = first_message["csrfToken"]
         assert fresh and fresh != page_token
-        ok = browser.post("/action", data={"action": "startServer", "csrf_token": fresh})
+        ok = browser.post(
+            "/action", data={"action": "startServer", "csrf_token": fresh}
+        )
         assert ok.status_code == 200
         web.controller.start_server.assert_called_once()
 
@@ -1513,7 +1515,9 @@ class TestLoginBackstops:
             headers={"X-Forwarded-For": "203.0.113.50"},
         )
         assert refused.status_code == 429
-        assert "Too many failed logins on this dashboard" in refused.get_data(as_text=True)
+        assert "Too many failed logins on this dashboard" in refused.get_data(
+            as_text=True
+        )
 
 
 class TestProxyOrigins:
@@ -1630,7 +1634,9 @@ class TestServerCleanup:
             gc.enable()
 
     def test_slow_bodies_cannot_keep_requests_out(self, serve):
-        web = serve(max_connections=16, max_connections_per_ip=6, request_read_timeout=30)
+        web = serve(
+            max_connections=16, max_connections_per_ip=6, request_read_timeout=30
+        )
         port = web.bound_port
         flood = []
         try:

@@ -209,6 +209,8 @@ class LifecycleRuntime:
                         "Lifecycle supervisor failed to handle an observation"
                     )
                     continue
+            if self.supervisor.state != state:
+                self._wake_detection.set()
             for request in requests:
                 self._dispatch(request)
 

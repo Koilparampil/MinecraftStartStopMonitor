@@ -87,7 +87,8 @@ def test_open_page_survives_a_monitor_restart(mock_settings, monkeypatch):
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 if second[0].controller.get_snapshot.called and (
-                    page.get_attribute('meta[name="csrf-token"]', "content") != old_token
+                    page.get_attribute('meta[name="csrf-token"]', "content")
+                    != old_token
                 ):
                     break
                 page.wait_for_timeout(200)
