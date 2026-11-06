@@ -735,15 +735,6 @@ class OSProcessManager:
             return False
         return not self._launcher_outlived_server(tracked, root_alive, members)
 
-    def _tracked_running(self, tracked: ProcessIdentity) -> bool:
-        root_alive = self._root_alive(tracked)
-        if root_alive:
-            self._remember_descendants(tracked)
-        members = self._live_members(tracked)
-        if not root_alive and not members:
-            return False
-        return not self._launcher_outlived_server(tracked, root_alive, members)
-
     def _remember_descendants(self, tracked: ProcessIdentity):
         try:
             children = psutil.Process(tracked.pid).children(recursive=True)
