@@ -205,10 +205,19 @@ instead of filling the server log.
   - set `web.trustedProxies` to the proxy's address(es), e.g. `["127.0.0.1"]`,
     so the real client address is used for the login lockout, the rate limit
     and the logs. Never list addresses clients connect from directly;
-  - make the proxy pass the original `Host` and `X-Forwarded-For` /
-    `X-Forwarded-Proto`. In nginx:
-    `proxy_set_header Host $host; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto $scheme;`.
-    Without this, logins and actions are refused as cross-site;
+  - make the proxy pass the original host *with its port*, plus the client
+    address and scheme. Without this, logins and actions are refused as
+    cross-site. In nginx:
+    ```nginx
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;   # not $host, which drops the public port
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Port $server_port;
+    ```
+    The live stream disables proxy buffering itself, so no `proxy_buffering`
+    change is needed. Serving HTTP/2 at the proxy also lifts browsers' limit of
+    6 connections per host;
   - set `web.secureCookies: true` (HTTPS only). Cookies become `Secure` with
     the `__Host-` prefix and HSTS is sent, and plain-HTTP logins stop working.
 - The sleeping server can't verify Mojang accounts. Someone who knows a
