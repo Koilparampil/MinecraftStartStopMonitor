@@ -160,12 +160,16 @@ class Supervisor:
         self._clock = clock or time.monotonic  # deadlines, cooldowns
         self._wall_clock = wall_clock or time.time  # snapshot timestamps
 
-        self.server_starting_cooldown = 5  # start -> start
-        self.server_stopping_cooldown = 5  # stop -> start (debounces wakes)
+        # stop -> start debounce: a start accepted sooner commits STARTING at
+        # once and launches when it ends. (No start -> start cooldown: a start
+        # needs STOPPED, which comes after a stop commit, so this one is later.)
+        self.server_stopping_cooldown = 5
         # None reads settings.pollingRate at call time; tests may pin a value.
         self.poll_interval: float | None = None
         self.last_server_started_time = float("-inf")
         self.last_server_stopped_time = float("-inf")
+        self._deferred_launch: LaunchRequest | None = None
+        self._launch_due_at: float | None = None
 
         self._state = LifecycleState.STOPPED
         self._identity: ProcessIdentity | None = None
@@ -261,20 +265,26 @@ class Supervisor:
     def next_timeout(self) -> float | None:
         now = self._clock()
         with self._state_lock:
-            if self._state != LifecycleState.RUNNING:
-                return None
-            deadlines = []
-            if self._poll_due_at is not None and not self._poll_inflight:
-                deadlines.append(self._poll_due_at)
-            if self._auto_stop.deadline is not None:
-                deadlines.append(self._auto_stop.deadline)
+            deadlines = self._deadlines_locked()
         if not deadlines:
             return None
         return max(0.0, min(deadlines) - now)
 
+    def _deadlines_locked(self) -> list:
+        if self._state == LifecycleState.STARTING and self._launch_due_at is not None:
+            return [self._launch_due_at]
+        if self._state != LifecycleState.RUNNING:
+            return []
+        deadlines = []
+        if self._poll_due_at is not None and not self._poll_inflight:
+            deadlines.append(self._poll_due_at)
+        if self._auto_stop.deadline is not None:
+            deadlines.append(self._auto_stop.deadline)
+        return deadlines
+
     def on_tick(self) -> list:
-        requests = []
         now = self._clock()
+        requests = self._due_launch(now)
         with self._state_lock:
             generation = self._generation
             identity = self._identity
@@ -308,12 +318,55 @@ class Supervisor:
             logger.warning(f"Start refused: {reason}")
             settle(command, False, reason)
             return []
-        request = self._begin_start()
+        # Within the stop -> start debounce the start is still accepted (a
+        # player told "starting" must not be lied to): STARTING is committed
+        # now, so the listener releases the port, and the launch follows.
+        delay = self._debounce_remaining()
+        request = self._begin_start(delay)
+        message = STARTING_MESSAGE
+        if delay > 0:
+            message = f"Starting the server in {_whole_seconds(delay)} s."
         # The command is accepted before the listener is asked to release the
         # port, so the auto-start thread never waits on this command.
-        settle(command, True, STARTING_MESSAGE)
-        logger.info("Starting the Minecraft server")
+        settle(command, True, message)
+        logger.info(message.replace("the server", "the Minecraft server"))
         self._publish_lifecycle(LifecycleState.STARTING, request.generation)
+        return [] if delay > 0 else [request]
+
+    def _debounce_remaining(self) -> float:
+        with self._state_lock:
+            stopped_ago = self._clock() - self.last_server_stopped_time
+        return max(0.0, self.server_stopping_cooldown - stopped_ago)
+
+    def _due_launch(self, now: float) -> list:
+        """The deferred launch of a debounced start, once it is due."""
+        with self._state_lock:
+            request = self._deferred_launch
+            if (
+                request is None
+                or self._state != LifecycleState.STARTING
+                or request.generation != self._generation
+                or now < self._launch_due_at
+            ):
+                return []
+            self._deferred_launch = None
+            self._launch_due_at = None
+        try:
+            found = self.process_manager.find_process_identity()
+        except Exception:
+            logger.exception("Process discovery failed")
+            logger.warning(f"Delayed start cancelled: {DISCOVERY_FAILED_MESSAGE}")
+            self._commit_down()
+            return []
+        if found is not None:
+            # Someone started a server meanwhile: adopt it right away. A
+            # SERVER_STOPPED now would re-arm the listener on its port.
+            logger.warning(
+                "Delayed start cancelled: a server process was started in the "
+                "server directory meanwhile; adopting it"
+            )
+            self._adopt(found)
+            return []
         return [request]
 
     def _handle_stop_command(self, command: StopCommand) -> list:
@@ -334,25 +387,16 @@ class Supervisor:
         return reason
 
     def _start_state_rejection(self) -> str | None:
-        now = self._clock()
         with self._state_lock:
             state = self._state
             restarting = self._restart_pending
-            started_ago = now - self.last_server_started_time
-            stopped_ago = now - self.last_server_stopped_time
-        if state != LifecycleState.STOPPED:
-            if restarting:
-                return RESTART_IN_PROGRESS_MESSAGE
-            return _START_REFUSED.get(state, _START_REFUSED[LifecycleState.RUNNING])
-        if started_ago < self.server_starting_cooldown:
-            wait = _whole_seconds(self.server_starting_cooldown - started_ago)
-            return f"The server was started moments ago; try again in {wait} s."
-        if stopped_ago < self.server_stopping_cooldown:
-            wait = _whole_seconds(self.server_stopping_cooldown - stopped_ago)
-            return f"The server stopped moments ago; try again in {wait} s."
-        return None
+        if state == LifecycleState.STOPPED:
+            return None
+        if restarting:
+            return RESTART_IN_PROGRESS_MESSAGE
+        return _START_REFUSED.get(state, _START_REFUSED[LifecycleState.RUNNING])
 
-    def _begin_start(self) -> LaunchRequest:
+    def _begin_start(self, delay: float = 0.0) -> LaunchRequest:
         with self._state_lock:
             self._generation += 1
             self._state = LifecycleState.STARTING
@@ -362,7 +406,11 @@ class Supervisor:
             self._auto_stop = auto_stop.AutoStopState()
             self._poll_due_at = None
             self._poll_inflight = False
-            return LaunchRequest(self._generation)
+            request = LaunchRequest(self._generation)
+            deferred = delay > 0
+            self._deferred_launch = request if deferred else None
+            self._launch_due_at = self._clock() + delay if deferred else None
+            return request
 
     def _request_stop(self, command, restart: bool) -> list:
         with self._state_lock:
@@ -656,6 +704,7 @@ class Supervisor:
             self.last_server_started_time = now
             self._poll_due_at = now
             self._poll_inflight = False
+            self._deferred_launch = self._launch_due_at = None
             generation = self._generation
         revision = self._bump_revision()
         self._publish(
@@ -682,6 +731,7 @@ class Supervisor:
             self.last_server_stopped_time = now
             self._poll_due_at = None
             self._poll_inflight = False
+            self._deferred_launch = self._launch_due_at = None
             generation = self._generation
         # Release players and tracking before anyone hears about the stop.
         self._call(self.player_manager.mark_all_offline)
@@ -788,9 +838,14 @@ class Supervisor:
 
     def _started_wall_time(self, identity: ProcessIdentity, adopted: bool) -> float:
         now = self._wall_clock()
-        created = identity.create_time
-        # An adopted server has been up since its process was created.
-        if adopted and created is not None and 0 < created <= now:
+        if not adopted:
+            return now
+        # An adopted server has been up since its process was created. The
+        # identity's key is not wall-clock time (it must survive clock steps),
+        # so ask the process manager, when it can tell.
+        started_at = getattr(self.process_manager, "started_at", None)
+        created = self._call(started_at, identity) if callable(started_at) else None
+        if isinstance(created, (int, float)) and 0 < created <= now:
             return float(created)
         return now
 

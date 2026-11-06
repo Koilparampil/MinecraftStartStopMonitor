@@ -11,6 +11,8 @@ import yaml
 from src.minecraft.server_files import read_eula, read_properties
 from src.settings import YAML_MAPPING, Settings
 from src.setup_wizard import (
+    choose_dashboard_port,
+    clean_path_answer,
     configure_rcon,
     default_config,
     detect_server_dir,
@@ -332,6 +334,12 @@ class TestSettingsFile:
 # ----------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def no_port_probes(monkeypatch):
+    """The wizard probes dashboard ports; tests never bind real ports."""
+    monkeypatch.setattr("src.setup_wizard.port_is_free", lambda port: True)
+
+
 @pytest.fixture
 def forge_server(tmp_path):
     server = tmp_path / "server"
@@ -463,3 +471,151 @@ class TestInteractiveSetup:
             str(tmp_path / "settings.yaml"), str(forge_server), out=lambda *_: None
         )
         assert (tmp_path / "settings.yaml").exists()
+
+
+# ----------------------------------------------------------------------
+# QA fixes: loop idioms, pasted paths, ports, CLI values, write order
+# ----------------------------------------------------------------------
+
+
+class TestRestartLoopIdioms:
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "while :; do ./run.sh; done",
+            "while : ; do ./run.sh; done",
+            "while [ 1 ]; do ./run.sh; done",
+            "while [ true ]; do ./run.sh; done",
+            "while ((1)); do ./run.sh; done",
+            "while true\ndo ./run.sh; done",
+            "until false; do ./run.sh; done",
+            "for (( ; ; )); do ./run.sh; done",
+            'cd "$(dirname "$0")" && while true; do ./run.sh; done',
+        ],
+    )
+    def test_shell_loops(self, tmp_path, line):
+        (tmp_path / "start.sh").write_text(f"#!/bin/sh\n{line}\n")
+        assert restart_loop_scripts(str(tmp_path)) == ["start.sh"]
+
+    @pytest.mark.parametrize(
+        ("name", "text"),
+        [
+            ("startserver.bat", ":START\njava -jar forge.jar nogui\ngoto:START\n"),
+            ("start.cmd", ":loop\njava -jar x.jar\nif 1==1 GOTO :loop\n"),
+            ("start.ps1", "while ($true) {\n  java -jar server.jar nogui\n}\n"),
+        ],
+    )
+    def test_batch_and_powershell_loops(self, tmp_path, name, text):
+        (tmp_path / name).write_text(text)
+        assert restart_loop_scripts(str(tmp_path)) == [name]
+
+    def test_comments_and_forward_jumps_are_not_loops(self, tmp_path):
+        (tmp_path / "run.sh").write_text("# while true; do\njava -jar server.jar\n")
+        (tmp_path / "a.bat").write_text(
+            "goto end\n:: goto end\njava -jar x.jar\n:end\n"
+        )
+        assert restart_loop_scripts(str(tmp_path)) == []
+
+
+class TestQaFixes:
+    @pytest.mark.parametrize(
+        ("answer", "os_name", "path"),
+        [
+            ('"/srv/My Server"', "posix", "/srv/My Server"),
+            ("'/srv/My Server'", "posix", "/srv/My Server"),
+            ("/srv/My\\ Server", "posix", "/srv/My Server"),
+            ('"C:\\Mc\\My Server"', "nt", "C:\\Mc\\My Server"),
+            ("C:\\Mc\\Server", "nt", "C:\\Mc\\Server"),
+        ],
+    )
+    def test_clean_path_answer(self, answer, os_name, path):
+        assert clean_path_answer(answer, os_name) == path
+
+    def test_quoted_folder_is_accepted_by_the_wizard(self, tmp_path):
+        spaced = tmp_path / "My Server"
+        spaced.mkdir()
+        (spaced / "server.properties").write_text("")
+        script = Script(
+            [f'"{spaced}"', "java -jar server.jar nogui", "n", "yes"],
+            secrets=["pw", "pw"],
+        )
+        config = run_wizard(tmp_path / "settings.yaml", None, script)
+        assert config["minecraft"]["serverDir"] == str(spaced)
+
+    def test_dashboard_port_avoids_server_ports_and_busy_ones(self, tmp_path):
+        (tmp_path / "server.properties").write_text(
+            "server-port=25580\nrcon.port=25581\nquery.port=25582\n"
+        )
+        chosen = choose_dashboard_port(str(tmp_path), is_free=lambda p: p != 25583)
+        assert chosen == 25584
+
+    def test_wizard_saves_a_port_that_validates(self, tmp_path, forge_server):
+        (forge_server / "server.properties").write_text("server-port=25580\n")
+        script = Script(["", "", "", "yes"], secrets=["pw", "pw"])
+        config = run_wizard(tmp_path / "settings.yaml", str(forge_server), script)
+        assert config["web"]["port"] not in (25580, 25575, 25590)
+
+    def test_command_line_values_are_used(self, tmp_path, forge_server):
+        script = Script(["", "n", "yes"])
+        config = interactive_setup(
+            str(tmp_path / "settings.yaml"),
+            None,
+            given={
+                "serverDir": str(forge_server),
+                "startCommand": "java -jar custom.jar nogui",
+                "webPassword": "cli-pass",
+            },
+            ask=script.ask,
+            ask_secret=script.ask_secret,
+            out=script.out,
+        )
+        assert config["minecraft"]["serverDir"] == str(forge_server)
+        assert config["minecraft"]["startCommand"] == "java -jar custom.jar nogui"
+        assert config["web"]["password"] == "cli-pass"
+        assert not any("server folder" in prompt for prompt in script.prompts)
+
+    def test_unwritable_settings_fail_before_any_question(self, tmp_path, forge_server):
+        blocker = tmp_path / "not-a-folder"
+        blocker.write_text("")
+        script = Script(["", "", "", "yes"], secrets=["pw", "pw"])
+        with pytest.raises(OSError):
+            run_wizard(blocker / "settings.yaml", str(forge_server), script)
+        assert script.prompts == []
+        assert not (forge_server / "server.properties").exists()
+
+    def test_settings_are_saved_before_server_files_change(
+        self, tmp_path, forge_server, monkeypatch
+    ):
+        def refuse(*_args):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr("src.setup_wizard.accept_eula", refuse)
+        script = Script(["", "", "n", "yes"], secrets=["pw", "pw"])
+        run_wizard(tmp_path / "settings.yaml", str(forge_server), script)
+        assert (tmp_path / "settings.yaml").exists()
+        assert "could not update the server's files" in script.text
+
+    def test_no_terminal_help_mentions_the_password(self, tmp_path):
+        assert "web.password" in no_terminal_help(str(tmp_path / "s.yaml"))[1]
+
+
+class TestExamplePassword:
+    def test_typed_example_password_is_refused(self, tmp_path, forge_server):
+        script = Script(["", "", "n", "yes"], secrets=["changeme", "mine", "mine"])
+        config = run_wizard(tmp_path / "settings.yaml", str(forge_server), script)
+        assert config["web"]["password"] == "mine"
+        assert "example password" in script.text
+
+    def test_example_password_from_the_command_line_is_asked_again(
+        self, tmp_path, forge_server
+    ):
+        script = Script(["", "", "n", "yes"], secrets=["mine", "mine"])
+        config = interactive_setup(
+            str(tmp_path / "settings.yaml"),
+            str(forge_server),
+            given={"webPassword": "changeme"},
+            ask=script.ask,
+            ask_secret=script.ask_secret,
+            out=script.out,
+        )
+        assert config["web"]["password"] == "mine"

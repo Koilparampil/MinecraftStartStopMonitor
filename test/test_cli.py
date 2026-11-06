@@ -55,6 +55,8 @@ class TestParsing:
             "autoStart": False,
             "autoStop": False,
             "autoStopDelay": 300,
+            "trustedProxies": None,
+            "secureCookies": None,
         }
 
     def test_no_flags_means_no_overrides(self):
@@ -139,3 +141,123 @@ class TestSettingsPath:
         assert default_settings_path(frozen=True, executable=exe) == str(
             tmp_path / "dist" / "settings.yaml"
         )
+
+
+class TestQaFixes:
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--polling-rate", "nan"],
+            ["--auto-stop-delay", "inf"],
+            ["--trusted-proxies", "10.0.0.0/8,bogus"],
+        ],
+    )
+    def test_more_invalid_values(self, argv, capsys):
+        with pytest.raises(SystemExit):
+            parse_args(argv)
+
+    def test_proxy_flags(self):
+        args = parse_args(
+            ["--trusted-proxies", "127.0.0.1, 10.0.0.0/8", "--secure-cookies"]
+        )
+        assert args.trustedProxies == ["127.0.0.1", "10.0.0.0/8"]
+        assert args.secureCookies is True
+
+    def test_a_complete_command_line_needs_no_settings_file(self):
+        from src.main import cli_settings_complete
+
+        base = ["--server-dir", "/srv/mc", "--start-command", "./run.sh nogui"]
+        assert cli_settings_complete(parse_args([*base, "--web-password", "pw"]))
+        assert cli_settings_complete(parse_args([*base, "--no-web"]))
+        assert not cli_settings_complete(parse_args(base))
+
+
+class TestFirstRunWithoutTerminal:
+    """main.run_first_time_setup: the no-terminal path and its error messages."""
+
+    @pytest.fixture
+    def no_tty(self, monkeypatch, mock_settings):
+        monkeypatch.setattr("src.main._stdin_is_a_terminal", lambda: False)
+        monkeypatch.setattr("src.setup_wizard.port_is_free", lambda port: True)
+
+    def test_complete_flags_are_saved_like_the_wizard(self, tmp_path, no_tty, capsys):
+        from src.main import run_first_time_setup
+
+        server = tmp_path / "server"
+        server.mkdir(exist_ok=True)
+        settings_path = tmp_path / "conf" / "settings.yaml"
+        args = parse_args(
+            [
+                "--server-dir",
+                str(server),
+                "--start-command",
+                "./run.sh nogui",
+                "--web-password",
+                "secret-pw",
+                "--auto-stop-delay",
+                "300",
+            ]
+        )
+        assert run_first_time_setup(str(settings_path), args)
+        assert (
+            f"saved the command-line settings to {settings_path}"
+            in capsys.readouterr().out
+        )
+        if os.name != "nt":
+            assert settings_path.stat().st_mode & 0o777 == 0o600
+        loaded = Settings()
+        loaded.readSettings(str(settings_path))
+        assert loaded.serverDir == str(server)
+        assert loaded.startCommand == "./run.sh nogui"
+        assert loaded.webPassword == "secret-pw"
+        assert loaded.autoStopDelay == 300
+
+    def test_example_password_is_refused_before_saving(self, tmp_path, no_tty, capsys):
+        from src.main import run_first_time_setup
+
+        settings_path = tmp_path / "settings.yaml"
+        args = parse_args(
+            [
+                "--server-dir",
+                str(tmp_path),
+                "--start-command",
+                "./run.sh nogui",
+                "--web-password",
+                "changeme",
+            ]
+        )
+        assert not run_first_time_setup(str(settings_path), args)
+        assert "example password" in capsys.readouterr().out
+        assert not settings_path.exists()
+
+    def test_server_file_errors_are_not_blamed_on_the_settings_file(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from src import main
+        from src.setup_wizard import SettingsWriteError
+
+        def unreadable(*_args, **_kwargs):
+            raise PermissionError(13, "Permission denied", "/srv/server.properties")
+
+        monkeypatch.setattr(main, "interactive_setup", unreadable)
+        assert not main.run_first_time_setup(str(tmp_path / "s.yaml"), parse_args([]))
+        out = capsys.readouterr().out
+        assert (
+            "/srv/server.properties" in out and "cannot write the settings" not in out
+        )
+
+        def unwritable(*_args, **_kwargs):
+            raise SettingsWriteError(13, "Permission denied", str(tmp_path))
+
+        monkeypatch.setattr(main, "interactive_setup", unwritable)
+        assert not main.run_first_time_setup(str(tmp_path / "s.yaml"), parse_args([]))
+        assert "cannot write the settings file" in capsys.readouterr().out
+
+
+def test_example_web_password_flag_is_refused_before_anything(tmp_path, capsys):
+    from src.main import main
+
+    settings_path = tmp_path / "settings.yaml"
+    assert main(["--settings", str(settings_path), "--web-password", "changeme"]) == 1
+    assert "--web-password is the example password" in capsys.readouterr().out
+    assert not settings_path.exists()

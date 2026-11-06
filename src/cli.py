@@ -1,7 +1,9 @@
 """CLI argument parsing, settings-file location and application to settings."""
 
 import argparse
+import ipaddress
 import logging
+import math
 import os
 import sys
 
@@ -32,9 +34,22 @@ def _positive_number(value):
         number = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
-    if number <= 0:
-        raise argparse.ArgumentTypeError(f"must be positive: {value}")
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive number: {value}")
     return int(number) if number.is_integer() else number
+
+
+def _address_list(value):
+    """Comma-separated IP addresses / networks (CIDR)."""
+    entries = [part.strip() for part in value.split(",") if part.strip()]
+    for entry in entries:
+        try:
+            ipaddress.ip_network(entry, strict=False)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"not an IP address or network: {entry!r}"
+            ) from None
+    return entries
 
 
 def _non_empty(value):
@@ -132,6 +147,21 @@ def _add_web_arguments(parser):
         metavar="PASS",
         type=_non_empty,
         help="Web dashboard password",
+    )
+    group.add_argument(
+        "--trusted-proxies",
+        dest="trustedProxies",
+        metavar="LIST",
+        type=_address_list,
+        help="Comma-separated reverse-proxy addresses/networks whose "
+        "X-Forwarded-For header is trusted",
+    )
+    group.add_argument(
+        "--secure-cookies",
+        dest="secureCookies",
+        action="store_true",
+        default=None,
+        help="Send the dashboard's session cookies over HTTPS only",
     )
 
 

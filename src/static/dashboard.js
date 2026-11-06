@@ -11,7 +11,9 @@
   'use strict';
 
   var CONSOLE_INTERVAL_MS = 2500;
-  var INFO_INTERVAL_MS = 60000;
+  var INFO_INTERVAL_MS = 20000;
+  var STREAM_PAUSE_MS = 10000;  // close the live stream once a tab stays hidden
+  var CONFIRM_GUARD_MS = 500;  // ignore Enter this soon after a dialog opens
   var AVATAR_BASE = 'https://mc-heads.net/avatar/';
   var SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -42,7 +44,10 @@
     playersKey: '',
     controlBusy: false,
     previousStatus: null,  // status of the last snapshot on this stream
-    userStopAt: 0  // when the admin last asked for a stop/restart (ms)
+    lastStatus: null,
+    userStopAt: 0,  // when the admin last asked for a stop/restart (ms)
+    monitor: boot.monitor || null,  // {rconStatus, autoStartStatus}, request-time
+    infoTimer: null
   };
 
   // ---------------------------------------------------------------------
@@ -183,7 +188,7 @@
     window.location.assign('/login' + query);
   }
 
-  function api(path, fields) {
+  function api(path, fields, retried) {
     var options = {
       method: fields ? 'POST' : 'GET',
       credentials: 'same-origin',
@@ -197,17 +202,34 @@
       options.headers['X-CSRFToken'] = csrfToken;
     }
     return fetch(path, options).then(function (response) {
+      // A remembered login was restored into a new session: new CSRF token.
+      var freshToken = response.headers.get('X-CSRF-Token');
+      if (freshToken) adoptCsrfToken(freshToken);
       if (response.status === 401) {
         goToLogin();
         throw new AuthRequired();
       }
       return response.json().catch(function () { return null; }).then(function (data) {
         if (!data) throw new Error('Unexpected response from the monitor (HTTP ' + response.status + ').');
+        if (fields && !retried && response.status === 400 && data.csrfError) {
+          // The session was renewed elsewhere (another tab, the live stream):
+          // fetch its token and try once more.
+          return api('/csrf').then(function (result) {
+            if (result.data && result.data.csrfToken) adoptCsrfToken(result.data.csrfToken);
+            return api(path, fields, true);
+          });
+        }
         return { ok: response.ok, status: response.status, data: data };
       });
     }, function () {
       throw new Error('Could not reach the monitor. Is it running?');
     });
+  }
+
+  function adoptCsrfToken(token) {
+    csrfToken = token;
+    if (csrfMeta) csrfMeta.setAttribute('content', token);
+    document.querySelectorAll('input[name="csrf_token"]').forEach(function (input) { input.value = token; });
   }
 
   function reportError(error) {
@@ -291,6 +313,7 @@
       }
       dialog.addEventListener('close', onClose);
       dialog.returnValue = '';
+      dialogOpenedAt = Date.now();
       dialog.showModal();
       var focusTarget = options.reason ? reasonInput : (options.focusConfirm ? ok : $('confirmCancel'));
       focusTarget.focus();
@@ -312,11 +335,24 @@
     return window.CSS && window.CSS.escape ? window.CSS.escape(value) : String(value).replace(/["\\]/g, '\\$&');
   }
 
+  var dialogOpenedAt = 0;
+
   function wireDialog() {
     if (!dialog) return;
     $('confirmCancel').addEventListener('click', function () { dialog.close('cancel'); });
+    // A backdrop click closes; a text selection that merely ends outside does not.
+    var pressedOnBackdrop = false;
+    dialog.addEventListener('pointerdown', function (event) { pressedOnBackdrop = event.target === dialog; });
     dialog.addEventListener('click', function (event) {
-      if (event.target === dialog) dialog.close('cancel');  // backdrop click
+      if (event.target === dialog && pressedOnBackdrop) dialog.close('cancel');
+      pressedOnBackdrop = false;
+    });
+    // A second Enter right after the one that opened the dialog (a double
+    // press, or key repeat) must not also confirm it. Implicit submission
+    // and button activation are both default actions of the keydown.
+    dialog.addEventListener('keydown', function (event) {
+      if (event.key !== 'Enter') return;
+      if (event.repeat || Date.now() - dialogOpenedAt < CONFIRM_GUARD_MS) event.preventDefault();
     });
   }
 
@@ -332,6 +368,9 @@
     if (typeof payload.autoStopDelay === 'number') {
       view.autoStopDelay = payload.autoStopDelay;
     }
+    if (payload.monitor && typeof payload.monitor === 'object') view.monitor = payload.monitor;
+    if ('rconStatus' in payload) view.monitor = Object.assign({}, view.monitor, { rconStatus: payload.rconStatus });
+    if (typeof payload.csrfToken === 'string' && payload.csrfToken) adoptCsrfToken(payload.csrfToken);
     return applySnapshot(payload.data);
   }
 
@@ -342,8 +381,46 @@
     view.snapshot = snapshot;
     view.lastUpdate = new Date();
     noticeFailedLaunch(snapshot);
+    var status = statusOf(snapshot);
+    if (status !== view.lastStatus) {
+      // Listener and RCON state are not in the snapshot: re-read them soon.
+      if (view.lastStatus !== null) scheduleInfo(2500);
+      view.lastStatus = status;
+    }
     render();
     return true;
+  }
+
+  // ---------------------------------------------------------------------
+  // Monitor state outside the snapshot (/info, action responses)
+  // ---------------------------------------------------------------------
+
+  function listenerState() {
+    return view.monitor && view.monitor.autoStartStatus ? view.monitor.autoStartStatus : null;
+  }
+
+  // Armed for a stopped server, but the game port could not be bound.
+  function autoStartBlocked() {
+    var listener = listenerState();
+    return !!(config.autoStart && listener && listener.armed && !listener.listening);
+  }
+
+  function rconStatus() {
+    return view.monitor ? view.monitor.rconStatus : null;
+  }
+
+  var RCON_PROBLEMS = {
+    disabled: 'RCON is off (enable-rcon in server.properties)',
+    auth_failed: 'RCON login failed — check rcon.password',
+    unreachable: 'RCON is not answering'
+  };
+
+  // Why RCON features (kick, ban, console) cannot work right now, or null.
+  // "unknown" (not tried yet) is neutral, and a roster read over RCON proves
+  // it works whatever an older status said.
+  function rconBlocker(snapshot) {
+    if (snapshot.server && snapshot.server.source === 'rcon') return null;
+    return RCON_PROBLEMS[rconStatus()] || null;
   }
 
   // STARTING/LOADING -> STOPPED that nobody asked for: the launch failed or
@@ -409,6 +486,7 @@
       case 'STOPPING':
         return snapshot.restartPending ? 'Restarting — saving worlds first…' : 'Saving worlds and shutting down…';
       default:
+        if (autoStartBlocked()) return 'Stopped — auto-start can\u2019t use the game port';
         return config.autoStart ? 'Sleeping — a join attempt wakes it' : 'Stopped';
     }
   }
@@ -454,6 +532,7 @@
         return snapshot.restartPending ? 'Restarting: it starts again as soon as it has stopped. "Cancel restart" keeps it offline.' : 'Stopping: the world is being saved.';
       case 'ONLINE': return 'Stop and restart save the world first.';
       default:
+        if (autoStartBlocked()) return 'Players cannot wake the server right now; start it from here.';
         return config.autoStart ? 'Start it now, or let the first player who joins wake it up.' : 'Start the server when you need it.';
     }
   }
@@ -553,11 +632,34 @@
   // Automation panel and auto-stop countdown
   // ---------------------------------------------------------------------
 
+  function renderAutoStartWarning() {
+    var box = $('autoStartWarning');
+    var blocked = autoStartBlocked();
+    var chip = $('autoStartChip');
+    if (chip && config.autoStart) {
+      setText(chip, blocked ? 'Blocked' : 'On');
+      var chipClass = 'chip ' + (blocked ? 'chip--warn' : 'chip--on');
+      if (chip.className !== chipClass) chip.className = chipClass;
+    }
+    if (!box) return;
+    setHidden(box, !blocked);
+    if (!blocked) return;
+    var error = listenerState().error;
+    var message = 'Auto-start can\u2019t use the game port' + (error ? ': ' + error : '.');
+    if (box.dataset.key !== message) {
+      box.dataset.key = message;
+      box.replaceChildren(icon('i-alert'), h('span', { text: message }));
+    }
+  }
+
   function renderAutomation(snapshot) {
+    renderAutoStartWarning();
     var startText = $('autoStartText');
     if (startText && config.autoStart) {
       var motd = view.info && view.info.sleepingMotd;
-      if (snapshot.state === 'STOPPED' && !snapshot.restartPending) {
+      if (autoStartBlocked()) {
+        setText(startText, 'Players cannot wake the server until the game port is free. The monitor keeps retrying.');
+      } else if (snapshot.state === 'STOPPED' && !snapshot.restartPending) {
         var parts = ['Sleeping: the monitor answers on the game port'];
         if (motd) {
           startText.replaceChildren(parts[0] + '. Players see ', h('q', { text: motd }),
@@ -592,7 +694,9 @@
     if (!show) return;
     var delay = view.autoStopDelay;
     var count = snapshot.playerCount || 0;
-    if (snapshot.playerData === 'unavailable') {
+    if (!snapshot.ready) {
+      setCountdown('countdown', ['Waits until the server has finished loading'], 1);
+    } else if (snapshot.playerData === 'unavailable') {
       // Auto-stop only trusts fresh player counts: it waits while the server is silent.
       setCountdown('countdown', ['Paused — the server is not answering'], 1);
     } else if (typeof snapshot.autoStopAt === 'number') {
@@ -603,8 +707,6 @@
         setCountdown('countdown countdown--armed', ['Stopping in ', h('span', { class: 'countdown-time', text: formatClock(remaining) }), ' — no players online'],
           delay > 0 ? remaining / delay : 0);
       }
-    } else if (!snapshot.ready) {
-      setCountdown('countdown', ['Waits until the server has finished loading'], 1);
     } else if (count > 0) {
       setCountdown('countdown countdown--paused', [plural(count, 'player') + ' online — timer paused'], 1);
     } else {
@@ -650,11 +752,11 @@
   }
 
   function moderationState(snapshot) {
-    var viaPing = !!(snapshot.server && snapshot.server.source === 'ping');
     var online = snapshot.state === 'RUNNING' && snapshot.ready;
     if (snapshot.state === 'STOPPED' && !snapshot.restartPending) return { banOk: true, kickOk: false, why: 'Kicking needs a running server' };
     if (!online) return { banOk: false, kickOk: false, why: 'Wait until the server has started or stopped' };
-    if (viaPing) return { banOk: false, kickOk: false, why: 'Needs RCON (enable-rcon in server.properties)' };
+    var blocker = rconBlocker(snapshot);
+    if (blocker) return { banOk: false, kickOk: false, why: blocker };
     return { banOk: true, kickOk: true, why: '' };
   }
 
@@ -751,11 +853,14 @@
     setText($('playerCountChip'), running ? count + ' online' : 'Server offline');
 
     var notices = [];
-    if (running && snapshot.playerData === 'unavailable') {
+    if (running && !snapshot.ready) {
+      notices.push(notice('The server is still loading. Players appear once it answers.', 'info'));
+    } else if (running && snapshot.playerData === 'unavailable') {
       notices.push(notice('The server is not answering. Showing the last known roster.'));
     } else if (running && snapshot.playerData === 'unknown') {
       notices.push(notice('Waiting for the first player list…', 'info'));
     }
+    if (rconStatus() === 'auth_failed') notices.push(notice('RCON login failed — check rcon.password'));
     if (running && count > known) {
       notices.push(notice((count - known) + ' online, names hidden', 'info',
         'The server reports more players than it names (status-ping samples are capped, or hide-online-players is on).'));
@@ -780,7 +885,7 @@
     var rows = playerRows(snapshot);
     renderPlayerMeta(snapshot, rows);
     var key = JSON.stringify([snapshot.state, !!snapshot.ready, snapshot.server && snapshot.server.source,
-      config.playerAvatars, rows.map(function (row) {
+      rconStatus(), config.playerAvatars, rows.map(function (row) {
         return [row.key, row.name, row.uuid, row.online, row.online ? 0 : row.lastOnline,
           row.ban ? [row.ban.reason, row.ban.expires, row.ban.source] : 0];
       })]);
@@ -850,13 +955,23 @@
   // Server facts and info (icon, mods, address)
   // ---------------------------------------------------------------------
 
-  var SOURCES = { rcon: 'RCON', ping: 'Status ping (no RCON)' };
+  var SOURCES = { rcon: 'RCON', ping: 'Status ping' };
+  var PING_BECAUSE = {
+    disabled: 'Status ping (RCON off)',
+    auth_failed: 'Status ping (RCON login failed)',
+    unreachable: 'Status ping (RCON not answering)'
+  };
+
+  function sourceLabel(server) {
+    if (server.source === 'ping' && PING_BECAUSE[rconStatus()]) return PING_BECAUSE[rconStatus()];
+    return SOURCES[server.source] || 'Waiting…';
+  }
 
   function renderFacts(snapshot) {
     var server = snapshot.server || {};
     setText($('factVersion'), server.version || '—');
     setText($('factSlots'), snapshot.maxPlayers ? String(snapshot.maxPlayers) : '—');
-    setText($('factSource'), snapshot.state === 'RUNNING' ? (SOURCES[server.source] || 'Waiting…') : '—');
+    setText($('factSource'), snapshot.state === 'RUNNING' ? sourceLabel(server) : '—');
     var started = snapshot.state === 'RUNNING' && typeof snapshot.startedAt === 'number';
     setText($('factStarted'), started ? new Date(snapshot.startedAt * 1000).toLocaleString([], {
       month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
@@ -867,7 +982,9 @@
     return api('/info').then(function (result) {
       if (!result.ok) return;
       view.info = result.data;
+      view.monitor = { rconStatus: result.data.rconStatus || null, autoStartStatus: result.data.autoStartStatus || null };
       renderInfo();
+      if (view.snapshot) render();
     }).catch(function (error) {
       if (!(error instanceof AuthRequired)) setText($('modsEmpty'), 'Could not load server details.');
     });
@@ -886,7 +1003,11 @@
     setHidden($('addressFact'), !info.serverAddress);
     if (info.serverAddress) setText($('serverAddress'), info.serverAddress);
     renderMods(Array.isArray(info.mods) ? info.mods : []);
-    if (view.snapshot) renderAutomation(view.snapshot);
+  }
+
+  function scheduleInfo(delay) {
+    window.clearTimeout(view.infoTimer);
+    view.infoTimer = window.setTimeout(loadInfo, delay);
   }
 
   function splitModName(file) {
@@ -960,7 +1081,7 @@
   // Console
   // ---------------------------------------------------------------------
 
-  var consoleState = { source: 'log', timer: null, inflight: null, key: '', history: [], cursor: -1 };
+  var consoleState = { source: 'log', timer: null, inflight: null, key: '', history: [], cursor: -1, draft: '' };
   var META_RE = /^((?:\[[^\]\n]{1,120}\]\s*){1,4}:?\s*)/;
 
   function consoleOpen() {
@@ -1035,10 +1156,13 @@
   function renderCommandAvailability(snapshot) {
     var input = $('commandInput');
     if (!input) return;
-    var ready = snapshot.state === 'RUNNING' && !!snapshot.ready;
+    var online = snapshot.state === 'RUNNING' && !!snapshot.ready;
+    var blocker = online ? rconBlocker(snapshot) : null;
+    var ready = online && !blocker;
     setDisabled(input, !ready);
     setDisabled($('commandSend'), !ready);
-    var placeholder = ready ? 'list, say Hello, time set day…' : 'Commands are available while the server is online';
+    var placeholder = ready ? 'list, say Hello, time set day…'
+      : (blocker ? blocker + ': commands are unavailable' : 'Commands are available while the server is online');
     if (input.placeholder !== placeholder) input.placeholder = placeholder;
   }
 
@@ -1062,6 +1186,7 @@
     if (consoleState.history[consoleState.history.length - 1] !== command) consoleState.history.push(command);
     if (consoleState.history.length > 50) consoleState.history.shift();
     consoleState.cursor = -1;
+    consoleState.draft = '';
     input.value = '';
     var button = $('commandSend');
     setBusy(button, true);
@@ -1080,13 +1205,14 @@
     var history = consoleState.history;
     if (!history.length || (event.key !== 'ArrowUp' && event.key !== 'ArrowDown')) return;
     event.preventDefault();
+    var input = event.target;
     if (event.key === 'ArrowUp') {
+      if (consoleState.cursor === -1) consoleState.draft = input.value;  // keep what was being typed
       consoleState.cursor = consoleState.cursor === -1 ? history.length - 1 : Math.max(0, consoleState.cursor - 1);
     } else if (consoleState.cursor !== -1) {
       consoleState.cursor = consoleState.cursor + 1 >= history.length ? -1 : consoleState.cursor + 1;
     }
-    var input = event.target;
-    input.value = consoleState.cursor === -1 ? '' : history[consoleState.cursor];
+    input.value = consoleState.cursor === -1 ? (consoleState.draft || '') : history[consoleState.cursor];
     input.setSelectionRange(input.value.length, input.value.length);
   }
 
@@ -1143,11 +1269,20 @@
   var retryDelay = 2000;
   var retryTimer = null;
 
+  var CONNECTION_KINDS = ['live', 'connecting', 'offline', 'paused'];
+
   function setConnection(kind, text) {
+    if (CONNECTION_KINDS.indexOf(kind) === -1) return;
     var node = $('connState');
     var className = 'conn conn--' + kind;
     if (node.className !== className) node.className = className;
-    setText($('connText'), text);
+    setText($('connText'), String(text));
+    live.conn = { kind: kind, text: String(text) };
+    if (live.role === 'leader') post('conn', live.conn);  // followers mirror it
+  }
+
+  function streamOpen() {
+    return !!stream && stream.readyState === EventSource.OPEN;
   }
 
   function connectStream() {
@@ -1163,12 +1298,20 @@
       view.previousStatus = null;
       retryDelay = 2000;
       setConnection('live', 'Live');
+      if (live.role === 'leader') post('reset');
     };
     source.onmessage = function (event) {
+      var payload;
       try {
-        applyPayload(JSON.parse(event.data));
+        payload = JSON.parse(event.data);
       } catch (error) {
         window.console.error('Bad stream message', error);
+        return;
+      }
+      applyPayload(payload);
+      if (live.role === 'leader') {
+        live.lastPayload = payload;
+        post('payload', payload);
       }
     };
     source.onerror = function () {
@@ -1180,9 +1323,139 @@
       // a 401 on this probe redirects to the login page.
       setConnection('offline', 'Disconnected — retrying');
       api('/info').catch(function () {});
-      retryTimer = window.setTimeout(connectStream, retryDelay);
+      retryTimer = window.setTimeout(reconnectStream, retryDelay);
       retryDelay = Math.min(retryDelay * 2, 30000);
     };
+  }
+
+  function reconnectStream() {
+    if (document.hidden) stopLive();
+    else connectStream();
+  }
+
+  function closeStream() {
+    window.clearTimeout(retryTimer);
+    if (stream) stream.close();
+    stream = null;
+  }
+
+  // ---------------------------------------------------------------------
+  // One live stream per browser, shared between tabs
+  // ---------------------------------------------------------------------
+  // Browsers allow six HTTP/1.1 connections per host, and every stream holds
+  // one. One visible tab (the leader) streams and relays each message over a
+  // BroadcastChannel; the other tabs follow, and one takes over when the
+  // leader goes quiet. Hidden tabs hold no stream at all. Without
+  // BroadcastChannel every visible tab streams on its own.
+
+  var TAB_ID = Date.now().toString(36) + Math.random().toString(36).slice(2);
+  var HEARTBEAT_MS = 2000;
+  var LEADER_TIMEOUT_MS = 5000;
+  var channel = openChannel();
+  var live = { role: 'paused', leaderSeenAt: 0, lastPayload: null, conn: null };
+  var pauseTimer = null;
+
+  function openChannel() {
+    try {
+      return window.BroadcastChannel ? new window.BroadcastChannel('mcmonitor-live') : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function post(type, payload) {
+    if (channel) channel.postMessage({ from: TAB_ID, type: type, payload: payload || null });
+  }
+
+  function startLive() {
+    if (!channel) {
+      live.role = 'leader';
+      connectStream();
+      return;
+    }
+    if (live.role === 'leader' || live.role === 'follower') return;
+    live.role = 'candidate';
+    setConnection('connecting', 'Connecting…');
+    post('hello');
+    window.setTimeout(function () {
+      if (live.role !== 'candidate') return;
+      if (Date.now() - live.leaderSeenAt < LEADER_TIMEOUT_MS) becomeFollower();
+      else becomeLeader();
+    }, 400 + Math.random() * 300);
+  }
+
+  function becomeLeader() {
+    live.role = 'leader';
+    connectStream();
+  }
+
+  function becomeFollower() {
+    if (live.role === 'leader') closeStream();
+    live.role = 'follower';
+    view.revision = -1;
+    view.previousStatus = null;
+    setConnection('live', 'Live');
+  }
+
+  function stopLive() {
+    if (live.role === 'leader') post('bye');
+    live.role = 'paused';
+    closeStream();
+    setConnection('paused', 'Paused while the tab is hidden');
+  }
+
+  function onChannelMessage(event) {
+    var message = event.data || {};
+    if (message.from === TAB_ID) return;
+    if (message.type === 'hello' && live.role === 'leader' && streamOpen()) {
+      // A leader whose stream is down stays silent: the newcomer tries itself.
+      post('leader', { conn: live.conn });
+      // Bring the newcomer up to date, with this session's token.
+      if (live.lastPayload) post('payload', Object.assign({}, live.lastPayload, { csrfToken: csrfToken }));
+    } else if (message.type === 'leader' || message.type === 'payload') {
+      live.leaderSeenAt = Date.now();
+      // Two leaders (a race): the one with the smaller id keeps streaming.
+      if (live.role === 'candidate' || (live.role === 'leader' && message.from < TAB_ID)) becomeFollower();
+      if (message.type === 'payload' && live.role === 'follower') applyPayload(message.payload);
+      if (message.type === 'leader' && live.role === 'follower') mirrorConnection(message.payload);
+    } else if (message.type === 'conn' && live.role === 'follower') {
+      mirrorConnection({ conn: message.payload });
+    } else if (message.type === 'reset' && live.role === 'follower') {
+      view.revision = -1;
+      view.previousStatus = null;
+    } else if (message.type === 'bye' && live.role === 'follower') {
+      live.leaderSeenAt = 0;
+      window.setTimeout(liveTick, Math.random() * 500);  // one follower takes over
+    }
+  }
+
+  function mirrorConnection(payload) {
+    var conn = payload && payload.conn;
+    if (conn && typeof conn.text === 'string') setConnection(conn.kind, conn.text);
+  }
+
+  function liveTick() {
+    // No heartbeat while the leader's own stream is down, so that followers
+    // notice, take over and show the real state themselves.
+    if (live.role === 'leader' && streamOpen()) post('leader', { conn: live.conn });
+    if (live.role === 'follower' && !document.hidden && Date.now() - live.leaderSeenAt > LEADER_TIMEOUT_MS) {
+      becomeLeader();
+    }
+  }
+
+  function wireStreamVisibility() {
+    if (channel) channel.onmessage = onChannelMessage;
+    window.addEventListener('pagehide', function () { if (live.role === 'leader') post('bye'); });
+    window.setInterval(liveTick, HEARTBEAT_MS);
+    document.addEventListener('visibilitychange', function () {
+      window.clearTimeout(pauseTimer);
+      if (document.hidden) {
+        pauseTimer = window.setTimeout(stopLive, STREAM_PAUSE_MS);
+      } else if (live.role === 'paused') {
+        // One request renews a lapsed session first, then the stream starts.
+        loadInfo().then(startLive);
+      }
+    });
   }
 
   function renderLastUpdated() {
@@ -1202,8 +1475,11 @@
     wirePlayers();
     wireInfo();
     wireConsole();
+    wireStreamVisibility();
     if (boot.payload) applyPayload(boot.payload);
-    connectStream();
+    // A tab opened in the background holds no stream until it is shown.
+    if (document.hidden) setConnection('paused', 'Paused while the tab is hidden');
+    else startLive();
     loadInfo();
     refreshConsole(true);
     window.setInterval(function () { renderCountdown(); renderUptime(); }, 1000);

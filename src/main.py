@@ -27,13 +27,16 @@ from src.events import EventBus
 from src.minecraft.client import MinecraftClient
 from src.minecraft_control import MinecraftController
 from src.player_manager import PlayerManager
-from src.process_manager import create_process_manager
-from src.settings import SENSITIVE_SETTINGS, settings
+from src.process_manager import ProcessStateUnknown, create_process_manager
+from src.settings import EXAMPLE_WEB_PASSWORD, SENSITIVE_SETTINGS, settings
 from src.setup_wizard import (
+    SettingsWriteError,
+    command_line_config,
     detect_server_dir,
     interactive_setup,
     no_terminal_help,
     print_web_link,
+    write_settings_file,
 )
 
 logger = logging.getLogger("src.main")
@@ -149,10 +152,48 @@ class ShutdownSignals:
 # ----------------------------------------------------------------------
 
 
-def run_first_time_setup(settings_path):
-    """Interactive wizard when there is no settings file. False = exit 1."""
+WIZARD_FLAGS = ("serverDir", "startCommand", "webPassword")
+
+
+def cli_settings_complete(args):
+    """The command line names the server folder, its launch command and
+    (unless --no-web) a dashboard password: no settings file is needed."""
+    web_ok = getattr(args, "useWebServer", None) is False or bool(
+        getattr(args, "webPassword", None)
+    )
+    return bool(getattr(args, "serverDir", None) and args.startCommand and web_ok)
+
+
+def _stdin_is_a_terminal():
     try:
-        interactive_setup(settings_path, detect_server_dir())
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def save_command_line_settings(settings_path, args):
+    """No terminal, but the command line has everything: save it as the
+    settings file the wizard would write (0600, atomic). False = exit 1."""
+    values = {k: v for k, v in vars(args).items() if v is not None and k != "settings"}
+    try:
+        config = command_line_config(values)
+    except ValueError as e:
+        print(f"error: {e}")
+        return False
+    write_settings_file(settings_path, config)
+    print(f"No settings file: saved the command-line settings to {settings_path}")
+    return True
+
+
+def run_first_time_setup(settings_path, args):
+    """No settings file: the interactive wizard (pre-filled from the command
+    line), or, without a terminal, a settings file saved from a complete
+    command line. False = exit 1."""
+    try:
+        if cli_settings_complete(args) and not _stdin_is_a_terminal():
+            return save_command_line_settings(settings_path, args)
+        given = {key: getattr(args, key, None) for key in WIZARD_FLAGS}
+        interactive_setup(settings_path, detect_server_dir(), given=given)
         return True
     except EOFError:
         print()  # end the unanswered prompt's line
@@ -160,6 +201,15 @@ def run_first_time_setup(settings_path):
             print(line)
     except KeyboardInterrupt:
         print("\nSetup cancelled; nothing was saved.")
+    except SettingsWriteError as e:
+        print(
+            f"error: cannot write the settings file {settings_path}: {e.strerror or e}"
+        )
+        print("Choose a writable location with --settings PATH.")
+    except OSError as e:
+        where = f": {e.filename}" if e.filename else ""
+        print(f"error: setup failed ({e.strerror or e}{where}).")
+        print("Run the monitor as the account that owns the server files.")
     return False
 
 
@@ -237,7 +287,14 @@ class MonitorApp:
             return
         # The supervisor reports STOPPED until its first scan: never bind the
         # game port while an undiscovered server may already hold it.
-        found = self.process_manager.find_process_identity()
+        try:
+            found = self.process_manager.find_process_identity()
+        except ProcessStateUnknown as e:
+            # Can't tell yet (e.g. out of file descriptors). Stay off the port;
+            # the supervisor's first good scan publishes SERVER_STOPPED, which
+            # arms the listener.
+            logger.warning(f"Could not scan for a running server yet ({e}); waiting")
+            return
         if found is None:
             self.auto_start.listen()
         else:
@@ -250,7 +307,10 @@ class MonitorApp:
         if use_web:
             from src.web_server import WebServer
 
-            self.web_server = WebServer(self.controller, self.bus)
+            status = self.auto_start.status if self.auto_start is not None else None
+            self.web_server = WebServer(
+                self.controller, self.bus, auto_start_status=status
+            )
             print_web_link(settings.webServerPort, settings.webBindHost)
             self.web_server.run()
             return
@@ -282,13 +342,21 @@ class MonitorApp:
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.webPassword == EXAMPLE_WEB_PASSWORD:
+        print(
+            "error: --web-password is the example password from "
+            "settings.yaml.example; choose your own."
+        )
+        return 1
     signals = ShutdownSignals()
     signals.install()
     print(BANNER, flush=True)
     settings_path = determine_settings_path(args)
     configure_logging(log_file_path(settings_path))
 
-    if not os.path.exists(settings_path) and not run_first_time_setup(settings_path):
+    if not os.path.exists(settings_path) and not run_first_time_setup(
+        settings_path, args
+    ):
         return 1
     if not load_settings(settings_path, args):
         return 1

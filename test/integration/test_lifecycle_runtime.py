@@ -23,6 +23,7 @@ from src.lifecycle.messages import (
 )
 from src.lifecycle.runtime import LifecycleRuntime
 from src.lifecycle.supervisor import Supervisor
+from src.process_manager import ProcessStateUnknown
 from test.support import wait_until
 from test.support.fakes import (
     FakeBanlistManager,
@@ -348,3 +349,69 @@ class TestLifecycleRuntime:
         wait_until(lambda: env.supervisor.state == LifecycleState.STOPPED)
 
         assert env.pm.terminate_forced == [True, False]
+
+
+class TestDetectionCadence:
+    def test_scans_about_every_second_while_stopped(self, env, mock_settings):
+        mock_settings.pollingRate = 5
+        assert env.supervisor.state == LifecycleState.STOPPED
+        assert env.runtime._detection_interval() == 1.0
+
+        identity = ProcessIdentity(1001, 10.0)
+        env.pm.found = identity
+        env.pm.alive.add(identity.pid)
+        env.supervisor.handle(ProcessObservation(0, env.pm.observe()))
+        assert env.supervisor.state == LifecycleState.RUNNING
+        assert env.runtime._detection_interval() == 5.0
+
+    def test_a_stopped_commit_wakes_detection_at_once(self, env, mock_settings):
+        mock_settings.pollingRate = 30  # RUNNING cadence: one scan per 30 s
+        identity = ProcessIdentity(1001, 10.0)
+        env.pm.found = identity
+        env.pm.alive.add(identity.pid)
+        env.runtime.start()
+        wait_until(lambda: env.supervisor.state == LifecycleState.RUNNING)
+        running = env.supervisor.generation
+        # A scan taken while RUNNING: the worker then waits its 30 s cadence.
+        wait_until(
+            lambda: env.spy.count(
+                ProcessObservation, lambda item: item.generation == running
+            ),
+            timeout=3,
+        )
+
+        assert env.runtime.submit_command(StopCommand())
+        wait_until(lambda: env.supervisor.state == LifecycleState.STOPPED)
+        scans = env.spy.count(ProcessObservation)
+        # Without the wake the worker would sleep out its 30 s RUNNING wait.
+        wait_until(lambda: env.spy.count(ProcessObservation) > scans, timeout=3)
+
+        hand_started = ProcessIdentity(2002, 20.0)  # e.g. started from a shell
+        env.pm.found = hand_started
+        env.pm.alive.add(hand_started.pid)
+        wait_until(lambda: env.supervisor.state == LifecycleState.RUNNING, timeout=3)
+        assert env.pm.tracked_identity == hand_started
+
+    def test_a_fast_polling_rate_is_kept_while_stopped(self, env):
+        assert env.runtime._detection_interval() == 0.01
+
+
+class TestUnknownProcessState:
+    def test_an_unreadable_process_table_never_commits_an_exit(self, env, caplog):
+        identity = ProcessIdentity(1001, 10.0)
+        env.pm.found = identity
+        env.pm.alive.add(identity.pid)
+        env.runtime.start()
+        wait_until(lambda: env.supervisor.state == LifecycleState.RUNNING)
+        observations = env.spy.count(ProcessObservation)
+
+        env.pm.observe_error = ProcessStateUnknown("cannot inspect processes: EMFILE")
+        env.pm.exit(identity)  # what a broken scan might wrongly conclude
+        wait_until(lambda: "Keeping the last known server state" in caplog.text)
+
+        assert env.supervisor.state == LifecycleState.RUNNING
+        assert env.spy.count(ProcessObservation) <= observations + 1
+        assert caplog.text.count("Keeping the last known server state") == 1
+
+        env.pm.observe_error = None  # the OS answers again: a real exit
+        wait_until(lambda: env.supervisor.state == LifecycleState.STOPPED)

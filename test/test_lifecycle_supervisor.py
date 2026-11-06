@@ -307,18 +307,97 @@ class TestTransitions:
         assert command.result is False
         assert command.outcome.message == DISCOVERY_FAILED_MESSAGE
 
-    def test_start_cooldown_after_stop(self, env):
+    def test_start_during_the_stop_debounce_launches_when_it_ends(self, env):
         env.supervisor.server_stopping_cooldown = 5
         stop(env, launch(env))
+        env.clock.advance(0.8)
 
         command = StartCommand()
         assert env.supervisor.handle(command) == []
-        assert command.outcome == ActionResult(
-            False, "The server stopped moments ago; try again in 5 s."
-        )
+        # Accepted at once: STARTING releases the game port; the launch waits.
+        assert command.outcome == ActionResult(True, "Starting the server in 5 s.")
+        assert env.supervisor.state == STARTING
+        assert events_of(env, Event.LIFECYCLE_CHANGED)[-1]["state"] == STARTING
+        assert env.supervisor.next_timeout() == pytest.approx(4.2)
+
+        env.clock.advance(4.1)
+        assert env.supervisor.on_tick() == []
+        env.clock.advance(0.1)
+        [request] = env.supervisor.on_tick()
+        assert isinstance(request, LaunchRequest)
+        assert request.generation == env.supervisor.generation
+        assert env.supervisor.on_tick() == []  # dispatched once
+
+        identity = ProcessIdentity(3001, 30.0)
+        env.supervisor.handle(LaunchResult(request.generation, identity))
+        assert env.supervisor.state == RUNNING
+
+    def test_start_after_the_debounce_launches_at_once(self, env):
+        env.supervisor.server_stopping_cooldown = 5
+        stop(env, launch(env))
+        env.clock.advance(5)
+
+        command = StartCommand()
+        [request] = env.supervisor.handle(command)
+        assert command.outcome == ActionResult(True, "Starting the server.")
+        assert isinstance(request, LaunchRequest)
+
+    def test_crash_right_after_a_start_only_waits_for_the_stop_debounce(self, env):
+        env.supervisor.server_stopping_cooldown = 5
+        identity = launch(env)
+        env.clock.advance(1)
+        env.pm.exit(identity)
+        observe(env)  # crashed one second after starting
+        env.clock.advance(4.5)
+
+        command = StartCommand()
+        env.supervisor.handle(command)
+
+        # No separate start -> start cooldown under-reporting the wait.
+        assert command.outcome == ActionResult(True, "Starting the server in 1 s.")
+
+    def test_server_started_by_hand_during_the_debounce_cancels_the_launch(self, env):
+        env.supervisor.server_stopping_cooldown = 5
+        stop(env, launch(env))
+        env.supervisor.handle(StartCommand())
+        stopped = len(events_of(env, Event.SERVER_STOPPED))
+        found = ProcessIdentity(4001, 40.0)
+        env.pm.found = found
+        env.pm.alive.add(found.pid)
 
         env.clock.advance(5)
-        assert len(env.supervisor.handle(StartCommand())) == 1
+        requests = env.supervisor.on_tick()
+
+        # Adopted at once: no launch, and no SERVER_STOPPED that would re-arm
+        # the sleeping listener on the port the new server is about to bind.
+        assert not any(isinstance(r, LaunchRequest) for r in requests)
+        assert env.supervisor.state == RUNNING
+        assert env.pm.tracked_identity == found
+        assert len(events_of(env, Event.SERVER_STOPPED)) == stopped
+        assert events_of(env, Event.SERVER_STARTED)[-1]["pid"] == found.pid
+
+    def test_discovery_failure_at_the_due_time_cancels_the_launch(self, env):
+        env.supervisor.server_stopping_cooldown = 5
+        stop(env, launch(env))
+        env.supervisor.handle(StartCommand())
+        env.pm.find_error = RuntimeError("scan failed")
+
+        env.clock.advance(5)
+
+        assert env.supervisor.on_tick() == []
+        assert env.supervisor.state == STOPPED
+
+    def test_deferred_launch_is_dropped_by_a_newer_generation(self, env):
+        env.supervisor.server_stopping_cooldown = 5
+        stop(env, launch(env))
+        env.supervisor.handle(StartCommand())
+        adopted = ProcessIdentity(4002, 41.0)
+        env.supervisor._commit_started(adopted, adopted=True)  # e.g. adoption
+
+        env.clock.advance(5)
+        requests = env.supervisor.on_tick()
+        assert not any(isinstance(r, LaunchRequest) for r in requests)
+        assert env.supervisor.state == RUNNING
 
     def test_collaborator_failure_does_not_break_the_stop_commit(self, env):
         identity = launch(env)
@@ -452,12 +531,20 @@ class TestSnapshot:
 
     def test_started_at_of_an_adopted_server_is_its_process_creation(self, env):
         created = env.wall() - 3600
-        start_running(env, ProcessIdentity(1001, created))
+        env.pm.created_at[1001] = created
+        # The identity's key is a boot-relative start time, not epoch seconds.
+        start_running(env, ProcessIdentity(1001, 427.19))
 
         assert snapshot(env)["startedAt"] == created
 
     def test_implausible_creation_time_falls_back_to_now(self, env):
-        start_running(env, ProcessIdentity(1001, env.wall() + 999))
+        env.pm.created_at[1001] = env.wall() + 999
+        start_running(env, ProcessIdentity(1001, 10.0))
+
+        assert snapshot(env)["startedAt"] == env.wall()
+
+    def test_unknown_creation_time_falls_back_to_now(self, env):
+        start_running(env, ProcessIdentity(1001, 10.0))
 
         assert snapshot(env)["startedAt"] == env.wall()
 
@@ -662,14 +749,16 @@ class TestRestart:
         env.supervisor.handle(LaunchResult(request.generation, second))
         assert env.supervisor.state == RUNNING
 
-        # A plain stop + start in the same moment is still debounced.
+        # A plain stop + start in the same moment is still debounced: the start
+        # is accepted but launches only once the debounce is over.
         env.clock.advance(61)
         stop(env, second)
         command = StartCommand()
         assert env.supervisor.handle(command) == []
-        assert command.result is False
-        env.clock.advance(61)
-        assert len(env.supervisor.handle(StartCommand())) == 1
+        assert command.outcome == ActionResult(True, "Starting the server in 60 s.")
+        env.clock.advance(60)
+        [late] = env.supervisor.on_tick()
+        assert isinstance(late, LaunchRequest)
 
     def test_restart_from_stopped_acts_like_start(self, env):
         command = RestartCommand()
@@ -853,20 +942,6 @@ class TestCommandOutcomes:
             assert command.outcome == ActionResult(
                 False, "A restart is already in progress."
             )
-
-    def test_start_cooldown_after_start(self, env):
-        env.supervisor.server_starting_cooldown = 5
-        identity = launch(env)
-        env.pm.exit(identity)
-        observe(env)  # crashed right away
-        env.supervisor.server_stopping_cooldown = 0
-
-        command = StartCommand()
-        env.supervisor.handle(command)
-
-        assert command.outcome == ActionResult(
-            False, "The server was started moments ago; try again in 5 s."
-        )
 
 
 class TestOfflineEdit:

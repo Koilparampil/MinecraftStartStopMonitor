@@ -7,7 +7,9 @@ documented snapshots and ActionResults.
 """
 
 import json
+import logging
 import re
+import socket
 import threading
 import time
 import urllib.request
@@ -19,7 +21,7 @@ import requests
 from src.events import Event, EventBus
 from src.lifecycle.messages import ActionResult
 from src.minecraft import server_files
-from src.web_server import WebServer
+from src.web_server import ServerLimits, WebServer
 from test.support import free_tcp_port, wait_until
 
 REAL_LIST_MODS = server_files.list_mods
@@ -176,6 +178,9 @@ class TestLogin:
         assert locked.status_code == 429
         assert "Too many failed attempts" in locked.get_data(as_text=True)
         assert "disabled" in locked.get_data(as_text=True)
+        # login.js counts down and re-enables the form when the lockout ends.
+        assert re.search(r'data-lockout-seconds="\d+"', locked.get_data(as_text=True))
+        assert "login.js" in locked.get_data(as_text=True)
         # Even the right password is refused while locked out.
         assert login(client).status_code == 429
 
@@ -280,12 +285,13 @@ class TestCsrf:
         response = client.post("/action", data={"action": "startServer"})
         assert response.status_code == 401
 
-    def test_logout_requires_token(self, build):
+    def test_logout_works_even_without_a_valid_token(self, build):
+        """Logging out must always work (the Origin check still refuses
+        cross-origin posts)."""
         client = build(csrf=True).app.test_client()
         login(client, csrf=True)
-        assert client.post("/logout").status_code == 400
-        token = csrf_from(client.get("/").get_data(as_text=True))
-        assert client.post("/logout", data={"csrf_token": token}).status_code == 302
+        assert client.post("/logout").status_code == 302
+        assert client.get("/").status_code == 302
 
 
 class TestUnauthenticated:
@@ -635,6 +641,23 @@ class TestConsole:
         assert body["source"] == "launch"
         assert body["lines"] == ["Launching", "ok"]  # ANSI colours stripped
 
+    def test_unreadable_log_is_a_json_error_logged_once(
+        self, auth_client, mock_settings, monkeypatch, caplog
+    ):
+        self.write_log(mock_settings, ["x"])
+
+        def denied(path, *args, **kwargs):
+            raise PermissionError(13, "Permission denied", path)
+
+        monkeypatch.setattr(server_files, "tail_file", denied)
+        with caplog.at_level(logging.WARNING, logger="src.web_server"):
+            responses = [auth_client.get("/console") for _ in range(3)]
+        assert [r.status_code for r in responses] == [200, 200, 200]
+        body = responses[0].get_json()
+        assert body["success"] is False
+        assert body["message"] == "Cannot read logs/latest.log: permission denied."
+        assert sum("cannot read" in r.getMessage() for r in caplog.records) == 1
+
     def test_missing_log(self, auth_client):
         body = auth_client.get("/console").get_json()
         assert body == {"success": True, "source": "log", "lines": [], "exists": False}
@@ -902,11 +925,12 @@ class TestSessionSecurity:
         theirs.close()
 
     def test_stream_ends_when_the_session_would_expire(
-        self, auth_client, web, mock_settings
+        self, client, web, mock_settings
     ):
         web.sse_keepalive_interval = 0.02
-        mock_settings.sessionTimeout = 0.2
-        response = auth_client.get("/stream", buffered=False)
+        mock_settings.sessionTimeout = 0.2  # sessions take it when they open
+        login(client)
+        response = client.get("/stream", buffered=False)
         started = time.monotonic()
         rest = list(response.response)  # ends by itself
         assert time.monotonic() - started < 3
@@ -998,3 +1022,741 @@ class TestControllerMessages:
             ]
             == "Starting the server…"
         )
+
+
+# ----------------------------------------------------------------------
+# Phase 3 hardening: sessions, Origin, proxies, cookies, monitor state
+# ----------------------------------------------------------------------
+
+
+def cookie_name(kind, mock_settings, prefix=""):
+    return f"{prefix}mcmonitor_{kind}_{mock_settings.webServerPort}"
+
+
+class TestSessionFixation:
+    def test_login_discards_the_pre_login_csrf_secret(self, build):
+        client = build(csrf=True).app.test_client()
+        planted = csrf_from(client.get("/login").get_data(as_text=True))
+        assert login(client, csrf_token=planted).status_code == 302
+        stale = client.post(
+            "/action", data={"action": "getStatus", "csrf_token": planted}
+        )
+        assert stale.status_code == 400
+        fresh = csrf_from(client.get("/").get_data(as_text=True))
+        ok = client.post("/action", data={"action": "getStatus", "csrf_token": fresh})
+        assert ok.status_code == 200
+
+    def test_login_starts_a_new_session(self, web, client):
+        with client.session_transaction() as sess:
+            sess["planted"] = "by an attacker"
+        login(client)
+        with client.session_transaction() as sess:
+            assert "planted" not in sess
+            assert web.sessions.check_session(sess["sid"], web._credential_epoch())
+
+
+class TestServerSideSessions:
+    def test_copied_session_cookie_dies_with_logout(self, web, mock_settings):
+        client = web.app.test_client()
+        login(client)
+        name = cookie_name("session", mock_settings)
+        copied = client.get_cookie(name).value
+        assert client.post("/logout").status_code == 302
+        thief = web.app.test_client()
+        thief.set_cookie(name, copied)
+        assert thief.get("/info").status_code == 401
+        assert thief.post("/command", data={"command": "op Mallory"}).status_code == 401
+        web.controller.run_console_command.assert_not_called()
+
+    def test_remember_tokens_are_random_and_revoked_by_logout(self, web, mock_settings):
+        name = cookie_name("remember", mock_settings)
+        first, second = web.app.test_client(), web.app.test_client()
+        login(first, remember="on")
+        login(second, remember="on")
+        token = first.get_cookie(name).value
+        assert token != second.get_cookie(name).value
+        assert "|" not in token  # not the old deterministic id|hmac format
+        thief = web.app.test_client()
+        thief.set_cookie(name, token)
+        assert thief.get("/info").status_code == 200  # valid until logout
+        first.post("/logout")
+        assert thief.get("/info").status_code == 401  # restored session ended too
+        late = web.app.test_client()
+        late.set_cookie(name, token)
+        assert late.get("/info").status_code == 401
+        assert second.get("/info").status_code == 200  # other logins unaffected
+
+    def test_remember_restores_on_safe_requests_only(self, web, mock_settings):
+        name = cookie_name("remember", mock_settings)
+        owner = web.app.test_client()
+        login(owner, remember="on")
+        browser = web.app.test_client()
+        browser.set_cookie(name, owner.get_cookie(name).value)
+        refused = browser.post("/action", data={"action": "getStatus"})
+        assert refused.status_code == 401
+        restored = browser.get("/info")
+        assert restored.status_code == 200
+        assert restored.headers["X-CSRF-Token"]  # the page adopts the new token
+        assert browser.post("/action", data={"action": "getStatus"}).status_code == 200
+
+    def test_bad_remember_cookie_is_deleted(self, client, mock_settings):
+        name = cookie_name("remember", mock_settings)
+        client.set_cookie(name, "admin|0123|forged")
+        response = client.get("/info")
+        assert response.status_code == 401
+        assert any(
+            c.startswith(f"{name}=;") for c in response.headers.getlist("Set-Cookie")
+        )
+
+    def test_expired_session_needs_a_new_login(self, web, client):
+        login(client)
+        web.sessions._clock = lambda: time.time() + 13 * 3600
+        assert client.get("/info").status_code == 401
+
+    def test_log_out_everywhere(self, web, mock_settings):
+        first, second = web.app.test_client(), web.app.test_client()
+        login(first)
+        login(second, remember="on")
+        assert first.post("/logout", data={"scope": "all"}).status_code == 302
+        assert second.get("/info").status_code == 401
+        assert web.sessions.token_count() == 0
+        assert "Signed out everywhere" in first.get("/login").get_data(as_text=True)
+
+    def test_logout_with_a_lapsed_session_still_forgets_the_browser(
+        self, web, mock_settings
+    ):
+        name = cookie_name("remember", mock_settings)
+        client = web.app.test_client()
+        login(client, remember="on")
+        token = client.get_cookie(name).value
+        web.sessions._sessions.clear()  # the session lapsed server-side
+        assert client.post("/logout").status_code == 302
+        stranger = web.app.test_client()
+        stranger.set_cookie(name, token)
+        assert stranger.get("/info").status_code == 401
+
+
+class TestOriginCheck:
+    def test_cross_origin_post_is_refused(self, auth_client, web):
+        response = auth_client.post(
+            "/action",
+            data={"action": "stopServer"},
+            headers={"Origin": "http://localhost:8123"},
+        )
+        assert response.status_code == 403
+        assert "trustedProxies" in response.get_json()["message"]
+        web.controller.stop_server.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "headers,status",
+        [
+            ({"Origin": "http://localhost"}, 200),
+            ({"Origin": "http://LOCALHOST:80"}, 200),
+            ({"Origin": "null"}, 403),
+            ({"Origin": "https://localhost"}, 403),
+            ({"Referer": "http://localhost/"}, 200),
+            ({"Referer": "http://evil.example/page"}, 403),
+            ({}, 200),  # non-browser clients still need the CSRF token
+        ],
+    )
+    def test_origin_and_referer(self, auth_client, headers, status):
+        response = auth_client.post(
+            "/action", data={"action": "getStatus"}, headers=headers
+        )
+        assert response.status_code == status
+
+    def test_cross_origin_login_is_refused(self, client):
+        response = client.post(
+            "/login",
+            data={"username": USERNAME, "password": PASSWORD},
+            headers={"Origin": "http://localhost:9000"},
+        )
+        assert response.status_code == 403
+        assert "Request blocked" in response.get_data(as_text=True)
+        assert client.get("/").status_code == 302
+
+
+class TestTrustedProxies:
+    def fail_logins(self, client, address, count=5):
+        for _ in range(count):
+            client.post(
+                "/login",
+                data={"username": USERNAME, "password": "wrong"},
+                headers={"X-Forwarded-For": address},
+            )
+
+    def test_lockout_follows_the_forwarded_client(self, build, mock_settings, caplog):
+        mock_settings.trustedProxies = ["127.0.0.1"]
+        web = build()
+        attacker, admin = web.app.test_client(), web.app.test_client()
+        with caplog.at_level(logging.WARNING):
+            self.fail_logins(attacker, "203.0.113.66")
+        assert "203.0.113.66" in caplog.text
+        response = admin.post(
+            "/login",
+            data={"username": USERNAME, "password": PASSWORD},
+            headers={"X-Forwarded-For": "198.51.100.7"},
+        )
+        assert response.status_code == 302
+
+    def test_untrusted_peers_cannot_spoof_their_address(self, build, mock_settings):
+        client = build().app.test_client()  # trustedProxies defaults to none
+        self.fail_logins(client, "203.0.113.66")
+        response = client.post(
+            "/login",
+            data={"username": USERNAME, "password": PASSWORD},
+            headers={"X-Forwarded-For": "198.51.100.7"},
+        )
+        assert response.status_code == 429
+
+    def test_https_proxy_origin_is_accepted(self, build, mock_settings):
+        mock_settings.trustedProxies = ["127.0.0.0/8"]
+        client = build().app.test_client()
+        login(client)
+        proxied = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": "mc.example.net"}
+        ok = client.post(
+            "/action",
+            data={"action": "getStatus"},
+            headers={**proxied, "Origin": "https://mc.example.net"},
+        )
+        assert ok.status_code == 200
+        bad = client.post(
+            "/action",
+            data={"action": "getStatus"},
+            headers={**proxied, "Origin": "http://mc.example.net:8123"},
+        )
+        assert bad.status_code == 403
+
+
+class TestCookies:
+    def test_default_cookies_are_strict_and_not_secure(self, client, mock_settings):
+        response = login(client, remember="on")
+        cookies = response.headers.getlist("Set-Cookie")
+        for kind in ("session", "remember"):
+            cookie = next(
+                c for c in cookies if c.startswith(cookie_name(kind, mock_settings))
+            )
+            assert "SameSite=Strict" in cookie and "HttpOnly" in cookie
+            assert "Secure" not in cookie
+        assert "Strict-Transport-Security" not in response.headers
+
+    def test_secure_cookies(self, build, mock_settings):
+        mock_settings.secureCookies = True
+        client = build().app.test_client()
+        response = login(client, remember="on")
+        cookies = response.headers.getlist("Set-Cookie")
+        for kind in ("session", "remember"):
+            cookie = next(
+                c
+                for c in cookies
+                if c.startswith(cookie_name(kind, mock_settings, prefix="__Host-"))
+            )
+            assert "Secure" in cookie and "Path=/" in cookie and "Domain" not in cookie
+        assert response.headers["Strict-Transport-Security"].startswith("max-age=")
+
+
+class TestMonitorWarnings:
+    BLOCKED = {"armed": True, "listening": False, "error": "Address already in use"}
+
+    def test_info_and_page_report_listener_and_rcon_state(self, build):
+        web = build()
+        web.controller.client.rcon_status = "auth_failed"
+        web.auto_start_status = lambda: dict(self.BLOCKED)
+        client = web.app.test_client()
+        login(client)
+        body = client.get("/info").get_json()
+        assert body["rconStatus"] == "auth_failed"
+        assert body["autoStartStatus"] == self.BLOCKED
+        html = client.get("/").get_data(as_text=True)
+        assert "auto-start can't use the game port" in html
+        assert "Sleeping — a join attempt wakes it" not in html
+        assert '"rconStatus": "auth_failed"' in html  # bootstrap for the script
+
+    def test_json_responses_carry_monitor_state(self, auth_client):
+        body = auth_client.post("/action", data={"action": "getStatus"}).get_json()
+        assert body["monitor"] == {"rconStatus": None, "autoStartStatus": None}
+
+    def test_automation_text_when_nothing_can_start_the_server(
+        self, build, mock_settings
+    ):
+        mock_settings.autoStart = False
+        mock_settings.controlServerThroughWeb = False
+        client = build().app.test_client()
+        login(client)
+        html = client.get("/").get_data(as_text=True)
+        assert "start the server from this dashboard" not in html
+        assert "started outside the monitor" in html
+
+
+# ----------------------------------------------------------------------
+# Bounded server: slow and idle connections (security-1)
+# ----------------------------------------------------------------------
+
+
+class TestBoundedServer:
+    @pytest.fixture
+    def serve(self, build, mock_settings):
+        started = []
+
+        def _serve(**limits):
+            mock_settings.webServerPort = free_tcp_port()
+            web = build()
+            web.server_limits = ServerLimits(**limits)
+            thread = threading.Thread(target=web.run, daemon=True)
+            thread.start()
+            assert web.serving.wait(5)
+            started.append((web, thread))
+            return web
+
+        yield _serve
+        for web, thread in started:
+            web.shutdown()
+            thread.join(5)
+
+    @staticmethod
+    def idle_connections(port, count, source):
+        sockets = []
+        for _ in range(count):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind((source, 0))
+            except OSError:
+                sock.close()
+                pytest.skip(f"cannot use {source} as a source address here")
+            sock.settimeout(5)
+            try:
+                sock.connect(("127.0.0.1", port))
+                sock.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n")  # headers never end
+            except OSError:
+                pass  # already refused
+            sockets.append(sock)
+        return sockets
+
+    @staticmethod
+    def closed_by_server(sock):
+        sock.settimeout(2)
+        try:
+            return sock.recv(1) == b""
+        except (ConnectionError, OSError):
+            return True
+
+    @staticmethod
+    def admin_can_use_the_dashboard(web):
+        session = requests.Session()
+        base = f"http://127.0.0.1:{web.bound_port}"
+        login = session.post(
+            base + "/login",
+            data={"username": USERNAME, "password": PASSWORD},
+            allow_redirects=False,
+            timeout=5,
+        )
+        assert login.status_code == 302
+        assert session.get(base + "/info", timeout=5).status_code == 200
+
+    def test_idle_flood_from_one_address_is_capped(self, serve):
+        web = serve(max_connections_per_ip=8, request_read_timeout=30)
+        flood = self.idle_connections(web.bound_port, 40, "127.0.0.2")
+        try:
+            refused = sum(self.closed_by_server(sock) for sock in flood[8:])
+            assert refused == 32
+            assert web._server.open_connections() <= 8
+            self.admin_can_use_the_dashboard(web)
+        finally:
+            for sock in flood:
+                sock.close()
+
+    def test_flood_from_many_addresses_cannot_keep_requests_out(self, serve):
+        web = serve(
+            max_connections=16, max_connections_per_ip=6, request_read_timeout=30
+        )
+        flood = []
+        try:
+            for host in range(2, 10):
+                flood += self.idle_connections(web.bound_port, 6, f"127.0.0.{host}")
+            assert web._server.open_connections() <= 16
+            for _ in range(3):  # each request evicts the oldest idle connection
+                self.admin_can_use_the_dashboard(web)
+        finally:
+            for sock in flood:
+                sock.close()
+
+    def test_trickled_request_is_dropped_at_the_deadline(self, serve):
+        web = serve(request_read_timeout=0.5)
+        sock = socket.create_connection(("127.0.0.1", web.bound_port), timeout=5)
+        try:
+            started = time.monotonic()
+            sock.sendall(b"GET / HTTP/1.1\r\n")
+            sock.settimeout(0.1)
+            closed = False
+            while not closed and time.monotonic() - started < 5:
+                try:
+                    sock.sendall(b"X")  # one byte at a time, never a full line
+                    closed = sock.recv(1) == b""
+                except TimeoutError:
+                    continue
+                except OSError:
+                    closed = True
+            assert closed
+            assert 0.4 < time.monotonic() - started < 3
+            wait_until(lambda: web._server.open_connections() == 0, timeout=5)
+        finally:
+            sock.close()
+
+    def test_streams_outlive_the_read_deadline(self, serve):
+        web = serve(request_read_timeout=0.3)
+        session = requests.Session()
+        base = f"http://127.0.0.1:{web.bound_port}"
+        session.post(base + "/login", data={"username": USERNAME, "password": PASSWORD})
+        with session.get(base + "/stream", stream=True, timeout=10) as response:
+            lines = response.iter_lines(decode_unicode=True)
+            next(line for line in lines if line.startswith("data: "))
+            time.sleep(0.6)
+            web.controller.get_snapshot.return_value = make_snapshot(revision=7)
+            web.bus.publish(Event.SERVER_STATUS, {})
+            update = next(line for line in lines if line.startswith("data: "))
+            assert json.loads(update[6:])["data"]["revision"] == 7
+
+
+# ----------------------------------------------------------------------
+# Fix round 2
+# ----------------------------------------------------------------------
+
+
+class TestSessionRenewal:
+    def restarted(self, build, client):
+        """A second WebServer on the same settings and data dir (a monitor
+        restart), with the browser's cookies carried over."""
+        web = build()
+        browser = web.app.test_client()
+        for cookie in client._cookies.values():
+            browser.set_cookie(cookie.key, cookie.value)
+        return web, browser
+
+    def test_page_left_open_across_a_restart_can_still_act(self, build, mock_settings):
+        first = build(csrf=True)
+        client = first.app.test_client()
+        assert login(client, csrf=True, remember="on").status_code == 302
+        page_token = csrf_from(client.get("/").get_data(as_text=True))
+        web, browser = self.restarted(build, client)
+        web.app.config["WTF_CSRF_ENABLED"] = True
+
+        stream = browser.get("/stream", buffered=False)  # the page reconnects first
+        first_message = sse_payload(next(iter(stream.response)))
+        stream.close()
+        fresh = first_message["csrfToken"]
+        assert fresh and fresh != page_token
+        ok = browser.post(
+            "/action", data={"action": "startServer", "csrf_token": fresh}
+        )
+        assert ok.status_code == 200
+        web.controller.start_server.assert_called_once()
+
+    def test_stale_token_is_flagged_and_csrf_endpoint_recovers(self, build):
+        web = build(csrf=True)
+        client = web.app.test_client()
+        login(client, csrf=True)
+        stale = client.post("/action", data={"action": "getStatus", "csrf_token": "x"})
+        assert stale.status_code == 400 and stale.get_json()["csrfError"] is True
+        token = client.get("/csrf").get_json()["csrfToken"]
+        ok = client.post("/action", data={"action": "getStatus", "csrf_token": token})
+        assert ok.status_code == 200
+        assert web.app.test_client().get("/csrf").status_code == 401
+
+    def test_logout_with_a_stale_token_still_logs_out(self, build, mock_settings):
+        web = build(csrf=True)
+        client = web.app.test_client()
+        login(client, csrf=True, remember="on")
+        response = client.post("/logout", data={"csrf_token": "stale"})
+        assert response.status_code == 302
+        assert response.headers["Location"] == "/login"
+        assert client.get("/").status_code == 302
+        assert web.sessions.token_count() == 0
+
+    def test_payloads_carry_the_rcon_status(self, auth_client, web):
+        web.controller.client.rcon_status = "ok"
+        body = auth_client.post("/action", data={"action": "getStatus"}).get_json()
+        assert body["rconStatus"] == "ok"
+
+
+class TestLoginBackstops:
+    def test_ipv6_rotation_within_a_64_is_one_client(self, build, mock_settings):
+        mock_settings.trustedProxies = ["127.0.0.1"]
+        client = build().app.test_client()
+        codes = [
+            client.post(
+                "/login",
+                data={"username": USERNAME, "password": "wrong"},
+                headers={"X-Forwarded-For": f"2001:db8:1:2::{n:x}"},
+            ).status_code
+            for n in range(1, 8)
+        ]
+        assert codes == [200, 200, 200, 200, 429, 429, 429]
+        other_64 = client.post(
+            "/login",
+            data={"username": USERNAME, "password": PASSWORD},
+            headers={"X-Forwarded-For": "2001:db8:1:3::1"},
+        )
+        assert other_64.status_code == 302
+
+    def test_global_backstop_across_addresses(self, build, mock_settings):
+        mock_settings.trustedProxies = ["127.0.0.1"]
+        web = build()
+        web.login_tracker.global_threshold = 3
+        client = web.app.test_client()
+        for n in range(3):
+            client.post(
+                "/login",
+                data={"username": USERNAME, "password": "wrong"},
+                headers={"X-Forwarded-For": f"198.51.100.{n}"},
+            )
+        refused = client.post(
+            "/login",
+            data={"username": USERNAME, "password": PASSWORD},
+            headers={"X-Forwarded-For": "203.0.113.50"},
+        )
+        assert refused.status_code == 429
+        assert "Too many failed logins on this dashboard" in refused.get_data(
+            as_text=True
+        )
+
+
+class TestProxyOrigins:
+    @pytest.fixture
+    def proxied(self, build, mock_settings):
+        mock_settings.trustedProxies = ["127.0.0.1"]
+        web = build(csrf=True)
+        client = web.app.test_client()
+        return web, client
+
+    def post_login(self, client, headers):
+        token = csrf_from(client.get("/login", headers=headers).get_data(as_text=True))
+        return client.post(
+            "/login",
+            data={"username": USERNAME, "password": PASSWORD, "csrf_token": token},
+            headers=headers,
+        )
+
+    def test_forwarded_port_completes_a_host_without_port(self, proxied):
+        _, client = proxied
+        headers = {
+            "Host": "mc.example.com",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Port": "8443",
+            "Origin": "https://mc.example.com:8443",
+        }
+        assert self.post_login(client, headers).status_code == 302
+
+    def test_missing_port_gets_an_accurate_hint(self, proxied):
+        _, client = proxied
+        headers = {
+            "Host": "mc.example.com",
+            "X-Forwarded-Proto": "https",
+            "Origin": "https://mc.example.com:8443",
+        }
+        response = self.post_login(client, headers)
+        assert response.status_code == 403
+        assert "$http_host" in response.get_data(as_text=True)
+
+    def test_https_post_without_referer_is_accepted(self, proxied):
+        _, client = proxied
+        headers = {
+            "Host": "mc.example.com",
+            "X-Forwarded-Proto": "https",
+            "Origin": "https://mc.example.com",
+        }
+        assert self.post_login(client, headers).status_code == 302
+        token = csrf_from(client.get("/", headers=headers).get_data(as_text=True))
+        ok = client.post(
+            "/action",
+            data={"action": "getStatus", "csrf_token": token},
+            headers=headers,
+        )
+        assert ok.status_code == 200
+
+
+class TestServerCleanup:
+    @pytest.fixture
+    def serve(self, build, mock_settings):
+        started = []
+
+        def _serve(**limits):
+            mock_settings.webServerPort = free_tcp_port()
+            web = build()
+            web.server_limits = ServerLimits(**limits)
+            web.sse_keepalive_interval = 0.1
+            thread = threading.Thread(target=web.run, daemon=True)
+            thread.start()
+            assert web.serving.wait(5)
+            started.append((web, thread))
+            return web
+
+        yield _serve
+        for web, thread in started:
+            web.shutdown()
+            thread.join(5)
+
+    @staticmethod
+    def epoll_fds():
+        import os
+
+        try:
+            names = os.listdir("/proc/self/fd")
+        except OSError:
+            return None
+        count = 0
+        for name in names:
+            try:
+                count += "eventpoll" in os.readlink(f"/proc/self/fd/{name}")
+            except OSError:
+                pass
+        return count
+
+    def test_long_streams_are_freed_without_garbage_collection(self, serve):
+        import gc
+
+        web = serve(request_read_timeout=0.3)
+        base = f"http://127.0.0.1:{web.bound_port}"
+        session = requests.Session()
+        session.post(base + "/login", data={"username": USERNAME, "password": PASSWORD})
+        before = self.epoll_fds()
+        gc.disable()
+        try:
+            for _ in range(5):
+                response = session.get(base + "/stream", stream=True, timeout=10)
+                next(response.iter_lines())
+                time.sleep(0.5)  # outlive the request read deadline
+                response.close()
+            wait_until(lambda: len(web._streams) == 0, timeout=5)
+            wait_until(lambda: web._server.open_connections() == 0, timeout=5)
+            if before is not None:
+                assert self.epoll_fds() <= before
+        finally:
+            gc.enable()
+
+    def test_slow_bodies_cannot_keep_requests_out(self, serve):
+        web = serve(
+            max_connections=16, max_connections_per_ip=6, request_read_timeout=30
+        )
+        port = web.bound_port
+        flood = []
+        try:
+            for host in range(2, 6):
+                for _ in range(6):
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    try:
+                        sock.bind((f"127.0.0.{host}", 0))
+                    except OSError:
+                        sock.close()
+                        pytest.skip("cannot use 127.0.0.x as a source address here")
+                    sock.settimeout(5)
+                    try:
+                        sock.connect(("127.0.0.1", port))
+                        sock.sendall(
+                            b"POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 8000\r\n"
+                            b"Content-Type: application/x-www-form-urlencoded\r\n\r\nu"
+                        )
+                    except OSError:
+                        pass
+                    flood.append(sock)
+            time.sleep(0.3)
+            assert web._server.open_connections() <= 16
+            for _ in range(3):
+                TestBoundedServer.admin_can_use_the_dashboard(web)
+        finally:
+            for sock in flood:
+                sock.close()
+
+
+# ----------------------------------------------------------------------
+# Fix round 3
+# ----------------------------------------------------------------------
+
+
+class TestLogoutCannotBeForged:
+    @pytest.fixture
+    def victim(self, build, mock_settings):
+        web = build(csrf=True)
+        client = web.app.test_client()
+        assert login(client, csrf=True, remember="on").status_code == 302
+        return web, client
+
+    @pytest.mark.parametrize("headers", [{}, {"Origin": "http://localhost"}])
+    def test_anonymous_logout_everywhere_changes_nothing(self, victim, headers):
+        web, client = victim
+        anonymous = web.app.test_client()
+        response = anonymous.post("/logout", data={"scope": "all"}, headers=headers)
+        assert response.status_code in (302, 401)
+        assert client.get("/info").status_code == 200
+        assert web.sessions.token_count() == 1
+        assert web.sessions.session_count() == 1
+
+    def test_anonymous_logout_without_csrf_protection_changes_nothing(self, build):
+        web = build()  # CSRF checks off: the login_required path
+        client = web.app.test_client()
+        login(client, remember="on")
+        web.app.test_client().post("/logout", data={"scope": "all"})
+        assert client.get("/info").status_code == 200
+        assert web.sessions.token_count() == 1
+
+    def test_stale_token_logout_ends_only_its_own_session(self, build):
+        web = build(csrf=True)
+        mine, theirs = web.app.test_client(), web.app.test_client()
+        login(mine, csrf=True)
+        login(theirs, csrf=True, remember="on")
+        response = mine.post("/logout", data={"scope": "all", "csrf_token": "stale"})
+        assert response.status_code == 302
+        assert mine.get("/info").status_code == 401
+        assert theirs.get("/info").status_code == 200
+        assert web.sessions.token_count() == 1
+
+    def test_logout_everywhere_needs_a_valid_token(self, build):
+        web = build(csrf=True)
+        mine, theirs = web.app.test_client(), web.app.test_client()
+        login(mine, csrf=True)
+        login(theirs, csrf=True)
+        token = csrf_from(mine.get("/").get_data(as_text=True))
+        mine.post("/logout", data={"scope": "all", "csrf_token": token})
+        assert theirs.get("/info").status_code == 401
+
+    def test_cross_origin_warnings_are_throttled(self, auth_client, caplog):
+        with caplog.at_level(logging.WARNING, logger="src.web_server"):
+            for _ in range(5):
+                auth_client.post(
+                    "/action",
+                    data={"action": "getStatus"},
+                    headers={"Origin": "http://evil.example"},
+                )
+        assert sum("cross-origin" in r.getMessage() for r in caplog.records) == 1
+
+
+class TestPortMappedProxy:
+    def test_proxy_listening_on_another_port_than_the_public_one(
+        self, build, mock_settings
+    ):
+        """nginx inside Docker (-p 443:8443): $server_port is 8443 while the
+        browser uses the default port."""
+        mock_settings.trustedProxies = ["127.0.0.1"]
+        client = build().app.test_client()
+        base = {
+            "Host": "mc.example.com",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Port": "8443",
+        }
+        logged_in = client.post(
+            "/login",
+            data={"username": USERNAME, "password": PASSWORD},
+            headers={**base, "Origin": "https://mc.example.com"},
+        )
+        assert logged_in.status_code == 302
+        for origin, status in [
+            ("https://mc.example.com", 200),
+            ("https://mc.example.com:8443", 200),
+            ("https://mc.example.com:9999", 403),
+            ("http://mc.example.com", 403),
+        ]:
+            response = client.post(
+                "/action",
+                data={"action": "getStatus"},
+                headers={**base, "Origin": origin},
+            )
+            assert response.status_code == status, origin

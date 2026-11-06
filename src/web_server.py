@@ -22,7 +22,11 @@ order (see docs/ARCHITECTURE.md, "WebServer").
 """
 
 import contextlib
+import errno
+import functools
 import hmac
+import io
+import ipaddress
 import json
 import logging
 import os
@@ -41,6 +45,7 @@ from flask import (
     Flask,
     Response,
     flash,
+    g,
     jsonify,
     redirect,
     render_template,
@@ -49,7 +54,6 @@ from flask import (
     url_for,
 )
 from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 from flask_login import (
     LoginManager,
     current_user,
@@ -57,11 +61,12 @@ from flask_login import (
     login_user,
     logout_user,
 )
-from flask_wtf.csrf import CSRFError, CSRFProtect
-from werkzeug.serving import make_server
+from flask_wtf.csrf import CSRFError, CSRFProtect, generate_csrf
+from werkzeug.serving import ThreadedWSGIServer, WSGIRequestHandler
 
 from src.auth import (
     LoginAttemptTracker,
+    SessionStore,
     User,
     credential_epoch,
     safe_next_url,
@@ -87,6 +92,12 @@ SSE_RETRY_MS = 3000
 SSE_QUEUE_SIZE = 32
 MAX_SSE_CLIENTS = 64
 AVATAR_ORIGIN = "https://mc-heads.net"
+SESSION_STORE_FILE = "web-sessions.json"  # remember-me token hashes (0600)
+ABSOLUTE_SESSION_SECONDS = 12 * 3600  # however active, a session ends after this
+REMEMBER_SECONDS = 7 * 86400
+MAX_REQUEST_BYTES = 16 * 1024  # dashboard requests are small forms
+SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+RCON_STATUSES = ("disabled", "ok", "auth_failed", "unreachable", "unknown")
 
 # Committed notifications that change what the dashboard shows. PLAYER_* are
 # deliberately absent: every roster change is followed by SERVER_STATUS.
@@ -110,7 +121,6 @@ class _StreamGrant:
 
     owner: str | None  # the session id (logout ends its streams)
     epoch: str  # credential epoch at open time
-    expires_at: float  # time.monotonic() deadline (the session's lifetime)
 
 
 @dataclass(frozen=True)
@@ -268,6 +278,12 @@ class _StreamHub:
             for client in self._clients:
                 _put_latest(client, message)
 
+    def end_all(self) -> None:
+        """End every open stream but keep accepting new ones."""
+        with self._lock:
+            for client in self._clients:
+                _put_latest(client, None)
+
     def close(self) -> None:
         """End every open stream; refuse new ones."""
         with self._lock:
@@ -276,14 +292,332 @@ class _StreamHub:
                 _put_latest(client, None)
 
 
+# ----------------------------------------------------------------------
+# Bounded HTTP server (werkzeug's threaded server, hardened)
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ServerLimits:
+    """Bounds that keep one client from exhausting threads and descriptors."""
+
+    max_connections: int = 128  # all open connections, streams included
+    max_connections_per_ip: int = 24  # per address (per /64 for IPv6)
+    request_read_timeout: float = 15.0  # request line + headers + body, total
+    io_timeout: float = 30.0  # any single socket read or write
+
+
+class _DeadlineSocketIO(socket.SocketIO):
+    """Socket reader with one deadline for the whole request, however slowly
+    the bytes trickle in (a per-recv timeout alone never fires for a client
+    that sends one byte every few seconds)."""
+
+    def __init__(self, sock, deadline: float, io_timeout: float):
+        super().__init__(sock, "rb")
+        self._deadline = deadline
+        self._io_timeout = io_timeout
+        self.responding = False  # set once the response has started
+
+    def readinto(self, buffer):
+        if self.responding:
+            # Only werkzeug's post-response drain reads now. End it cleanly
+            # (EOF) so it closes its selector and the response iterator at
+            # once instead of leaking them until a garbage collection.
+            return 0
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("the request was not received in time")
+        self._sock.settimeout(min(remaining, self._io_timeout))
+        try:
+            return super().readinto(buffer)
+        finally:
+            self._sock.settimeout(self._io_timeout)
+
+
+class _GuardedRequestHandler(WSGIRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        super().setup()
+        limits = self.server.limits
+        self.connection.settimeout(limits.io_timeout)
+        self.rfile.close()  # replaced by a reader with a request deadline
+        deadline = time.monotonic() + limits.request_read_timeout
+        self.rfile = io.BufferedReader(
+            _DeadlineSocketIO(self.connection, deadline, limits.io_timeout)
+        )
+
+    def send_response(self, code, message=None):
+        # From here on nothing more is read from the client, and the
+        # connection is no longer a candidate for eviction.
+        if isinstance(getattr(self.rfile, "raw", None), _DeadlineSocketIO):
+            self.rfile.raw.responding = True
+        self.server.mark_responding(self.request)
+        super().send_response(code, message)
+
+    def log_error(self, format, *args):  # noqa: A002 - stdlib signature
+        if format.startswith("Request timed out"):
+            logger.debug("Dropped a slow HTTP client %s", self.client_address[0])
+            return
+        super().log_error(format, *args)
+
+
+@dataclass
+class _Connection:
+    peer: str  # per-address key (see _peer_key)
+    accepted_at: float
+    waiting: bool = True  # no response started yet (still reading or working)
+
+
+class _GuardedWSGIServer(ThreadedWSGIServer):
+    """Caps open connections globally and per client address.
+
+    Excess connections are closed as soon as they are accepted, except that
+    at the global cap the oldest connection that has not started its response
+    is dropped to make room: a flood of slow headers or slow bodies, from many
+    addresses or through a trusted proxy, cannot keep a real request (which
+    completes in milliseconds) out. Live streams are never dropped.
+    """
+
+    daemon_threads = True
+    block_on_close = False
+
+    def __init__(self, host, port, app, limits: ServerLimits):
+        self.limits = limits
+        self._connections: dict[socket.socket, _Connection] = {}
+        self._connections_lock = threading.Lock()
+        self._warned_at: dict[str, float] = {}
+        super().__init__(host, port, app, handler=_GuardedRequestHandler)
+
+    def open_connections(self) -> int:
+        with self._connections_lock:
+            return len(self._connections)
+
+    def verify_request(self, request, client_address):
+        address = str(client_address[0]) if client_address else ""
+        peer = _peer_key(address)
+        proxy = _in_networks(address, _trusted_networks())
+        with self._connections_lock:
+            same_peer = sum(1 for c in self._connections.values() if c.peer == peer)
+            if not proxy and same_peer >= self.limits.max_connections_per_ip:
+                self._warn(
+                    "peer", "Refusing connections from %s: too many open", address
+                )
+                return False
+            if (
+                len(self._connections) >= self.limits.max_connections
+                and not self._evict()
+            ):
+                self._warn(
+                    "full",
+                    "Refusing a connection: %s already open",
+                    len(self._connections),
+                )
+                return False
+            self._connections[request] = _Connection(peer, time.monotonic())
+        return True
+
+    def _evict(self) -> bool:
+        """Drop the oldest connection whose response has not started."""
+        waiting = [
+            (c.accepted_at, s) for s, c in self._connections.items() if c.waiting
+        ]
+        if not waiting:
+            return False
+        _accepted, victim = min(waiting, key=lambda item: item[0])
+        del self._connections[victim]
+        with contextlib.suppress(OSError):
+            victim.shutdown(socket.SHUT_RDWR)  # its blocked read returns at once
+        return True
+
+    def mark_responding(self, request) -> None:
+        with self._connections_lock:
+            connection = self._connections.get(request)
+            if connection is not None:
+                connection.waiting = False
+
+    def shutdown_request(self, request):
+        with self._connections_lock:
+            self._connections.pop(request, None)
+        super().shutdown_request(request)
+
+    def get_request(self):
+        try:
+            return super().get_request()
+        except OSError as error:
+            if error.errno in (errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM):
+                self._warn("accept", "Web server cannot accept connections: %s", error)
+                time.sleep(0.1)  # don't spin while the process is out of descriptors
+            raise
+
+    def handle_error(self, request, client_address):
+        error = sys.exc_info()[1]
+        if isinstance(error, OSError):
+            logger.debug("Connection from %s ended: %s", client_address, error)
+        else:
+            logger.exception("Error while serving %s", client_address)
+
+    def _warn(self, reason: str, message: str, *args) -> None:
+        now = time.monotonic()
+        if now - self._warned_at.get(reason, -3600.0) >= 60:
+            self._warned_at[reason] = now
+            logger.warning(message, *args)
+
+
+def make_server(host, port, app, limits: ServerLimits | None = None):
+    """The dashboard's threaded server with connection and read bounds."""
+    return _GuardedWSGIServer(host, port, app, limits or ServerLimits())
+
+
+# ----------------------------------------------------------------------
+# Reverse proxies (web.trustedProxies)
+# ----------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=8)
+def _parse_networks(entries: tuple[str, ...]) -> tuple:
+    networks = []
+    for entry in entries:
+        try:
+            networks.append(ipaddress.ip_network(entry.strip(), strict=False))
+        except ValueError:
+            logger.warning("Ignoring invalid web.trustedProxies entry %r", entry)
+    return tuple(networks)
+
+
+def _trusted_networks() -> tuple:
+    raw = settings.get("trustedProxies", []) or []
+    if isinstance(raw, str):
+        raw = re.split(r"[,\s]+", raw)
+    return _parse_networks(tuple(str(item) for item in raw if str(item).strip()))
+
+
+def _ip(text):
+    try:
+        address = ipaddress.ip_address(str(text).strip().split("%")[0])
+    except ValueError:
+        return None
+    if address.version == 6 and address.ipv4_mapped:
+        return address.ipv4_mapped
+    return address
+
+
+def _in_networks(host, networks) -> bool:
+    address = _ip(host) if networks else None
+    return address is not None and any(
+        address.version == network.version and address in network
+        for network in networks
+    )
+
+
+def _peer_key(host: str) -> str:
+    """Connection-cap key: the address, or its /64 for IPv6."""
+    address = _ip(host)
+    if address is None:
+        return host
+    if address.version == 6:
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return str(address)
+
+
+def _last_value(header) -> str:
+    return str(header or "").split(",")[-1].strip()
+
+
+_HOST_RE = re.compile(r"[A-Za-z0-9.\-]+(:\d{1,5})?|\[[0-9A-Fa-f:.]+\](:\d{1,5})?")
+
+
+class _TrustedProxyMiddleware:
+    """Honours X-Forwarded-For/-Proto/-Host/-Port only when the TCP peer is a
+    trusted proxy, so the lockout, the rate limit, the logs and the Origin
+    check see the real client and the public URL."""
+
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        networks = _trusted_networks()
+        if networks and _in_networks(environ.get("REMOTE_ADDR", ""), networks):
+            _apply_forwarded_headers(environ, networks)
+        return self.app(environ, start_response)
+
+
+def _apply_forwarded_headers(environ, networks) -> None:
+    hops = [hop.strip() for hop in environ.get("HTTP_X_FORWARDED_FOR", "").split(",")]
+    client = None
+    for hop in reversed([hop for hop in hops if hop]):
+        if _ip(hop) is None:
+            break
+        client = hop  # the nearest address that is not one of our proxies
+        if not _in_networks(hop, networks):
+            break
+    environ["mcmonitor.proxied"] = True
+    if client:
+        environ["REMOTE_ADDR"] = client
+    proto = _last_value(environ.get("HTTP_X_FORWARDED_PROTO")).lower()
+    if proto in ("http", "https"):
+        environ["wsgi.url_scheme"] = proto
+    host = _last_value(environ.get("HTTP_X_FORWARDED_HOST"))
+    if host and _HOST_RE.fullmatch(host):
+        environ["HTTP_HOST"] = host
+    port = _last_value(environ.get("HTTP_X_FORWARDED_PORT"))
+    if port.isdigit() and 0 < int(port) < 65536:
+        # The port the proxy itself listens on: the public port, unless the
+        # proxy sits behind port mapping (Docker -p 443:8443, a router).
+        # _check_origin accepts it in addition to the Host header's port.
+        environ["mcmonitor.forwarded_port"] = int(port)
+
+
+def _acceptable_origins(expected) -> set:
+    """The dashboard's own origin, plus the same scheme and host on the port a
+    trusted proxy reports in X-Forwarded-Port."""
+    if expected is None:
+        return set()
+    origins = {expected}
+    port = request.environ.get("mcmonitor.forwarded_port")
+    if port:
+        origins.add((expected[0], expected[1], port))
+    return origins
+
+
+def _origin_of(url):
+    """(scheme, host, port) of an http(s) URL, or None."""
+    try:
+        parts = urlsplit(str(url))
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not parts.hostname:
+        return None
+    return scheme, parts.hostname.lower(), port or (443 if scheme == "https" else 80)
+
+
+def _client_key() -> str:
+    """Lockout and rate-limit key: the client address (after trusted-proxy
+    resolution), or its /64 for IPv6."""
+    return _peer_key(request.remote_addr or "unknown")
+
+
+def _secure_cookies() -> bool:
+    return bool(settings.get("secureCookies", False))
+
+
 class WebServer:
     """The dashboard: a Flask app plus its committed-snapshot cache and SSE hub."""
 
-    def __init__(self, controller, bus):
+    def __init__(self, controller, bus, auto_start_status=None):
+        """``auto_start_status``: optional callable returning the sleeping
+        listener's ``{"armed": bool, "listening": bool, "error": str|None}``."""
         self.controller = controller
         self.bus = bus
+        self.auto_start_status = auto_start_status
         self.sse_keepalive_interval = SSE_KEEPALIVE_SECONDS
         self.info_cache_seconds = INFO_CACHE_SECONDS
+        self.server_limits = ServerLimits()
+        self.sessions = SessionStore(settings.data_path(SESSION_STORE_FILE))
+        self._console_errors: dict[str, int | None] = {}  # path -> errno logged
+        self._origin_warned_at = -3600.0
 
         self._lock = threading.RLock()  # snapshot cache + SSE broadcast order
         self.snapshot = self._read_snapshot()
@@ -331,20 +665,31 @@ class WebServer:
         app.secret_key = secret
         # Cookies are shared by every port of a host: suffix the port so two
         # monitors (or other Flask apps) on one machine keep separate logins.
+        # Over HTTPS the __Host- prefix also stops plain-HTTP pages on the
+        # same host from planting or overwriting them.
+        secure = _secure_cookies()
+        prefix = "__Host-" if secure else ""
         suffix = str(settings.webServerPort)
+        self.remember_cookie_name = f"{prefix}mcmonitor_remember_{suffix}"
         app.config.update(
             PERMANENT_SESSION_LIFETIME=timedelta(seconds=int(settings.sessionTimeout)),
-            SESSION_COOKIE_NAME=f"mcmonitor_session_{suffix}",
+            SESSION_COOKIE_NAME=f"{prefix}mcmonitor_session_{suffix}",
             SESSION_COOKIE_HTTPONLY=True,
-            SESSION_COOKIE_SAMESITE="Lax",
-            REMEMBER_COOKIE_NAME=f"mcmonitor_remember_{suffix}",
-            REMEMBER_COOKIE_HTTPONLY=True,
-            REMEMBER_COOKIE_SAMESITE="Lax",
-            REMEMBER_COOKIE_DURATION=timedelta(days=7),
-            # The token lives in the (expiring) session; a dashboard left open
-            # for hours must still be able to act.
+            SESSION_COOKIE_SAMESITE="Strict",
+            SESSION_COOKIE_SECURE=secure,
+            # Flask-Login's own remember cookie is unused: remember-me tokens
+            # are random, server-side and revocable (SessionStore).
+            REMEMBER_COOKIE_NAME=f"mcmonitor_unused_{suffix}",
+            # The token lives in the session, which expires server-side; a
+            # dashboard left open for hours must still be able to act.
             WTF_CSRF_TIME_LIMIT=None,
+            # Same-origin is enforced by _check_origin from Origin or Referer;
+            # Flask-WTF's HTTPS-only check would demand a Referer as well.
+            WTF_CSRF_SSL_STRICT=False,
+            MAX_CONTENT_LENGTH=MAX_REQUEST_BYTES,
         )
+        app.wsgi_app = _TrustedProxyMiddleware(app.wsgi_app)
+        app.before_request(self._check_origin)  # runs before the CSRF check
         app.jinja_env.globals["static_url"] = self._static_url
         return app
 
@@ -353,7 +698,7 @@ class WebServer:
         # counters on one request would lock out at an unpredictable count),
         # as are /stream, /healthz, /console and static files.
         return Limiter(
-            get_remote_address,
+            _client_key,
             app=self.app,
             storage_uri="memory://",
             default_limits=[_default_rate_limit],
@@ -366,6 +711,7 @@ class WebServer:
         manager.login_view = "login"
         manager.login_message = None
         manager.user_loader(self._load_user)
+        manager.request_loader(self._load_user_from_remember)
         manager.unauthorized_handler(self._unauthorized)
         return manager
 
@@ -382,15 +728,107 @@ class WebServer:
             return None
         if not hmac.compare_digest(epoch, self._credential_epoch()):
             return None
+        if not self.sessions.check_session(session.get("sid"), epoch):
+            return None  # logged out, expired, or never opened here
         return User(username, epoch)
 
-    def _ensure_session_id(self):
-        """Give every logged-in session an id (remember-cookie logins too), so
-        logout can end exactly that session's live streams."""
-        if request.endpoint in (None, "static", "healthz"):
-            return
-        if "sid" not in session and current_user.is_authenticated:
-            session["sid"] = secrets.token_urlsafe(16)
+    def _load_user_from_remember(self, req):
+        """Restore a login from a remember-me token into a brand-new session
+        (new id, new CSRF secret). Only on safe requests: a state change must
+        come from a session that already existed, with its own token."""
+        cookie = req.cookies.get(self.remember_cookie_name)
+        if not cookie:
+            return None
+        epoch = self._credential_epoch()
+        token_id = self.sessions.redeem_token(cookie, epoch)
+        if token_id is None:
+            g.drop_remember_cookie = True
+            return None
+        if req.method not in SAFE_METHODS:
+            return None
+        user = User(str(settings.webUsername), epoch)
+        self._establish_session(user, token_id)
+        g.csrf_rotated = True
+        logger.info("Restored a remembered login from %s", req.remote_addr)
+        return user
+
+    def _establish_session(self, user, token_id=None) -> str:
+        """A fresh session: nothing carried over from before the login, so a
+        cookie planted beforehand (and its CSRF secret) is worthless."""
+        session.clear()
+        g.pop("csrf_token", None)
+        session.permanent = True
+        sid = self.sessions.open_session(
+            user.epoch,
+            idle=float(settings.sessionTimeout),
+            lifetime=max(float(settings.sessionTimeout), ABSOLUTE_SESSION_SECONDS),
+            token_id=token_id,
+        )
+        session["sid"] = sid
+        login_user(user)
+        generate_csrf()
+        return sid
+
+    def _set_remember_cookie(self, response, value: str) -> None:
+        response.set_cookie(
+            self.remember_cookie_name,
+            value,
+            max_age=REMEMBER_SECONDS,
+            path="/",
+            secure=_secure_cookies(),
+            httponly=True,
+            samesite="Strict",
+        )
+
+    def _delete_remember_cookie(self, response) -> None:
+        response.delete_cookie(
+            self.remember_cookie_name,
+            path="/",
+            secure=_secure_cookies(),
+            httponly=True,
+            samesite="Strict",
+        )
+
+    def _check_origin(self):
+        """Refuse state-changing requests sent from another origin (another
+        port or host). Browsers always send Origin on such POSTs; clients
+        that send neither Origin nor Referer still need the CSRF token."""
+        if request.method in SAFE_METHODS:
+            return None
+        claimed = request.headers.get("Origin") or request.headers.get("Referer")
+        if claimed is None:
+            return None
+        expected = _origin_of(request.host_url)
+        actual = _origin_of(claimed)
+        if actual is not None and actual in _acceptable_origins(expected):
+            return None
+        # Anonymous clients can send these at will: warn at most every 10 s.
+        now = time.monotonic()
+        quiet = now - self._origin_warned_at < 10
+        if not quiet:
+            self._origin_warned_at = now
+        (logger.debug if quiet else logger.warning)(
+            "Refused a cross-origin %s %s from %s (origin %r, expected %s)",
+            request.method,
+            request.path,
+            request.remote_addr,
+            claimed[:200],
+            request.host_url.rstrip("/"),
+        )
+        message = (
+            "Request blocked: it did not come from this dashboard's own page. "
+            "Behind a reverse proxy, list it in web.trustedProxies."
+        )
+        proxied = request.environ.get("mcmonitor.proxied")
+        if proxied and expected and actual and actual[:2] == expected[:2]:
+            message = (
+                "Request blocked: the reverse proxy did not pass on the public "
+                "port. Forward the browser's Host header with its port (nginx: "
+                "proxy_set_header Host $http_host;)."
+            )
+        if request.endpoint == "login":
+            return self._render_login(error=message, status=403)
+        return jsonify(success=False, message=message), 403
 
     def _static_url(self, filename: str) -> str:
         """url_for('static') with a cache-busting version (file mtime)."""
@@ -469,16 +907,21 @@ class WebServer:
         def info():
             return self._handle_info()
 
+        @app.route("/csrf")
+        @login_required
+        def csrf_token():
+            return jsonify(success=True, csrfToken=generate_csrf())
+
         @app.route("/healthz")
         @limiter.exempt
         def healthz():
             return jsonify(ok=True)
 
     def _register_error_handlers(self):
-        self.app.before_request(self._ensure_session_id)
         self.app.register_error_handler(CSRFError, self._handle_csrf_error)
         self.app.register_error_handler(429, self._handle_rate_limited)
-        self.app.after_request(self._add_security_headers)
+        self.app.register_error_handler(413, self._handle_too_large)
+        self.app.after_request(self._after_request)
 
     # ------------------------------------------------------------------
     # Auth / error responses
@@ -489,7 +932,16 @@ class WebServer:
         if request.endpoint in ("index", "logout") and request.method == "GET":
             return redirect(self._login_url_for_current_page())
         if request.endpoint == "logout":
-            return redirect(url_for("login"))
+            # The session had already lapsed: still forget this browser.
+            self.sessions.revoke_token(
+                self.sessions.redeem_token(
+                    request.cookies.get(self.remember_cookie_name),
+                    self._credential_epoch(),
+                )
+            )
+            response = redirect(url_for("login"))
+            self._delete_remember_cookie(response)
+            return response
         return (
             jsonify(
                 success=False,
@@ -514,11 +966,19 @@ class WebServer:
                 error="Your login form expired. Please try again.", status=400
             )
         if not current_user.is_authenticated:
+            # Nothing happens before authentication: an anonymous POST /logout
+            # only forgets the remember cookie it presents itself.
             return self._unauthorized()
+        if request.endpoint == "logout":
+            # A stale token (from a session renewed elsewhere) must not keep
+            # the admin from logging out: end this caller's own session only.
+            # "Everywhere" always needs a valid token.
+            return self._handle_logout(allow_everywhere=False)
         logger.warning("CSRF check failed for %s: %s", request.path, error.description)
         return (
             jsonify(
                 success=False,
+                csrfError=True,  # the page fetches /csrf and retries once
                 message="Security token missing or expired. Reload the page and try again.",
             ),
             400,
@@ -532,12 +992,22 @@ class WebServer:
         )
 
     @staticmethod
-    def _add_security_headers(response):
+    def _handle_too_large(_error):
+        return jsonify(success=False, message="Request too large."), 413
+
+    def _after_request(self, response):
+        if g.pop("drop_remember_cookie", False):
+            self._delete_remember_cookie(response)
+        if g.pop("csrf_rotated", False):
+            # The page's token belonged to the session that just lapsed.
+            response.headers["X-CSRF-Token"] = generate_csrf()
         headers = response.headers
         headers.setdefault("X-Content-Type-Options", "nosniff")
         headers.setdefault("X-Frame-Options", "DENY")
         headers.setdefault("Referrer-Policy", "same-origin")
         headers.setdefault("Content-Security-Policy", _content_security_policy())
+        if _secure_cookies():
+            headers.setdefault("Strict-Transport-Security", "max-age=31536000")
         if request.endpoint != "static":
             headers.setdefault("Cache-Control", "no-store")
         return response
@@ -589,32 +1059,81 @@ class WebServer:
             self.snapshot = snapshot
             self._streams.broadcast(self._sse_message(self._payload(snapshot)))
 
-    @staticmethod
-    def _payload(snapshot: dict) -> dict:
+    def _payload(self, snapshot: dict) -> dict:
         return {
             "data": dict(snapshot),
             "autoStopDelay": _auto_stop_delay(),
             "serverTime": time.time(),
+            # A quick read under the client's small state lock; arrives with
+            # every committed snapshot so the page never acts on a stale one.
+            "rconStatus": self._rcon_status(),
         }
 
     def _json_state(self, status: int = 200, **extra):
         """JSON body built around one consistent committed snapshot."""
         body = self._payload(self._refresh_snapshot())
+        body["monitor"] = self._monitor_status()
         body.update(extra)
         return jsonify(body), status
+
+    def _monitor_status(self) -> dict:
+        """Live state that is not part of the snapshot. Only called from
+        request handlers, never under the broadcast lock or on the bus."""
+        return {
+            "rconStatus": self._rcon_status(),
+            "autoStartStatus": self._auto_start_state(),
+        }
+
+    def _rcon_status(self) -> str | None:
+        try:
+            value = getattr(
+                getattr(self.controller, "client", None), "rcon_status", None
+            )
+            if callable(value):
+                value = value()
+        except Exception:
+            logger.debug("rcon_status failed", exc_info=True)
+            return None
+        return value if value in RCON_STATUSES else None
+
+    def _auto_start_state(self) -> dict | None:
+        if self.auto_start_status is None:
+            return None
+        try:
+            raw = self.auto_start_status()
+        except Exception:
+            logger.debug("auto_start_status failed", exc_info=True)
+            return None
+        if not isinstance(raw, dict):
+            return None
+        error = raw.get("error")
+        return {
+            "armed": bool(raw.get("armed")),
+            "listening": bool(raw.get("listening")),
+            "error": str(error) if error else None,
+        }
 
     # ------------------------------------------------------------------
     # Login / logout / dashboard
     # ------------------------------------------------------------------
 
     def _handle_login(self):
-        ip = request.remote_addr or "unknown"
+        ip = _client_key()  # IPv6 clients by /64: rotating addresses is free
         next_url = self._next_url()
         if request.method == "GET" and current_user.is_authenticated:
             return redirect(next_url)
         if self.login_tracker.is_locked_out(ip):
             return self._render_locked_out(ip)
         if request.method == "POST":
+            wait = self.login_tracker.global_wait(ip)
+            if wait:
+                return self._render_login(
+                    error="Too many failed logins on this dashboard. "
+                    f"Try again in {wait} seconds.",
+                    locked_out=True,
+                    lockout_seconds=wait,
+                    status=429,
+                )
             return self._attempt_login(ip, next_url)
         return self._render_login()
 
@@ -632,16 +1151,24 @@ class WebServer:
         if verify_credentials(
             username, password, settings.webUsername, settings.webPassword
         ):
-            session.permanent = True
             user = User(str(settings.webUsername), self._credential_epoch())
-            login_user(user, remember=remember)
-            session["sid"] = secrets.token_urlsafe(16)
+            token_id, token = None, None
+            if remember:
+                token_id, token = self.sessions.issue_token(
+                    user.epoch, REMEMBER_SECONDS
+                )
+            self._establish_session(user, token_id)
             self.login_tracker.record_successful_login(ip)
-            logger.info("Web login from %s", ip)
-            return redirect(next_url)
+            logger.info("Web login from %s", request.remote_addr)
+            response = redirect(next_url)
+            if token:
+                self._set_remember_cookie(response, token)
+            return response
 
         self.login_tracker.record_failed_attempt(ip)
-        logger.warning("Failed login attempt from %s for user %r", ip, username)
+        logger.warning(
+            "Failed login attempt from %s for user %r", request.remote_addr, username
+        )
         remaining = self.login_tracker.get_remaining_attempts(ip)
         if remaining == 0:
             return self._render_locked_out(ip)
@@ -658,6 +1185,7 @@ class WebServer:
         return self._render_login(
             error=f"Too many failed attempts. Try again in {remaining} seconds.",
             locked_out=True,
+            lockout_seconds=remaining,
             status=429,
         )
 
@@ -668,19 +1196,42 @@ class WebServer:
             status,
         )
 
-    def _handle_logout(self):
-        logger.info("Web logout from %s", request.remote_addr)
-        sid = session.pop("sid", None)
-        logout_user()
-        if sid:
+    def _handle_logout(self, allow_everywhere: bool = True):
+        everywhere = allow_everywhere and request.form.get("scope") == "all"
+        logger.info(
+            "Web logout%s from %s",
+            " of every session" if everywhere else "",
+            request.remote_addr,
+        )
+        sid = session.get("sid")
+        self.sessions.revoke_token(self.sessions.close_session(sid))
+        presented = request.cookies.get(self.remember_cookie_name)
+        self.sessions.revoke_token(
+            self.sessions.redeem_token(presented, self._credential_epoch())
+        )
+        if everywhere:
+            self.sessions.close_all()
+            self._streams.end_all()
+        elif sid:
             self._streams.close_owner(sid)
-        flash("You have been signed out.", "info")
-        return redirect(url_for("login"))
+        logout_user()
+        session.clear()
+        flash(
+            "Signed out everywhere: every session and remembered login has ended."
+            if everywhere
+            else "You have been signed out.",
+            "info",
+        )
+        response = redirect(url_for("login"))
+        self._delete_remember_cookie(response)
+        return response
 
     def _handle_index(self):
         snapshot = self._refresh_snapshot()
         config = _ui_config()
         server = snapshot.get("server") or {}
+        monitor = self._monitor_status()
+        listener = monitor["autoStartStatus"] or {}
         return render_template(
             "index.html",
             theme=_theme_cookie(),
@@ -690,7 +1241,16 @@ class WebServer:
             motd=strip_formatting(server.get("motd")).strip(),
             status=status_label(snapshot),
             config=config,
-            bootstrap={"payload": self._payload(snapshot), "config": config},
+            auto_start_blocked=bool(
+                config["autoStart"]
+                and listener.get("armed")
+                and not listener.get("listening")
+            ),
+            bootstrap={
+                "payload": self._payload(snapshot),
+                "config": config,
+                "monitor": monitor,
+            },
             git_hash=settings.get_git_hash(),
             username=current_user.username,
         )
@@ -803,13 +1363,31 @@ class WebServer:
             return jsonify(success=False, message="lines must be a number."), 400
         count = min(max(count, 1), MAX_CONSOLE_LINES)
         path = _console_path(source)
-        exists = bool(path) and os.path.isfile(path)
-        lines = (
-            [_ANSI_RE.sub("", line) for line in server_files.tail_file(path, count)]
-            if exists
-            else []
+        if not (path and os.path.isfile(path)):
+            return jsonify(success=True, source=source, lines=[], exists=False)
+        try:
+            raw = server_files.tail_file(path, count)
+        except OSError as error:
+            return self._console_unreadable(source, path, error)
+        self._console_errors.pop(path, None)
+        lines = [_ANSI_RE.sub("", line) for line in raw]
+        return jsonify(success=True, source=source, lines=lines, exists=True)
+
+    def _console_unreadable(self, source: str, path: str, error: OSError):
+        """A JSON error, logged once per file and error rather than on every
+        refresh of the console panel."""
+        if self._console_errors.get(path, -1) != error.errno:
+            self._console_errors[path] = error.errno
+            logger.warning("The web console cannot read %s: %s", path, error)
+        name = "logs/latest.log" if source == "log" else "the launch output"
+        reason = (error.strerror or str(error)).lower()
+        return jsonify(
+            success=False,
+            source=source,
+            lines=[],
+            exists=True,
+            message=f"Cannot read {name}: {reason}.",
         )
-        return jsonify(success=True, source=source, lines=lines, exists=exists)
 
     def _handle_command(self):
         if not (settings.webConsole and settings.controlServerThroughWeb):
@@ -841,7 +1419,7 @@ class WebServer:
     # ------------------------------------------------------------------
 
     def _handle_info(self):
-        return jsonify(self._get_info())
+        return jsonify({**self._get_info(), **self._monitor_status()})
 
     def _get_info(self) -> dict:
         with self._info_lock:
@@ -864,16 +1442,18 @@ class WebServer:
 
     def _handle_stream(self):
         grant = _StreamGrant(
-            owner=session.get("sid"),
-            epoch=getattr(current_user, "epoch", ""),
-            expires_at=time.monotonic() + float(settings.sessionTimeout),
+            owner=session.get("sid"), epoch=getattr(current_user, "epoch", "")
         )
         with self._lock:
             # The initial snapshot is read and the queue registered under the
             # broadcast lock, so no committed update can slip in between.
             snapshot = self._cache_snapshot(self._read_snapshot())
             client = self._streams.add(grant.owner)
-            initial = self._sse_message(self._payload(snapshot), retry=SSE_RETRY_MS)
+            first = self._payload(snapshot)
+            # This request may have restored a remembered login into a new
+            # session: hand the page that session's token (only to this client).
+            first["csrfToken"] = generate_csrf()
+            initial = self._sse_message(first, retry=SSE_RETRY_MS)
         if client is None:
             return jsonify(success=False, message="Live updates unavailable."), 503
         response = Response(
@@ -885,11 +1465,11 @@ class WebServer:
 
     def _grant_valid(self, grant: "_StreamGrant") -> bool:
         """A stream lives no longer than the session that opened it: it ends
-        when that session would expire or the credentials change (logout
-        ends it at once through close_owner)."""
-        if time.monotonic() >= grant.expires_at:
+        when that session expires or the credentials change (logout ends it
+        at once through close_owner)."""
+        if not hmac.compare_digest(grant.epoch, self._credential_epoch()):
             return False
-        return hmac.compare_digest(grant.epoch, self._credential_epoch())
+        return self.sessions.check_session(grant.owner, grant.epoch, touch=False)
 
     def _stream_events(self, client: queue.Queue, initial: str, grant=None):
         try:
@@ -918,7 +1498,7 @@ class WebServer:
         host = settings.webBindHost or "0.0.0.0"
         port = int(settings.webServerPort)
         try:
-            server = make_server(host, port, self.app, threaded=True)
+            server = make_server(host, port, self.app, self.server_limits)
         except OSError as error:
             logger.error("Web server could not listen on %s:%s: %s", host, port, error)
             raise

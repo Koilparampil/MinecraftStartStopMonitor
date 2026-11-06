@@ -10,7 +10,9 @@ calls, and can block to simulate slow I/O. No processes, sockets or files.
   against real servers (a frozen clock would stop the polls).
 - ``FakeProcessManager``: ``alive`` (live PIDs), ``found`` (what discovery
   reports), ``launch_identity`` (what the next launch returns), plus
-  blocking/result knobs for launch, terminate and observe.
+  blocking/result knobs for launch, terminate and observe. ``observe_error``
+  makes ``observe()`` raise (e.g. ``ProcessStateUnknown``); ``created_at``
+  maps PIDs to the wall-clock creation time ``started_at()`` reports.
 - ``FakeClient``: ``roster`` returned by ``get_roster()`` (``None`` or
   ``available = False`` means RCON and ping both failed), ``block`` to hold a
   poll, configurable moderation/console results. With ``banlist`` set, ban and
@@ -125,6 +127,8 @@ class FakeProcessManager:
         self.observe_entered = threading.Event()
         self.gated_snapshot = None  # returned by the gated observe()
         self.find_error = None  # exception raised by find_process_identity()
+        self.observe_error = None  # exception raised by observe()
+        self.created_at = {}  # pid -> wall-clock creation time (started_at)
         self.launch_calls = []
         self.terminate_calls = []
         self.terminate_forced = []  # the force flag of each terminate call
@@ -157,7 +161,12 @@ class FakeProcessManager:
             raise self.find_error
         return self.found
 
+    def started_at(self, identity):
+        return self.created_at.get(identity.pid)
+
     def observe(self):
+        if self.observe_error is not None:
+            raise self.observe_error
         if self.observe_gate is not None:
             gate = self.observe_gate
             self.observe_gate = None
