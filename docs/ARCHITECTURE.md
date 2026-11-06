@@ -170,6 +170,13 @@ Thread-safe; one persistent RCON connection guarded by a lock, reconnect on erro
   `Kicked`/`Banned`/`Unbanned`, "already banned"/"isn't banned" count as
   success-with-message). The controller re-verifies bans against the file.
 - `request_stop() -> bool` (RCON `stop`; connection drop after sending = sent).
+- `rcon_status`: `disabled` | `unknown` | `ok` | `auth_failed` | `unreachable`
+  (constants `RCON_*` in `src.minecraft.client`). After a rejected password
+  the client stops trying RCON for 60 s, doubling to 10 min, while the status
+  ping keeps the roster alive. It logs one error per state change, and
+  console/moderation calls fail fast with the remaining wait.
+- Player counts (ping and `list`) must be bounded ASCII integers; anything
+  else makes the sample unavailable (`None`), never a low count.
 - `close()`.
 
 ### server_files (`src/minecraft/server_files.py`) — protocol
